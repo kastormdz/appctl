@@ -1,92 +1,83 @@
 # appctl
 
-Provisionador de servidores de aplicaciones por cliente. Un comando, un stack
-dockerizado autocontenido, un resumen listo para pasarle al developer.
+Un comando y tenés el server del cliente andando.
 
 ```bash
 appctl acme php psql sftp
 ```
 
-Genera un proyecto `acme` con nginx + PHP 8.5 + PostgreSQL 18 + SFTP, publica
-solo el puerto de la app y el del SFTP, deja la base de datos inalcanzable desde
-la red, y devuelve el resumen con las credenciales.
+Levanta nginx + PHP 8.5 + PostgreSQL 18 + SFTP, publica solo los puertos que
+hace falta (el de la app y el del SFTP), deja la base de datos inalcanzable
+desde afuera, y te devuelve un resumen con todo lo que hay que passarle al
+developer.
 
 ---
 
 ## Qué es y qué no es
 
-**Es** un provisionador. Le decís qué quiere el cliente y te da un stack corriendo,
-autocontenido y destruible con un comando.
+Es un provisionador. Le decís qué quiere el cliente y te da un stack corriendo,
+que se borra entero con un comando.
 
-**No es** un PaaS. No hay panel web, ni multi-servidor, ni billing, ni git push
-deploys. Esas cosas las agregan Coolify/Dokploy; acá serían features que vos
-tenés que operar, actualizar y asegurar, sin resolver el problema real.
+No es un PaaS. No hay panel web, ni deploys por git push, ni billing, ni
+multiserver. Si eso es lo que necesitás, Coolify y Dokploy ya lo hacen, y los
+vas a tener que operar y actualizar vos. Acá el problema es otro: que el cliente
+pida un PHP con PostgreSQL y SFTP y que eso exista hoy, no en tres días.
 
-El estado de cada cliente es un directorio con un `compose.yaml`. Nada más.
+Cada cliente es un directorio con un `compose.yaml`. Nada más.
 
 ---
 
 ## Requisitos del servidor
 
-Un host Linux con Docker + Compose v2 y un usuario con acceso al daemon:
+Un Linux con Docker y Compose v2, y un usuario que pueda hablar con el daemon:
 
 | | |
 |---|---|
-| Docker | 29.8.2 (probado), 24+ debería servir |
+| Docker | 29.8.2 (probado) |
 | Compose | v2.40.3 (probado) |
-| RAM | ~1 GB por cliente (su app + su DB) |
-| sudo | NOPASSWD, o un wrapper: `destroy` borra archivos que crea el contenedor |
+| RAM | ~1 GB por cliente (su app + su base) |
+| sudo | sin password, o un wrapper |
 
-**Cada cliente lleva su propia base en su propio contenedor.** No hay una base
-compartida: es lo que hace que el aislamiento sea real en vez de prometido con
-GRANTs. El costo es RAM; a escala chica sobra, y la primera vez que los clientes
-sumen memoria se mide.
+Cada cliente lleva **su propia base en su propio contenedor**. No hay una base
+compartida entre todos. Es lo que hace que el aislamiento sea real y no un
+`GRANT` que promete. Sale en RAM; mientras los clientes sean pocos, sobra.
 
-El CLI corre **en el host, al lado de Docker**: necesita el daemon y el socket, y
-el `flock` del registry tiene que vivir en el mismo filesystem que el registry.
-No es un panel web ni un PaaS: es una CLI que crea stacks. La API HTTP no expone
-nada por defecto.
+El CLI corre en el host, al lado de Docker. Necesita el daemon y el socket, y el
+`flock` del registro tiene que estar en el mismo filesystem que el registro.
 
-TLS lo termina un reverse proxy **por delante**, que no es parte de esto. Los
-stacks sirven HTTP en un puerto del host y quien los publica decide el
-certificado; `appctl` no sabe de certificados.
+Del TLS no se ocupa: eso lo termina un reverse proxy adelante, que no es parte
+de esto. Los stacks sirven HTTP en un puerto del host y el que los publica
+decide el certificado.
 
 ---
 
 ## Layout en el host
 
-Todo vive bajo un directorio configurable (`APPCTL_PROJECTS`, por defecto
-`/srv/appctl`), con un subdirectorio por cliente:
+Todo cuelga de un directorio configurable, con un subdirectorio por cliente:
 
 ```
-$APPCTL_PROJECTS/<proyecto>/          # un directorio por cliente
+$APPCTL_PROJECTS/<proyecto>/          # uno por cliente
 ├── compose.yaml
 ├── .env                                 # 0600
-├── nginx/site.conf                      # montado, no baked en la imagen
+├── nginx/site.conf
+├── db/init/                             # scripts de initdb
+├── db/data/                             # volumen de la base
 └── state.json
 ```
 
-**Los proyectos van en el mismo filesystem que los volúmenes Docker.** Un
-proyecto de cliente fuera del filesystem donde viven sus datos es una receta para
-un restore que no cierra. Por eso el default no es `/opt` ni `/srv` sino el
-directorio donde ya está el root de Docker.
+El default es `/srv/appctl`, pero lo importante es dónde: **en el mismo
+filesystem que el root de Docker**. Un proyecto de cliente separado del lugar
+donde viven sus datos es un restore que no cierra.
 
-```
-/usr/local/bin/appctl                    # el CLI (stdlib only)
-$APPCTL_PROJECTS/.appctl/registry.json   # puerto→cliente, con flock
-$APPCTL_PROJECTS/.appctl/versions.json   # tag flotante de las imágenes
-```
+El registro de puertos va aparte, en `$APPCTL_HOME` (por defecto
+`/srv/appctl/.appctl`), oculto, para que listar los proyectos muestre solo
+clientes.
 
-El registry va en `.appctl/` (oculto, fuera del alcance de los directorios de
-proyecto) para que `ls $APPCTL_PROJECTS/` muestre solo clientes.
-
-Ajustables por entorno, para que el repo sirva en dos lugares:
-
-| Variable | Default | Qué es |
+| Variable | Default | Para qué |
 |---|---|---|
 | `APPCTL_PROJECTS` | `/srv/appctl` | raíz de los proyectos |
-| `APPCTL_HOME` | `/srv/appctl/.appctl` | registry y versiones |
-| `APPCTL_HOST` | `localhost` | host que aparece en el resumen |
+| `APPCTL_HOME` | `/srv/appctl/.appctl` | registro de puertos y versiones |
+| `APPCTL_HOST` | `localhost` | el host que sale en el resumen |
 | `HTTPS_PROXY` | — | hace falta si la red no llega a los repos |
 
 ---
@@ -99,24 +90,25 @@ appctl <proyecto> [componentes...] [opciones]
 
 ## Los stacks
 
-Cada stack es un directorio bajo `stacks/` con `Dockerfile` (si hace falta),
-`compose.tmpl.yaml`, `env.tmpl` y `nginx.tmpl`. Agregar uno nuevo = copiar un
-directorio. Hay **8**:
+Cada stack es un directorio bajo `stacks/`, con su `compose.tmpl.yaml` y una
+imagen propia (Dockerfile, entrypoint, nginx) donde hace falta. Agregar uno
+nuevo es copiar un directorio y ajustar los placeholders.
+
+Hay **4**:
 
 | Stack | App | DB | Servicios | Notas |
 |---|---|---|---|---|
-| `php-postgres-sftp` | PHP 8.5 + nginx | PG 18 | 3 | **el de hoy** |
-| `php-mysql-sftp` | PHP 8.5 + nginx | MariaDB 11 | 3 | el más pedido |
+| `php-postgres-sftp` | PHP 8.5 + nginx | PG 18 | 3 | el default |
+| `php-mysql-sftp` | PHP 8.5 + nginx | MariaDB 11.8 | 3 | |
 | `nextjs-postgres-sftp` | Node 22 + Next | PG 18 | 3 | build multi-stage, `.next` |
-| `nextjs-mysql-sftp` | Node 22 + Next | MariaDB 11 | 3 | |
-| `tomcat-postgres-sftp` | Tomcat 11 + nginx | PG 18 | **4** | nginx aparte |
-| `tomcat-mysql-sftp` | Tomcat 11 + nginx | MariaDB 11 | **4** | nginx aparte |
-| `php-postgres` | PHP 8.5 | PG 18 | 2 | sin sftp |
-| `php-postgres-cron` | PHP 8.5 + supervisor | PG 18 | 3 | queue workers |
+| `tomcat-postgres-sftp` | Tomcat 11 + nginx | PG 18 | 4 | nginx va aparte |
 
-`php-postgres-cron` existe porque el 90% de los pedidos de PHP con
-Laravel/WordPress en 30 días necesita un worker de cola. Sin él, el primer
-"necesito correr un cron" es un ticket de soporte.
+Los que faltan (los `mysql` de nextjs y tomcat, y el stack con `cron` para
+workers de cola) son directorios nuevos. El CLI ya los pide por nombre; lo que
+no existe todavía es el directorio. No está-built por diseño: cada uno se
+agrega cuando alguien lo pide de verdad, y así el repo no carga con stacks que
+nadie probó.
+
 
 ## Stack `tomcat`
 
@@ -130,10 +122,10 @@ servir, hay un `.war` que compilar y deployar. Tres diferencias concretas contra
 | build | el cliente sube el código ya hecho | `mvn package` / `gradle build` → el `.war` |
 | descentrado | nginx → `php-fpm:9000` | nginx → `tomcat:8080` |
 
-El compose lleva **4 servicios**: `app` (tomcat), `nginx`, `db`, `sftp` — o sea
-que acá nginx **sí** es un servicio separado, porque el reverse proxy tiene que
-terminar TLS/routing y hablar con el `catalina.sh` que corre aparte. En PHP,
-nginx y FPM viven juntos; en Tomcat, no.
+El compose lleva **4 servicios**: `app` (tomcat), `nginx`, `db` y `sftp`. Acá
+nginx **sí** va aparte, porque tiene que terminar el TLS y hablar con el
+`catalina.sh` que corre en otro proceso. En PHP nginx y FPM viven juntos; en
+Tomcat no pueden.
 
 Imagen: `tomcat:11-jdk25-temurin-noble` (Tomcat 11 = Jakarta EE 10, requiere Java
 17+). **OJO:** Tomcat 10 fue Jakarta y **no** es compatible binariamente con
@@ -159,8 +151,8 @@ appctl acme php psql sftp --php 8.3   # fijado a 8.3
 
 El tag flotante vive en `$APPCTL_HOME/versions.json`, con un `lock` de
 escritura. Regla: **el tag exacto se resuelve una vez y se escribe en el
-compose y en `state.json`**. Un contenedor que corre no se actualiza solo —
-nunca. Actualizar es `appctl acme upgrade`, explícito.
+compose y en `state.json`**. Un contenedor que corre no se actualiza solo,
+nunca. Actualizar es `appctl acme upgrade`, y es explícito a propósito.
 
 Razón de la regla: `restart: unless-stopped` re-pulled no hace nada (no
 re-pullea), pero un `docker compose pull` en un `up` futuro sí. Si el tag
@@ -215,10 +207,10 @@ No de memoria ni del sitio de Docker Hub: bajadas una por una.
 | Tomcat | `tomcat:10.1-jdk21-temurin-noble` | 729 MB |
 | Tomcat | `tomcat:9-jdk21-temurin-noble` | 730 MB |
 
-`php:8.5-fpm-alpine` pesa **150 MB contra 732 MB** de bookworm — 5x menos. Es la
-diferencia entre 15 clientes y 30 en un disco de 32 GB. El stack de PHP usa
-alpine; si un cliente necesita extensiones que no compilan en alpine (o GD con
-librerías del sistema), se cae a bookworm y se acepta el costo.
+`php:8.5-fpm-alpine` pesa 150 MB contra 732 MB de bookworm, cinco veces menos.
+Eso solo decide cuántos clientes entran en el disco. El stack de PHP usa
+alpine; si un cliente necesita una extensión que no compila ahí (GD con
+librerías del sistema, por ejemplo), se cae a bookworm y se acepta el costo.
 
 Tomcat: los tags con `jre` en el nombre **no existen** (`11-jdk25-temurin-jre17-noble`
 no baja), solo los `jdk`. Y hay 9, 10 y 11 disponibles, que es exactamente lo que
@@ -357,13 +349,12 @@ Se imprime **una sola vez**. Después se lee con `appctl <proyecto> creds`.
 
 ## Disco: el límite real
 
-`/data` = 32 GB. Un stack `php + postgres` ronda 800 MB de imagen; con datos,
-logs y backups, cada cliente se come 1.5-2 GB realista. **~15 clientes con
-margen**, no los 30 que salen de hacer la cuenta optimista con la RAM.
+Un stack `php + postgres` ronda 800 MB de imagen. Con datos, logs y backups,
+cada cliente se va a 1.5-2 GB en la práctica. Decime cuántos clientes querés
+sostener y te digo si el disco da; si no da, se agranda o se mueven los
+volúmenes de datos afuera.
 
-Cuando se llegue a 10, se mide el uso real y se decide: ampliar el LVM, o mover
-los volúmenes de datos a espacio externo (local, S3, lo que sea). No antes — con
-10 clientes y 20 GB libres no hay nada que decidir.
+---
 
 ## La base de datos: los comandos que la mueven
 
@@ -403,11 +394,11 @@ appctl <p> db grant nombre --rol readonly
 ```
 
 En MariaDB el usuario de migración necesita `WITH GRANT OPTION` sobre la base
-**y** `CREATE USER` global — MariaDB rechaza `GRANT OPTION ON db.*` con 1064
-porque no es un privilegio, es una opción de `GRANT`. El alcance global es
-seguro acá porque cada base está en su red y no comparte nada con otros
-clientes: el aislamiento lo da la red. En un MySQL con varias bases en el mismo
-servidor, no.
+**y** `CREATE USER` global. MariaDB rechaza `GRANT OPTION ON db.*` con 1064
+porque no es un privilegio: es una opción de `GRANT`. El alcance global no
+molesta acá porque cada base está en su red y no comparte nada con otros
+clientes, y el aislamiento lo da la red. En un MySQL con varias bases en el
+mismo servidor, sí.
 
 ---
 
@@ -431,7 +422,7 @@ appctl doctor                        # estado del host
 
 ## Idempotencia y concurrencia
 
-- `flock` sobre `registry.json` durante todo `create`/`destroy` — sin esto, dos
+- `flock` sobre `registry.json` durante todo `create`/`destroy`. Sin eso, dos
   altas en paralelo se clavan el mismo puerto sin enterarse.
 - Reserva los **dos** puertos (app y sftp) en el registry antes de levantar nada.
 - Verifica contra `ss -ltnp` real además del registry: el registry puede
@@ -445,13 +436,13 @@ Después de `up -d`, el smoke test **comprueba que la DB no responde desde el
 host**:
 
 ```bash
-docker run --rm --network host postgres:16-alpine \
-  pg_isready -h 127.0.0.1 -p 5432   # debe fallar / no conectar
+docker run --rm --network host postgres:18-alpine \
+  pg_isready -h 127.0.0.1 -p 5432   # tiene que fallar
 ```
 
-No alcanza con que el puerto no esté en el YAML — hay que *comprobar* que un
-cliente desde afuera muere. Si una imagen de la DB alguna vez trae un `ports:`,
-eso frena en la creación y no tres meses después.
+Que el puerto no esté en el YAML no alcanza: hay que comprobar que un cliente
+desde afuera muere. Si una imagen de la base un día trae un `ports:` puesto, eso
+frena en la creación y no tres meses después.
 
 ---
 
@@ -459,28 +450,28 @@ eso frena en la creación y no tres meses después.
 
 ```
 appctl/
-├── bin/appctl                 # el CLI (stdlib, sin deps)
+├── bin/appctl                 # el CLI, stdlib y nada más
 ├── lib/
-│   ├── compose.py             # generación del compose
-│   ├── secrets.py             # generación
-│   ├── ports.py               # registry + flock + validación
-│   ├── db.py                  # roles/grants PG y MySQL
-│   ├── summary.py             # el resumen
-│   └── smoke.py               # healthcheck + prueba de que la DB no está expuesta
-├── stacks/
-│   ├── php-postgres-sftp/     # Dockerfile + compose.tmpl + nginx.tmpl
-│   ├── php-mysql-sftp/
-│   ├── nextjs-postgres-sftp/
-│   ├── nextjs-mysql-sftp/
-│   ├── php-postgres-cron/     # el 6º: queue workers
-│   └── php-postgres/
-├── ansible/
-│   ├── bootstrap.yml          # UNA vez: docker, ufw, fail2ban, sysctl, usuario
-│   └── deploy-cli.yml         # instala /usr/local/bin/appctl
-└── tests/
+│   ├── gen.py                 # renderiza el compose y el .env
+│   ├── ports.py               # registry de puertos + flock
+│   ├── dbtool.py              # dump / restore / expose / grant
+│   ├── smoke.py               # los 9 checks
+│   └── summary.py             # el resumen para el developer
+├── stacks/                    # 4 stacks, uno por directorio
+├── tests/
+│   ├── test_init_sql.py       # ejecuta los init y valida el SQL que producen
+│   ├── test_root_pw.py        # parsea la línea del log de mariadb
+│   ├── test_security.py       # el compose no publica la DB
+│   └── check_names.py         # AST: llamadas sin definir, defs duplicadas
+└── docs/                      # (privado, no en este repo)
 ```
 
----
+`tests/test_init_sql.py` es el que más rindió. Un init corre una sola vez, cuando
+se crea el volumen; si falla ahí, no hay reintento y el proyecto queda con una
+base sin los tres usuarios para siempre. El test corre el init de verdad con
+`psql`/`mariadb` sustituidos por un binario que hace `cat`, y mira el SQL que
+llega. Sin base de datos de por medio.
+
 
 ## Estado
 
