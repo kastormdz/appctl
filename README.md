@@ -1,198 +1,205 @@
 # appctl
 
-One command and the client's server is up.
+Un comando y tenés el server del cliente andando.
 
 ```bash
 appctl acme php psql sftp
 ```
 
-Brings up nginx + PHP 8.5 + PostgreSQL 18 + SFTP, publishes only the ports that
-are actually needed (the app's and SFTP's), leaves the database unreachable
-from outside, and hands you a summary with everything the developer needs.
+Levanta nginx + PHP 8.5 + PostgreSQL 18 + SFTP, publica solo los puertos que
+hace falta (el de la app y el del SFTP), deja la base de datos inalcanzable
+desde afuera, y te devuelve un resumen con todo lo que hay que passarle al
+developer.
 
-[Español](README.es.md)
-
----
-
-## What this is and what it isn't
-
-It's a provisioner. You tell it what the client wants and you get a running
-stack, which deletes in one command.
-
-It isn't a PaaS. No web panel, no git push deploys, no billing, no multi-server.
-If you need that, Coolify and Dokploy already do it, and you'll be the one
-running and updating it. The problem here is a different one: a client asks for
-PHP with PostgreSQL and SFTP, and that exists today, not three days from now.
-
-Each client is a directory with a `compose.yaml`. That's it.
+[English](README.en.md)
 
 ---
 
-## Server requirements
+## Qué es y qué no es
 
-Linux with Docker and Compose v2, and a user that can talk to the daemon:
+Es un provisionador. Le decís qué quiere el cliente y te da un stack corriendo,
+que se borra entero con un comando.
+
+No es un PaaS. No hay panel web, ni deploys por git push, ni billing, ni
+multiserver. Si eso es lo que necesitás, Coolify y Dokploy ya lo hacen, y los
+vas a tener que operar y actualizar vos. Acá el problema es otro: que el cliente
+pida un PHP con PostgreSQL y SFTP y que eso exista hoy, no en tres días.
+
+Cada cliente es un directorio con un `compose.yaml`. Nada más.
+
+---
+
+## Requisitos del servidor
+
+Un Linux con Docker y Compose v2, y un usuario que pueda hablar con el daemon:
 
 | | |
 |---|---|
-| Docker | 29.8.2 (tested) |
-| Compose | v2.40.3 (tested) |
-| RAM | ~1 GB per client (its app plus its database) |
-| sudo | passwordless, or a wrapper |
+| Docker | 29.8.2 (probado) |
+| Compose | v2.40.3 (probado) |
+| RAM | ~1 GB por cliente (su app + su base) |
+| sudo | sin password, o un wrapper |
 
-Every client gets **its own database in its own container**. There's no shared
-database. That's what makes the isolation real instead of a `GRANT` that merely
-promises it. It costs RAM; while the client count is small, there's plenty.
+Cada cliente lleva **su propia base en su propio contenedor**. No hay una base
+compartida entre todos. Es lo que hace que el aislamiento sea real y no un
+`GRANT` que promete. Sale en RAM; mientras los clientes sean pocos, sobra.
 
-The CLI runs on the host, next to Docker. It needs the daemon and the socket,
-and the `flock` on the registry has to live in the same filesystem as the
-registry itself.
+El CLI corre en el host, al lado de Docker. Necesita el daemon y el socket, y el
+`flock` del registro tiene que estar en el mismo filesystem que el registro.
 
-TLS isn't its job. A reverse proxy in front handles that, and that isn't part of
-this. The stacks serve HTTP on a host port and whoever publishes them decides the
-certificate.
+Del TLS no se ocupa: eso lo termina un reverse proxy adelante, que no es parte
+de esto. Los stacks sirven HTTP en un puerto del host y el que los publica
+decide el certificado.
 
 ---
 
-## Layout on the host
+## Layout en el host
 
-Everything hangs off one configurable directory, with a subdirectory per client:
+Todo cuelga de un directorio configurable, con un subdirectorio por cliente:
 
 ```
-$APPCTL_PROJECTS/<project>/          # one per client
+$APPCTL_PROJECTS/<proyecto>/          # uno por cliente
 ├── compose.yaml
 ├── .env                                 # 0600
 ├── nginx/site.conf
-├── db/init/                             # initdb scripts
-├── db/data/                             # database volume
+├── db/init/                             # scripts de initdb
+├── db/data/                             # volumen de la base
 └── state.json
 ```
 
-The default is `/srv/appctl`, but where it goes matters more than the value:
-**on the same filesystem as the Docker root**. A client project kept away from
-where its data lives is a restore that never closes.
+El default es `/srv/appctl`, pero lo importante es dónde: **en el mismo
+filesystem que el root de Docker**. Un proyecto de cliente separado del lugar
+donde viven sus datos es un restore que no cierra.
 
-The port registry sits separately in `$APPCTL_HOME` (default
-`/srv/appctl/.appctl`), hidden, so listing projects shows only clients.
+El registro de puertos va aparte, en `$APPCTL_HOME` (por defecto
+`/srv/appctl/.appctl`), oculto, para que listar los proyectos muestre solo
+clientes.
 
-| Variable | Default | What it's for |
+| Variable | Default | Para qué |
 |---|---|---|
-| `APPCTL_PROJECTS` | `/srv/appctl` | projects root |
-| `APPCTL_HOME` | `/srv/appctl/.appctl` | port registry and versions |
-| `APPCTL_HOST` | `localhost` | the host printed in the summary |
-| `HTTPS_PROXY` | — | needed when the network can't reach the repos |
+| `APPCTL_PROJECTS` | `/srv/appctl` | raíz de los proyectos |
+| `APPCTL_HOME` | `/srv/appctl/.appctl` | registro de puertos y versiones |
+| `APPCTL_HOST` | `localhost` | el host que sale en el resumen |
+| `HTTPS_PROXY` | — | hace falta si la red no llega a los repos |
 
 ---
 
-## Syntax
+## Sintaxis
 
 ```bash
-appctl <project> [components...] [options]
+appctl <proyecto> [componentes...] [opciones]
 ```
 
-## The stacks
+## Los stacks
 
-Each stack is a directory under `stacks/`, with its `compose.tmpl.yaml` and its
-own image (Dockerfile, entrypoint, nginx) where that's needed. Adding one means
-copying a directory and adjusting the placeholders.
+Cada stack es un directorio bajo `stacks/`, con su `compose.tmpl.yaml` y una
+imagen propia (Dockerfile, entrypoint, nginx) donde hace falta. Agregar uno
+nuevo es copiar un directorio y ajustar los placeholders.
 
-There are **4**:
+Hay **4**:
 
-| Stack | App | DB | Services | Notes |
+| Stack | App | DB | Servicios | Notas |
 |---|---|---|---|---|
-| `php-postgres-sftp` | PHP 8.5 + nginx | PG 18 | 3 | the default |
+| `php-postgres-sftp` | PHP 8.5 + nginx | PG 18 | 3 | el default |
 | `php-mysql-sftp` | PHP 8.5 + nginx | MariaDB 11.8 | 3 | |
-| `nextjs-postgres-sftp` | Node 22 + Next | PG 18 | 3 | multi-stage build, `.next` |
-| `tomcat-postgres-sftp` | Tomcat 11 + nginx | PG 18 | 4 | nginx on its own |
+| `nextjs-postgres-sftp` | Node 22 + Next | PG 18 | 3 | build multi-stage, `.next` |
+| `tomcat-postgres-sftp` | Tomcat 11 + nginx | PG 18 | 4 | nginx va aparte |
 
-The missing ones (the `mysql` variants of nextjs and tomcat, and the stack with
-`cron` for queue workers) are new directories. The CLI already asks for them by
-name; what doesn't exist yet is the directory. That's deliberate: each one gets
-added when someone actually asks for it, so the repo doesn't carry stacks nobody
-has tested.
+Los que faltan (los `mysql` de nextjs y tomcat, y el stack con `cron` para
+workers de cola) son directorios nuevos. El CLI ya los pide por nombre; lo que
+no existe todavía es el directorio. No está-built por diseño: cada uno se
+agrega cuando alguien lo pide de verdad, y así el repo no carga con stacks que
+nadie probó.
 
-## The `tomcat` stack
 
-Tomcat changes the shape of the stack, because **it isn't PHP**: there's no
-`.php` to serve, there's a `.war` to build and deploy. Three concrete differences
-against `php`:
+## Stack `tomcat`
+
+Tomcat cambia la forma del stack, porque **no es PHP**: no hay `.php` que
+servir, hay un `.war` que compilar y deployar. Tres diferencias concretas contra
+`php`:
 
 | | `php` | `tomcat` |
 |---|---|---|
-| code | `/var/www/html`, mounted | `/usr/local/tomcat/webapps/<project>.war` |
-| build | client uploads the finished code | `mvn package` / `gradle build` → the `.war` |
-| upstream | nginx → `php-fpm:9000` | nginx → `tomcat:8080` |
+| código | `/var/www/html` montado | `/usr/local/tomcat/webapps/<proyecto>.war` |
+| build | el cliente sube el código ya hecho | `mvn package` / `gradle build` → el `.war` |
+| descentrado | nginx → `php-fpm:9000` | nginx → `tomcat:8080` |
 
-The compose carries **4 services**: `app` (tomcat), `nginx`, `db` and `sftp`.
-Here nginx **does** become a separate service, because it has to terminate TLS
-and talk to a `catalina.sh` running on its own. In PHP, nginx and FPM live
-together. In Tomcat they can't.
+El compose lleva **4 servicios**: `app` (tomcat), `nginx`, `db` y `sftp`. Acá
+nginx **sí** va aparte, porque tiene que terminar el TLS y hablar con el
+`catalina.sh` que corre en otro proceso. En PHP nginx y FPM viven juntos; en
+Tomcat no pueden.
 
-Image: `tomcat:11-jdk25-temurin-noble` (Tomcat 11 is Jakarta EE 10, needs Java
-17+). Watch out: Tomcat 10 went Jakarta and is **not** binary compatible with
-Tomcat 9 (`javax.*` → `jakarta.*`). A `.war` that compiles on 9 today won't run
-on 11 without touching imports. Ask the client which Tomcat they're on instead
-of assuming the newest.
+Imagen: `tomcat:11-jdk25-temurin-noble` (Tomcat 11 = Jakarta EE 10, requiere Java
+17+). **OJO:** Tomcat 10 fue Jakarta y **no** es compatible binariamente con
+Tomcat 9 (`javax.*` → `jakarta.*`). Un `.war` que hoy compila en 9 no corre en 11
+sin tocar imports. Hay que preguntar la versión de Tomcat al cliente, no asumir
+la última.
 
-## The `mysql` stack
+## Stack `mysql`
 
-`mysql` is an alternative to `psql`, never an addition. With `php` the usual
-choice is **MariaDB 11.8** (GPL, no license friction, better embedded); MySQL 8.4
-only when the client asks for it explicitly. With `tomcat` or Next.js, MySQL 8.4
-starts to make more sense.
+`mysql` es alternativa a `psql`, nunca adicional. Con `php` lo normal es
+**MariaDB 11.8** (GPL, sin fricción de licencia, mejor embed); MySQL 8.4
+(oracle) solo si el cliente lo pide explícitamente. Con `tomcat` o Next.js,
+MySQL 8.4 sí tiene más sentido.
 
-## The registry: which version gets installed
+## El registry: qué versión se instala
 
-The tags resolve at `create` time, and they're not hardcoded:
+Los tags se resuelven en `create`, no están escritos en el código:
 
-```bash
+```
 appctl acme php psql sftp          # PHP 8.5.11 + PostgreSQL 18.6 + atmoz/sftp:alpine
-appctl acme php psql sftp --php 8.3   # pinned to 8.3
+appctl acme php psql sftp --php 8.3   # fijado a 8.3
 ```
 
-The floating tag lives in `$APPCTL_HOME/versions.json`, behind a write lock.
-The rule: **the exact tag resolves once and gets written into the compose and
-`state.json`**. A container that's running never updates itself, not ever.
-Upgrading is `appctl acme upgrade`, on purpose explicit.
+El tag flotante vive en `$APPCTL_HOME/versions.json`, con un `lock` de
+escritura. Regla: **el tag exacto se resuelve una vez y se escribe en el
+compose y en `state.json`**. Un contenedor que corre no se actualiza solo,
+nunca. Actualizar es `appctl acme upgrade`, y es explícito a propósito.
 
-## Components
+Razón de la regla: `restart: unless-stopped` re-pulled no hace nada (no
+re-pullea), pero un `docker compose pull` en un `up` futuro sí. Si el tag
+flotara, el cliente A sube a PHP 8.6 un martes, sin querer, porque alguien
+corrió `up`. Fijado en el YAML, eso no puede pasar.
 
-| Component | What it adds |
+## Los componentes
+
+| Componente | Qué agrega |
 |---|---|
-| `php` | PHP-FPM 8.5 + nginx + supervisor, code volume |
-| `nextjs` | Node 22 + Next.js build, app volume |
-| `tomcat` | Tomcat 11 + JDK 25, separate nginx reverse proxy, `.war` in `webapps/` |
-| `psql` / `mysql` | PostgreSQL 18 / MariaDB 11 (or MySQL 8.4), private network |
-| `sftp` | atmoz/sftp, dedicated port, volume shared with the app |
-| `cron` | supervisor with a crontab mounted in |
+| `php` | PHP-FPM 8.5 + nginx + supervisor, volumen de código |
+| `nextjs` | Node 22 + build Next.js, volumen de app |
+| `tomcat` | Tomcat 11 + JDK 25, reverse proxy nginx aparte, `.war` en `webapps/` |
+| `psql` / `mysql` | PostgreSQL 18 / MariaDB 11 (o MySQL 8.4), red privada |
+| `sftp` | atmoz/sftp, puerto dedicado, volumen compartido con la app |
+| `cron` | supervisor con crontab montado |
 
 ```
 appctl acme php psql sftp
 appctl acme php mysql
-appctl nextjs-project nextjs psql sftp --app-port 3001
+appctl nextjs-proyecto nextjs psql sftp --app-port 3001
 ```
 
-**Options:** `--app-port N` (default: first free from 8001) · `--sftp-port N`
+**Opciones:** `--app-port N` (default: primer libre desde 8001) · `--sftp-port N`
 (default: 2221) · `--host NAME` (default: `$APPCTL_HOST`) ·
-`--env .env.example` (seed to preload from) · `--dry-run` · `--yes`
+`--env .env.example` (semilla para precargar) · `--dry-run` · `--yes`
 
-**Invariants checked before creating anything:**
+**Invariantes que valida antes de crear:**
 
-- `project` matches `[a-z0-9][a-z0-9-]{1,30}[a-z0-9]`
-- there's **at least one runtime** (php or nextjs) and **at least one service** (psql, mysql or sftp)
-- the app port and the sftp port are free (both the registry **and** real `ss -ltnp`)
-- the project doesn't already exist
-- the resulting stack exists under `stacks/`
+- `proyecto` es `[a-z0-9][a-z0-9-]{1,30}[a-z0-9]`
+- hay **al menos un runtime** (php o nextjs) y **al menos un servicio** (psql o mysql o sftp)
+- el puerto de app y el de sftp están libres (registry **y** `ss -ltnp` real)
+- el proyecto no existe ya
+- el stack resultante existe en `stacks/`
 
 ---
 
-## Verified versions (pulled from Docker Hub, 2026-10-01)
+## Versiones verificadas (pull real contra Docker Hub, 2026-10-01)
 
-Not from memory and not from the website: pulled one by one.
+No de memoria ni del sitio de Docker Hub: bajadas una por una.
 
-| Image | Verified tag | Size |
+| Imagen | Tag verificado | Tamaño |
 |---|---|---|
 | PHP | `php:8.5-fpm-bookworm` | 732 MB |
-| PHP | `php:8.5-fpm-alpine` | **150 MB** ← what the stack uses |
+| PHP | `php:8.5-fpm-alpine` | **150 MB** ← el que usa el stack |
 | PostgreSQL | `postgres:18-alpine` | 433 MB |
 | MariaDB | `mariadb:11.8` | 458 MB |
 | Node | `node:22-alpine` | 238 MB |
@@ -202,70 +209,68 @@ Not from memory and not from the website: pulled one by one.
 | Tomcat | `tomcat:10.1-jdk21-temurin-noble` | 729 MB |
 | Tomcat | `tomcat:9-jdk21-temurin-noble` | 730 MB |
 
-`php:8.5-fpm-alpine` is 150 MB against 732 MB for bookworm, five times less.
-On its own that's what decides how many clients fit on the disk. The PHP stack
-uses alpine; if a client needs an extension that won't compile there (GD with
-system libraries, say), it falls back to bookworm and eats the cost.
+`php:8.5-fpm-alpine` pesa 150 MB contra 732 MB de bookworm, cinco veces menos.
+Eso solo decide cuántos clientes entran en el disco. El stack de PHP usa
+alpine; si un cliente necesita una extensión que no compila ahí (GD con
+librerías del sistema, por ejemplo), se cae a bookworm y se acepta el costo.
 
-Tomcat: tags with `jre` in the name **don't exist**
-(`11-jdk25-temurin-jre17-noble` won't pull), only the `jdk` ones. And 9, 10 and
-11 are all available, which is exactly what lets you ask the client their
-version instead of guessing.
+Tomcat: los tags con `jre` en el nombre **no existen** (`11-jdk25-temurin-jre17-noble`
+no baja), solo los `jdk`. Y hay 9, 10 y 11 disponibles, que es exactamente lo que
+permite preguntar la versión al cliente en vez de suponer.
 
-## The default stack (`php psql sftp`)
+## El stack por defecto (`php psql sftp`)
 
-A `compose.yaml` with **three** services (`app`, `db`, `sftp`) and **two**
-networks. The networks are the interesting part:
+Un `compose.yaml` con **tres** servicios (`app`, `db`, `sftp`) y **dos** redes.
+Lo interesante son las redes:
 
 ```yaml
 networks:
-  # with outbound access: the app calls a payment gateway, an SMTP, a
-  # whatsapp API. Without this the client can't charge anyone.
+  # con salida a internet: la app llama a una pasarela de pagos, a un SMTP,
+  # a la API de un whatsapp. Sin esto, el cliente no puede cobrar.
   egress:
     driver: bridge
-  # NO GATEWAY. The guarantee that the database isn't visible from outside,
-  # built with machinery instead of "I didn't add a ports:".
-  # Nobody reaches it, not even a container from another project.
+  # SIN GATEWAY. La garantía de que la DB no se ve desde afuera, hecha con
+  # machinery y no con "no le puse ports:". Nadie la alcanza, ni siquiera
+  # un contenedor de otro proyecto.
   data:
     driver: bridge
     internal: true
 ```
 
-`app` sits on both networks: it reaches the internet for `composer` and
-`packagist`, and it reaches the database only over `data`. `db` sits only on
-`data`.
+`app` está en las dos redes: sale a internet para `composer` y `packagist`, y
+llega a la base solo por `data`. `db` está solo en `data`.
 
-Merging them into one network would make the database reachable from anything
-that can route to the host. That's the whole reason there are two.
+Si las dos fueran una, la base sería alcanzable desde cualquier cosa que pueda
+enrutar al host. Esa es toda la razón de que sean dos.
 
 ---
 
-## What's generated, and with what permissions
+## Qué genera y con qué permisos
 
-| Object | Name | Permissions |
+| Objeto | Nombre | Permisos |
 |---|---|---|
-| Database | `<project>_db` | — |
-| App role | `<project>` | `ALL` on `_db`, `CONNECT` on `_db` |
-| Migration role | `<project>_mig` | `ALL` on `_db` (for Laravel's `artisan migrate`) |
-| Read-only role | `<project>_ro` | `SELECT` on `_db` |
-| SFTP user | `<project>` | chrooted to its home, `upload/` writable |
-| `.env` | 0600, root:root | secrets in plain text, never in the YAML |
+| Base de datos | `<proyecto>_db` | — |
+| Rol de la app | `<proyecto>` | `ALL` sobre `_db`, `CONNECT` en `_db` |
+| Rol de migraciones | `<proyecto>_mig` | `ALL` sobre `_db` (para `artisan migrate` de Laravel) |
+| Rol de lectura | `<proyecto>_ro` | `SELECT` sobre `_db` |
+| SFTP user | `<proyecto>` | chroot a su home, `upload/` escribible |
+| `.env` | 0600, root:root | secretos en claro, nunca en el YAML |
 
-In MySQL: `GRANT ALL ON \`acme_db\`.*` for `<project>` and `<project>_mig`, plus
-a `<project>_ro` with `SELECT`. In PostgreSQL: `CREATE ROLE` + `CREATE DATABASE
-OWNER` + `REVOKE CONNECT ON DATABASE ... FROM PUBLIC` (without that last one,
-any role in the cluster can connect to a client's database).
+En MySQL: `GRANT ALL ON \`acme_db\`.*` para `<proyecto>` y `<proyecto>_mig`, más
+un `<proyecto>_ro` con `SELECT`. En PostgreSQL: `CREATE ROLE` + `CREATE DATABASE
+OWNER` + `REVOKE CONNECT ON DATABASE ... FROM PUBLIC` (sin eso, cualquier rol
+puede conectarse a la base de un cliente).
 
-### Separate roles, and why
+### Roles separados, y por qué
 
-The app role does **not** need `CREATE SCHEMA` or `DROP`. `artisan migrate` does.
-Mixing them means a SQL injection in the app can drop the schema. So: two roles,
-two passwords, and the developer gets the migration one separately, with
-instructions to use it only for migrating.
+El rol de la app **no** necesita `CREATE SCHEMA` ni `DROP`. `artisan migrate` sí.
+Mezclar los dos significa que un SQL injection en la app puede borrar el schema.
+Son dos roles distintos, dos passwords distintos, y el developer recibe el de
+migraciones aparte, con instrucción de usarlo solo para migrar.
 
 ---
 
-## The summary (output of `create`)
+## El resumen (output de `create`)
 
 ```
 ╭──────────────────────────────────────────────────────────────╮
@@ -289,161 +294,158 @@ instructions to use it only for migrating.
   Credenciales en  $APPCTL_PROJECTS/acme/.env  (0600)
 ```
 
-It prints **once**. After that you read it with `appctl <project> creds`.
+Se imprime **una sola vez**. Después se lee con `appctl <proyecto> creds`.
 
 ---
 
-## Disk: the real limit
+## Disco: el límite real
 
-A `php + postgres` stack runs about 800 MB of image. With data, logs and
-backups, each client lands at 1.5-2 GB in practice. Tell me how many clients you
-want to carry and I'll tell you whether the disk holds; if it doesn't, we either
-grow it or move the data volumes off.
+Un stack `php + postgres` ronda 800 MB de imagen. Con datos, logs y backups,
+cada cliente se va a 1.5-2 GB en la práctica. Decime cuántos clientes querés
+sostener y te digo si el disco da; si no da, se agranda o se mueven los
+volúmenes de datos afuera.
 
 ---
 
-## Database commands
+## La base de datos: los comandos que la mueven
 
-The database is **never exposed on its own**. It lives on an `internal: true`
-network with no published port, and the `create` check proves it: it tests from
-another container, not by reading the config.
+La DB **nunca se expone sola**. Vive en una red `internal:true` sin puerto
+publicado; el chequeo `create` lo verifica de verdad: lo prueba desde otro contenedor,
+no leyendo la config.
 
-### Exposing it
+### Exponerla
 
 ```bash
-appctl <p> db expose 5432                     # only from 127.0.0.1
-appctl <p> db expose 5432 --cidr 10.20.0.0/16  # open to a network
+appctl <p> db expose 5432                     # solo desde 127.0.0.1
+appctl <p> db expose 5432 --cidr 10.20.0.0/16  # abrir a una red
 ```
 
-The default is `127.0.0.1`, not a network. With just any `/8`, every LAN that
-can reach the port gets in, and whoever ran the command has no way to know the
-database ended up open to half the environment. For a network, `--cidr`
-explicit.
+El default es `127.0.0.1`, no una red. Con un `/8` cualquiera, cualquier LAN que
+llegue al puerto entra, y quien llama al comando no tiene por qué saber que
+la base quedó abierta a medio entorno. Para una red, `--cidr` explícito.
 
-`appctl <p> db unexpose` closes it. Publishing the port doesn't take the database
-off its internal network: that's a host publication, not a permission.
+`appctl <p> db unexpose` cierra. Publicar el puerto **no** hace que la base
+deje de estar en su red interna: es una publicación del host, no un permiso.
 
 ### Backups
 
 ```bash
-appctl <p> db dump                 # to a file, both engines
-appctl <p> db restore <file>
+appctl <p> db dump                 # a un archivo, ambos motores
+appctl <p> db restore <archivo>
 ```
 
-On Postgres the dump carries `--no-owner --no-acl` and **no `--clean`**: a
-`--clean --if-exists` emits `DROP ROLE` for the source role, and restoring that
-into a clone dies with `FATAL: role "x" does not exist`.
+En Postgres el dump va con `--no-owner --no-acl` y **sin `--clean`**: un
+`--clean --if-exists` genera `DROP ROLE` del origen y el restore muere con
+`FATAL: role "x" does not exist` cuando se restaura en un clon.
 
-### Granting a user
+### Un usuario nuevo
 
 ```bash
-appctl <p> db grant name --rol readonly
+appctl <p> db grant nombre --rol readonly
 ```
 
-In MariaDB the migration user needs `WITH GRANT OPTION` on the database **and**
-global `CREATE USER`. MariaDB rejects `GRANT OPTION ON db.*` with 1064 because
-it isn't a privilege: it's an option of `GRANT`. The global scope is harmless
-here because every database is on its own network and shares nothing with other
-clients, and the network is what provides the isolation. On a MySQL with several
-databases on one server, it isn't.
+En MariaDB el usuario de migración necesita `WITH GRANT OPTION` sobre la base
+**y** `CREATE USER` global. MariaDB rechaza `GRANT OPTION ON db.*` con 1064
+porque no es un privilegio: es una opción de `GRANT`. El alcance global no
+molesta acá porque cada base está en su red y no comparte nada con otros
+clientes, y el aislamiento lo da la red. En un MySQL con varias bases en el
+mismo servidor, sí.
 
 ---
 
-## Commands
+## Comandos
 
 ```bash
-appctl <project> <components...>   # create
-appctl list                        # table: project | app | sftp | db | status
-appctl <project> info               # urls + per-service status
-appctl <project> creds              # re-reveal the .env (ends up in scrollback)
-appctl <project> logs [-f] [--app|--db|--sftp]
-appctl <project> shell              # exec bash in the app container
-appctl <project> psql               # psql, connected, no password
-appctl <project> restart
-appctl <project> rotate <sftp|db|mig>
-appctl <project> destroy [--keep-data]
-appctl doctor                        # host state
+appctl <proyecto> <componentes...>   # crear
+appctl list                          # tabla: proyecto | app | sftp | db | estado
+appctl <proyecto> info               # urls + estado de cada servicio
+appctl <proyecto> creds              # re-revela el .env (queda en el scrollback)
+appctl <proyecto> logs [-f] [--app|--db|--sftp]
+appctl <proyecto> shell              # exec bash en el contenedor app
+appctl <proyecto> psql               # psql ya conectado, sin password
+appctl <proyecto> restart
+appctl <proyecto> rotate <sftp|db|mig>
+appctl <proyecto> destroy [--keep-data]
+appctl doctor                        # estado del host
 ```
 
 ---
 
-## Idempotency and concurrency
+## Idempotencia y concurrencia
 
-- `flock` on `registry.json` for the whole of `create`/`destroy`. Without it, two
-  parallel creations grab the same port without noticing.
-- Both ports (app and sftp) get reserved in the registry before anything starts.
-- It checks real `ss -ltnp` as well as the registry: the registry can lie if
-  someone started a container by hand.
-- `create` on an existing project fails. `destroy` needs `--yes` or an
-  interactive confirmation.
+- `flock` sobre `registry.json` durante todo `create`/`destroy`. Sin eso, dos
+  altas en paralelo se clavan el mismo puerto sin enterarse.
+- Reserva los **dos** puertos (app y sftp) en el registry antes de levantar nada.
+- Verifica contra `ss -ltnp` real además del registry: el registry puede
+  mentir si alguien levantó un contenedor a mano.
+- `create` sobre un proyecto existente falla. `destroy` exige `--yes` o
+  confirmación interactiva.
 
-### The check that matters most
+### La verificación que más importa
 
-After `up -d`, the smoke test **checks that the database doesn't answer from the
+Después de `up -d`, el smoke test **comprueba que la DB no responde desde el
 host**:
 
 ```bash
 docker run --rm --network host postgres:18-alpine \
-  pg_isready -h 127.0.0.1 -p 5432   # this has to fail
+  pg_isready -h 127.0.0.1 -p 5432   # tiene que fallar
 ```
 
-The port not being in the YAML isn't enough: you have to confirm that a client
-from outside dies. If a database image ever ships with a `ports:` in it, that
-stops at creation instead of three months later.
+Que el puerto no esté en el YAML no alcanza: hay que comprobar que un cliente
+desde afuera muere. Si una imagen de la base un día trae un `ports:` puesto, eso
+frena en la creación y no tres meses después.
 
 ---
 
-## Repo layout
+## Estructura del repo
 
 ```
 appctl/
-├── bin/appctl                 # the CLI, stdlib and nothing else
+├── bin/appctl                 # el CLI, stdlib y nada más
 ├── lib/
-│   ├── gen.py                 # renders the compose and the .env
-│   ├── ports.py               # port registry + flock
+│   ├── gen.py                 # renderiza el compose y el .env
+│   ├── ports.py               # registry de puertos + flock
 │   ├── dbtool.py              # dump / restore / expose / grant
-│   ├── smoke.py               # the 9 checks
-│   └── summary.py             # the summary for the developer
-├── stacks/                    # 4 stacks, one per directory
+│   ├── smoke.py               # los 9 checks
+│   └── summary.py             # el resumen para el developer
+├── stacks/                    # 4 stacks, uno por directorio
 ├── tests/
-│   ├── test_init_sql.py       # runs the inits and validates the SQL they produce
-│   ├── test_root_pw.py        # parses mariadb's log line
-│   ├── test_security.py       # the compose doesn't publish the database
-│   └── check_names.py         # AST: undefined calls, duplicate defs
-└── docs/                      # (private, not in this repo)
+│   ├── test_init_sql.py       # ejecuta los init y valida el SQL que producen
+│   ├── test_root_pw.py        # parsea la línea del log de mariadb
+│   ├── test_security.py       # el compose no publica la DB
+│   └── check_names.py         # AST: llamadas sin definir, defs duplicadas
+└── docs/                      # (privado, no en este repo)
 ```
 
-`tests/test_init_sql.py` paid for itself several times over. An init runs once,
-when the volume is created; if it fails there, there's no retry and the project
-ends up with a database missing its three users, permanently. The test runs the
-init for real with `psql`/`mariadb` swapped for a binary that does `cat`, and
-looks at the SQL that comes out. No database required.
+`tests/test_init_sql.py` es el que más rindió. Un init corre una sola vez, cuando
+se crea el volumen; si falla ahí, no hay reintento y el proyecto queda con una
+base sin los tres usuarios para siempre. El test corre el init de verdad con
+`psql`/`mariadb` sustituidos por un binario que hace `cat`, y mira el SQL que
+llega. Sin base de datos de por medio.
 
----
 
-## Status
+## Estado
 
-Working and verified end to end on PostgreSQL and MariaDB:
+Funcional y verificado end-to-end en PostgreSQL y MariaDB:
 
 | | |
 |---|---|
-| `create` | 9/9 checks: containers healthy, DB answers, roles created, password required, DB unreachable from the host and from another container |
-| `clone` | data, indexes and new credentials; the clone is independent of the source |
-| `upgrade` | PHP 8.5 → 8.4 → 8.5, data intact |
-| `db dump/restore` | Postgres and MariaDB |
-| `db expose` | publishes the database on a host port; only from `127.0.0.1` by default, `--cidr` opens it to a network |
-| `db grant` | new users, with their own password |
+| `create` | 9/9 checks: contenedores healthy, DB responde, roles creados, password exigida, DB inalcanzable desde el host y desde otro contenedor |
+| `clone` | datos, índices y credenciales nuevas; el clon es independiente del origen |
+| `upgrade` | PHP 8.5 → 8.4 → 8.5, datos intactos |
+| `db dump/restore` | Postgres y MariaDB |
+| `db expose` | publica la DB en un puerto del host; por defecto solo desde `127.0.0.1`, con `--cidr` se abre a una red |
+| `db grant` | alta de usuarios, con password propia |
 
-Verified stacks: `php-postgres-sftp`, `php-mysql-sftp`,
+Los stacks verificados: `php-postgres-sftp`, `php-mysql-sftp`,
 `nextjs-postgres-sftp`, `tomcat-postgres-sftp`.
 
 ---
+## El nombre del servidor en el summary
 
-## The server name in the summary
+El summary dice el nombre de `$APPCTL_HOST`, no la IP. El developer lo copia y
+funciona. Si mañana el servidor cambia de IP, el summary no queda viejo.
 
-The summary prints the `$APPCTL_HOST` name, not the IP. The developer copies it
-and it works. If the server's IP changes tomorrow, the summary doesn't go stale.
-
-If someone eventually asks for a domain per client, the compose is already
-ready for it: adding a Traefik `labels:` is one line. Not implemented now
-because nobody asked for it.
+Si en algún momento se pide dominio por cliente, el compose ya queda preparado:
+agregar un `labels:` de Traefik es una línea. No se implementa ahora porque no
+fue pedido.
