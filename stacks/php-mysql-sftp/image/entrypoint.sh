@@ -216,7 +216,7 @@ fi
 # --- stubs de configuracion, solo si el cliente no trajo los suyos --------
 # Re-escribir el stub SIEMPRE que sea el nuestro. El check anterior solo
 # escribia si el archivo no existia: un proyecto recreado de postgres a
-# mysql conservaba el index.php viejo y la pagina seguia报告显示
+# mysql conservaba el index.php viejo y la pagina seguia usando
 # pdo_pgsql y "SIN CONEXION" en un stack MariaDB. La marca
 # APPCTL_STUB lo distingue del codigo real del cliente: si el cliente
 # subio su index.php, no se toca.

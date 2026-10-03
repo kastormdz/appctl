@@ -365,6 +365,52 @@ Cuando se llegue a 10, se mide el uso real y se decide: ampliar el LVM, o mover
 los volúmenes de datos a espacio externo (local, S3, lo que sea). No antes — con
 10 clientes y 20 GB libres no hay nada que decidir.
 
+## La base de datos: los comandos que la mueven
+
+La DB **nunca se expone sola**. Vive en una red `internal:true` sin puerto
+publicado; el chequeo `create` lo verifica de verdad: lo prueba desde otro contenedor,
+no leyendo la config.
+
+### Exponerla
+
+```bash
+appctl <p> db expose 5432                     # solo desde 127.0.0.1
+appctl <p> db expose 5432 --cidr 10.20.0.0/16  # abrir a una red
+```
+
+El default es `127.0.0.1`, no una red. Con `10.0.0.0/8` cualquier LAN que llegue
+al puerto entra, y quien llama al comando no tiene por qué saber que la base
+quedó abierta a medio entorno. Para una red, `--cidr` explícito.
+
+`appctl <p> db unexpose` cierra. Publicar el puerto **no** hace que la base
+deje de estar en su red interna: es una publicación del host, no un permiso.
+
+### Backups
+
+```bash
+appctl <p> db dump                 # a un archivo, ambos motores
+appctl <p> db restore <archivo>
+```
+
+En Postgres el dump va con `--no-owner --no-acl` y **sin `--clean`**: un
+`--clean --if-exists` genera `DROP ROLE` del origen y el restore muere con
+`FATAL: role "x" does not exist` cuando se restaura en un clon.
+
+### Un usuario nuevo
+
+```bash
+appctl <p> db grant nombre --rol readonly
+```
+
+En MariaDB el usuario de migración necesita `WITH GRANT OPTION` sobre la base
+**y** `CREATE USER` global — MariaDB rechaza `GRANT OPTION ON db.*` con 1064
+porque no es un privilegio, es una opción de `GRANT`. El alcance global es
+seguro acá porque cada base está en su red y no comparte nada con otros
+clientes: el aislamiento lo da la red. En un MySQL con varias bases en el mismo
+servidor, no.
+
+---
+
 ## Comandos
 
 ```bash
@@ -446,7 +492,7 @@ Funcional y verificado end-to-end en PostgreSQL y MariaDB:
 | `clone` | datos, índices y credenciales nuevas; el clon es independiente del origen |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, datos intactos |
 | `db dump/restore` | Postgres y MariaDB |
-| `db expose` | publica la DB en un puerto del host, con CIDR opcional |
+| `db expose` | publica la DB en un puerto del host; por defecto solo desde `127.0.0.1`, con `--cidr` se abre a una red |
 | `db grant` | alta de usuarios, con password propia |
 
 Los stacks verificados: `php-postgres-sftp`, `php-mysql-sftp`,

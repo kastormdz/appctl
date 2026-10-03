@@ -2412,8 +2412,13 @@ def main() -> int:
 
     q = dsub.add_parser("grant", help="dar acceso a un usuario externo")
     q.add_argument("usuario")
-    q.add_argument("--cidr", default="10.0.0.0/8",
-                   help="de donde se permite entrar (default 10.0.0.0/8)")
+    # El default NO es una red: es 127.0.0.1, o sea "solo desde este host".
+    # Con 10.0.0.0/8 cualquier red privada que llegue al puerto entra, y el
+    # que llama al comando no tiene por que saber que la base quedo abierta
+    # a medio LAN. Quien quiera la red interna la pide explicita.
+    q.add_argument("--cidr", default="127.0.0.1",
+                   help="de donde se permite entrar (default 127.0.0.1: "
+                        "solo este host. Para una red, --cidr 10.20.0.0/16)")
     q.add_argument("--rol", default="readonly",
                    choices=["readonly", "write", "migrate"], help="readonly default")
     q.add_argument("--schema", default="public")
