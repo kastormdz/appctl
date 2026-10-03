@@ -378,9 +378,9 @@ appctl <p> db expose 5432                     # solo desde 127.0.0.1
 appctl <p> db expose 5432 --cidr 10.20.0.0/16  # abrir a una red
 ```
 
-El default es `127.0.0.1`, no una red. Con `10.0.0.0/8` cualquier LAN que llegue
-al puerto entra, y quien llama al comando no tiene por qué saber que la base
-quedó abierta a medio entorno. Para una red, `--cidr` explícito.
+El default es `127.0.0.1`, no una red. Con un `/8` cualquiera, cualquier LAN que
+llegue al puerto entra, y quien llama al comando no tiene por qué saber que
+la base quedó abierta a medio entorno. Para una red, `--cidr` explícito.
 
 `appctl <p> db unexpose` cierra. Publicar el puerto **no** hace que la base
 deje de estar en su red interna: es una publicación del host, no un permiso.
