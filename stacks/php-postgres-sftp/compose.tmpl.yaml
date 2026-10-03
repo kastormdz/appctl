@@ -1,0 +1,185 @@
+# Generado por appctl desde stacks/php-postgres-sftp/compose.tmpl.yaml
+# NO EDITAR A MANO: los cambios se pierden en el proximo
+# `appctl <proyecto> upgrade`, que lo re-renderiza desde este template.
+#
+# Datos persistentes: TODO en bind mounts dentro de este directorio.
+# Nada de volumes nombrados, para que `destroy --keep-data` sea un rm -rf
+# de una carpeta y el backup sea un tar de una carpeta.
+name: appctl-__PROYECTO__
+
+services:
+
+  # ---------------------------------------------------------------- app ----
+  # nginx + php-fpm + sshd en un mismo contenedor. El cliente tiene su
+  # servidor web listo; el codigo que sube por SFTP es el que sirve PHP.
+  app:
+    # SIN build:. La imagen se construye UNA vez con `appctl build` y la
+    # comparten todos los proyectos del mismo PHP. Un `build:` aca hace que
+    # cada cliente nuevo compile la imagen entera, que es lo que NO quiero.
+    # Si la imagen no existe, appctl create lo dice y te dice que corras
+    # `appctl build` (no compila solo: fallar a medias es peor).
+    image: __APP_IMAGE__
+    # La imagen es local (la construye `appctl build` y la comparten todos
+    # los proyectos). Sin esto, compose la intenta PULL de un registry que
+    # no existe: "pull access denied for appctl/...".
+    pull_policy: never
+    container_name: __PROYECTO___app
+    labels:
+      appctl.proyecto: __PROYECTO__
+      appctl.rol: app
+      appctl.gestor: appctl
+    hostname: __PROYECTO__
+    restart: unless-stopped
+    environment:
+      PROJECT: __PROYECTO__
+__CRON__
+      SFTP_USER: ${SFTP_USER}
+      SFTP_PASSWORD: ${SFTP_PASSWORD}
+      SFTP_UID: ${SFTP_UID:-1001}
+      SFTP_GID: ${SFTP_GID:-1000}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_MIGRATION_USER: ${DB_MIGRATION_USER}
+      DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD}
+      DB_READONLY_USER: ${DB_READONLY_USER}
+      DB_READONLY_PASSWORD: ${DB_READONLY_PASSWORD}
+    volumes:
+      # chroot del SFTP = webroot. UN solo bind mount para las dos cosas:
+      # el cliente sube a /upload (en el host: sftp/home/upload) y nginx+fpm
+      # sirven ESE MISMO directorio. Un lugar para el codigo, no dos que hay
+      # que sincronizar. El chroot debe ser el mismo path que ve
+      # ChrootDirectory y root:root 755, o sshd cierra la conexion.
+      - ./sftp/home:/srv/sftp
+      # vhost montado, no baked: se edita sin rebuild
+      - ./nginx/site.conf:/etc/nginx/conf.d/default.conf:ro
+      # host keys del host: si no, cada recreate cambia la huella SSH y el
+      # cliente ve un host distinto cada vez
+      - /etc/ssh/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro
+      - /etc/ssh/ssh_host_rsa_key:/etc/ssh/ssh_host_rsa_key:ro
+      - /etc/ssh/ssh_host_ecdsa_key:/etc/ssh/ssh_host_ecdsa_key:ro
+      # logs al stdout del contenedor (docker logs), no a un archivo
+      - type: tmpfs
+        target: /var/log/nginx
+      - type: tmpfs
+        target: /run
+    ports:
+      # el unico puerto web del proyecto
+      - "__APP_PORT__:80"
+      # sftp del proyecto
+      - "__SFTP_PORT__:22"
+    networks:
+      - egress
+      - data
+    deploy:
+      # Limite = TECHO, no reserva. Docker no commitmenta la memoria: el
+      # kernel solo toma lo que el proceso pide. Medido con 4 stacks reales:
+      # php 38 MB, next 36 MB, tomcat 102 MB, postgres 29 MB en reposo.
+      #
+      # Por que 512M y no 1G: en reposo da lo mismo (el proceso pide 40 MB
+      # y toma 40 MB), pero el techo cae antes. Un cliente que se va de las
+      # manos (un loop, una consulta sin limite) topa contra su 512M y se
+      # muere SOLO, en vez de empujar a los otros 14.
+      #
+      # Para subirle a uno:  APP_MEMORY=2G en el .env del proyecto.
+      # Para subirle a todos: editar el template y `appctl <p> upgrade`.
+      #
+      # NOTA de capacidad: esto NO limita cuantos clientes entran. Con 15 GB
+      # y ~1 GB entre host y servicios, entran ~30 clientes en reposo. Si
+      # hacen falta mas, la RAM del host se agranda en OpenStack (la VM es
+      # Nova: se cambia el flavor y se reinicia), no bajando este numero.
+      resources:
+        limits:
+          cpus: "${APP_CPUS:-1.0}"
+          memory: ${APP_MEMORY:-512M}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    security_opt:
+      - no-new-privileges:true
+    # root por defecto: el entrypoint necesita crear el chroot con
+    # root:root 755 y setear la password del usuario SFTP.
+
+  # ----------------------------------------------------------------- db ----
+  # SIN ports:. Ni uno. Vive en la red `data` (internal:true, sin gateway).
+  # Inalcanzable desde el host y desde internet. Alcanzable desde `app`.
+  db:
+    image: postgres:__PG_VERSION__-alpine
+    # esta si viene de docker hub: bajarla si no esta local
+    pull_policy: missing
+    container_name: __PROYECTO___db
+    labels:
+      appctl.proyecto: __PROYECTO__
+      appctl.rol: db
+      appctl.gestor: appctl
+    hostname: __PROYECTO___db
+    # Publicar la DB en el host es OPCIONAL y por defecto NO: el puerto
+    # queda cerrado y la red data es internal:true, o sea que nadie de
+    # afuera la alcanza. `appctl <p> db expose <puerto>` rellena esto.
+__DB_PUBLISH__
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME}
+      # El superuser NO es el rol de la app. Con POSTGRES_USER = DB_USER
+      # (los dosettel el mismo nombre) el init/10-roles.sh hacia
+      # CREATE ROLE <lo mismo> y postgres contestaba
+      # 'role "acme" already exists': con ON_ERROR_STOP=1 el script paraba
+      # y los roles de migracion y readonly nunca se creaban. El proyecto
+      # quedaba 'creado' con una base que solo el superuser podia usar.
+      POSTGRES_USER: ${DB_ADMIN_USER}
+      # La password del SUPERUSER, no la de la app: son usuarios
+      # distintos con passwords distintas.
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # El init/10-roles.sh necesita estos para crear los tres roles del
+      # proyecto (app / migracion / readonly). Con set -u, que faltara uno
+      # daba 'DB_USER: unbound variable' en la linea 16 y el script SEGUIA:
+      # los tres roles nunca se creaban y el error de postgres de verdad
+      # era 'role "postgres" does not exist', que no senala el problema.
+      # El proyecto quedaba 'creado' con una sola base y sin los roles.
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_MIGRATION_USER: ${DB_MIGRATION_USER}
+      DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD}
+      DB_READONLY_USER: ${DB_READONLY_USER}
+      DB_READONLY_PASSWORD: ${DB_READONLY_PASSWORD}
+    volumes:
+      - ./db/data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - data
+    deploy:
+      # Limites BAJOS a proposito. Medido en 4 stacks reales: php 38 MB,
+      # next 36 MB, tomcat 102 MB de RAM en reposo. El limite no es una
+      # reserva: es el techo antes de que un cliente se coma el server.
+      # Con 512M un php aguanta ~13x lo que usa en reposo; 1G reservaba 7 GB
+      # del server para 214 MB de trabajo real y a los 10 clientes no
+      # entraba nada. Cambiar por proyecto: APP_MEMORY=2G en el .env.
+      resources:
+        limits:
+          cpus: "${DB_CPUS:-0.75}"
+          memory: ${DB_MEMORY:-512M}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_ADMIN_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+networks:
+  # con salida a internet: la app llama a una pasarela de pagos, a un SMTP,
+  # a la API de un whatsapp. Sin esto, el cliente no puede cobrar.
+  egress:
+    driver: bridge
+  # SIN GATEWAY. La guarantee de que la DB no se ve desde afuera, hecha con
+  # machinery y no con "no le puse ports:". Nadie la alcanza, ni siquiera
+  # otro contenedor de otro proyecto.
+  data:
+    driver: bridge
+    internal: true

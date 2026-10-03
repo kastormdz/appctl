@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+*.log
+
+# Helper de acceso a la red interna: es especifico de mi topologia
+# (cadena de saltos, IPs, usuarios). No va a un repo publico.
+# Copia real en ~/tmp/mz-real.bak
+bin/mz

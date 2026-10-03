@@ -1,0 +1,2515 @@
+#!/usr/bin/env python3
+"""appctl - provisionador de stacks por cliente.
+
+    appctl <proyecto> <componentes...>     crear
+    appctl list                            ver todos
+    appctl <proyecto> <subcomando>         ver un proyecto
+
+Componentes: php | nextjs | tomcat | psql | mysql | sftp | cron
+Solo stdlib. Corre en el host, al lado de Docker.
+"""
+import argparse
+import atexit
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+from shlex import quote as sh_quote
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import ports as portsmod
+import gen as sec
+import smoke as smokemod
+from summary import render_create, render_rotate, render_list, render_info
+
+# Defaults deliberadamente genericos (/srv/appctl): un repo publico no debe
+# dictar la topologia del que lo instala. Donde van las cosas se decide con
+# APPCTL_PROJECTS y APPCTL_HOME; el unico requisito real es que el directorio
+# de proyectos este en el MISMO filesystem que el root de Docker, para que un
+# restore cierre.
+APPCTL_HOME = Path(os.environ.get("APPCTL_HOME", "/srv/appctl/.appctl"))
+PROJECTS_DIR = Path(os.environ.get("APPCTL_PROJECTS", "/srv/appctl"))
+STACKS_DIR = Path(__file__).resolve().parent.parent / "stacks"
+# El host NO tiene default: cada instalacion define APPCTL_HOST. Hardcodear
+# el dominio de una despliegue daba un help que moria en otro lado, y en un
+# repo publico publicaba la topologia del que lo instala.
+DEFAULT_HOST = os.environ.get("APPCTL_HOST", "localhost")
+
+RUNTIMES = {"php", "nextjs", "tomcat"}
+DATABASES = {"psql", "mysql"}
+SERVICES = {"psql", "mysql", "sftp"}
+ALL_COMPONENTS = RUNTIMES | DATABASES | {"sftp", "cron"}
+
+# Tags resueltos contra Docker Hub en `create` y escritos FIJOS en el compose.
+# Ver README: un contenedor corriendo no se actualiza solo.
+DEFAULT_TAGS = {
+    "php": os.environ.get("APPCTL_PHP_TAG", "8.5-fpm-alpine"),
+    "psql": os.environ.get("APPCTL_PG_TAG", "18-alpine"),
+    "mysql": os.environ.get("APPCTL_MYSQL_TAG", "11.8"),
+    "sftp": "alpine",
+    "nextjs": os.environ.get("APPCTL_NODE_TAG", "22-alpine"),
+    # tomcat oficial de docker (Tomcat + JDK ya resueltos). NO bitnami:
+    # desde ago-2025 su catalogo publico es de pago y lo gratuito esta
+    # congelado en bitnamilegacy, sin parches de CVE.
+    "tomcat": os.environ.get("APPCTL_TOMCAT_TAG", "11-jdk25-temurin-noble"),
+}
+
+APP_PORT_RANGE = (8001, 8500)
+SFTP_PORT_RANGE = (2221, 2320)
+
+MIN_PHP = (8, 1)
+MAX_PHP = (8, 9)
+
+
+def die(msg: str, code: int = 1):
+    print(f"\n\033[31merror:\033[0m {msg}\n", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd: list[str], cwd=None, timeout=300, capture=True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd, cwd=cwd, text=True,
+        capture_output=capture, timeout=timeout,
+    )
+
+
+def sh(cmd: str, cwd=None, timeout=300) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd, shell=True, cwd=cwd, text=True,
+        capture_output=True, timeout=timeout,
+    )
+
+
+# --------------------------------------------------------------- create ----
+
+def stack_name(components: set[str]) -> str:
+    """El NOMBRE del stack. Solo runtime + db + sftp.
+
+    `cron` NO entra aca a proposito: no cambia la imagen ni la base, es un
+    paquete de mas que hace el entrypoint del contenedor de la app. Si
+    `cron` fuera parte del nombre, habria que duplicar cada directorio de
+    stack (runtime x db x sftp x cron = 16 combinaciones) y 14 de esas 16
+    serian copias identicas con dos lineas de diferencia. Cron se resuelve
+    como bandera: `want_cron` se pasa aparte al render.
+    """
+    runtime = next((r for r in ("php", "nextjs", "tomcat") if r in components), None)
+    db = "postgres" if "psql" in components else ("mysql" if "mysql" in components else None)
+    parts = [runtime]
+    if db:
+        parts.append(db)
+    if "sftp" in components:
+        parts.append("sftp")
+    return "-".join(parts)
+
+
+def validate_components(components: set[str]) -> None:
+    unknown = components - ALL_COMPONENTS
+    if unknown:
+        die(f"componentes desconocidos: {', '.join(sorted(unknown))}\n"
+            f"  validos: {', '.join(sorted(ALL_COMPONENTS))}")
+    if not (components & RUNTIMES):
+        die(f"falta el runtime: elige uno de {', '.join(sorted(RUNTIMES))}")
+    if not (components & SERVICES):
+        die("falta al menos un servicio: psql, mysql o sftp")
+    if len(components & DATABASES) > 1:
+        die("psql y mysql son alternativas, no acumulables")
+    if "cron" in components and "sftp" not in components:
+        # cron lee el crontab de /upload/cron/crontab, que es el chroot del
+        # SFTP. Sin sftp el cliente no tiene por donde subirlo.
+        die("cron necesita sftp: el cliente sube el crontab a "
+            "/upload/cron/crontab por SFTP")
+
+
+def php_version_ok(tag: str) -> bool:
+    try:
+        major, minor = tag.split("-")[0].split(".")[:2]
+        return MIN_PHP <= (int(major), int(minor)) <= MAX_PHP
+    except (ValueError, IndexError):
+        return False
+
+
+def build_dir(project: str) -> Path:
+    return PROJECTS_DIR / project
+
+
+def cmd_create(args) -> int:
+    components = set(args.componentes)
+    validate_components(components)
+    project = args.proyecto
+
+    try:
+        portsmod.valid_project(project)
+    except portsmod.PortError as e:
+        die(str(e))
+
+    stack = stack_name(components)
+    stack_dir = STACKS_DIR / stack
+    if not stack_dir.is_dir():
+        # El caso comun es forgetting el sftp: `appctl acme php psql` genera
+        # 'php-postgres', que no existe. Decir "no existe el stack
+        # 'php-postgres'" sin más hace que el usuario adivine.
+        disponibles = sorted(p.name for p in STACKS_DIR.iterdir() if p.is_dir())
+        pistas = []
+        if "sftp" not in components:
+            pistas.append("falta 'sftp': todos los stacks lo incluyen "
+                          "(es como el cliente sube el codigo)")
+        if stack.startswith(("php-postgres", "php-mysql")):
+            pistas.append(f"probaste: appctl {project} "
+                          f"{' '.join(sorted(components))} sftp")
+        die(f"no existe el stack {stack!r}\n"
+            + "".join(f"  {p_}\n" for p_ in pistas)
+            + f"  stacks disponibles: {', '.join(disponibles)}")
+
+    if args.php and not php_version_ok(args.php):
+        die(f"version de php no soportada: {args.php}\n"
+            f"  soportado: 8.1 a 8.9 (ej: 8.3)")
+
+    if build_dir(project).exists():
+        # Un create que fallo a mitad (imagen que no baja, sin espacio, un
+        # Ctrl-C) deja el directorio a medias. El mensaje anterior decia
+        # "ya existe, hacé destroy" sin distinguir eso de un proyecto real,
+        # y el admin se comia un error que lo mandaba a borrar algo que no
+        # habia que borrar. Un proyecto REAL tiene state.json: sin eso no
+        # hay nada que perder y se limpia solo.
+        if not (build_dir(project) / "state.json").exists():
+            # Antes de borrar: si no es escribible, el rmtree tampoco va a
+            # poder (o va a necesitar sudo). Decirlo, no fallar en silencio.
+            d = build_dir(project)
+            if not os.access(d, os.W_OK):
+                du = sh(f"stat -c '%U:%G %a' {sh_quote(str(d))}",
+                        timeout=30).stdout.strip()
+                die(f"{d} existe pero no es escribible y no es un proyecto\n"
+                    f"  lo tiene: {du}\n"
+                    f"  se creo desde otro proceso o desde un contenedor. "
+                    f"Para continuar:\n"
+                    f"    sudo rm -rf {d}")
+            shutil.rmtree(build_dir(project), ignore_errors=True)
+            print(f"limpio: {build_dir(project)} estaba a medias "
+                  f"(sin state.json, no era un proyecto)")
+        else:
+            die(f"ya existe el proyecto {project}\n"
+                f"  detalle:  appctl {project} info\n"
+                f"  empezar de nuevo: appctl {project} destroy")
+
+    # ---- puertos, bajo lock ------------------------------------------------
+    reg = portsmod.Registry(str(APPCTL_HOME / "registry.json"))
+    with reg.locked() as data:
+        if args.app_port:
+            app_port = args.app_port
+        else:
+            app_port = portsmod.find_free(
+                *APP_PORT_RANGE, data["ports"], "app")
+        sftp_port = None
+        if "sftp" in components:
+            sftp_port = args.sftp_port or portsmod.find_free(
+                *SFTP_PORT_RANGE, data["ports"], "sftp")
+        try:
+            reg.check_free(data, project, app_port, sftp_port or 0)
+        except portsmod.PortError as e:
+            die(str(e))
+
+        # ---- secretos -----------------------------------------------------
+        pw = {
+            # La del superuser <proyecto>_admin es propia: ver el comentario
+            # donde se escribe en el .env. Con POSTGRES_PASSWORD apuntando a
+            # DB_PASSWORD, el admin quedaba con la password de la app.
+            "DB_ADMIN_PASSWORD": sec.password(24),
+            "DB_PASSWORD": sec.password(24),
+            "DB_MIGRATION_PASSWORD": sec.password(24),
+            "DB_READONLY_PASSWORD": sec.password(24),
+            "SFTP_PASSWORD": sec.password(20),
+            "APP_KEY": sec.app_key(),
+        }
+        # MariaDB exige password para root. No se muestra en el summary ni
+        # se entrega: es para administracion del contenedor.
+        if "mysql" in components:
+            pw["DB_ROOT_PASSWORD"] = sec.password(28)
+        names = {
+            "DB_NAME": f"{project}_db",
+            "DB_USER": project,
+            "DB_MIGRATION_USER": f"{project}_mig",
+            "DB_READONLY_USER": f"{project}_ro",
+            "SFTP_USER": project,
+        }
+        tags = {k: DEFAULT_TAGS[k] for k in components if k in DEFAULT_TAGS}
+        if args.php:
+            tags["php"] = f"{args.php}-fpm-alpine"
+        pg_major = tags.get("psql", "18-alpine").split("-")[0]
+
+        # ---- escribir el proyecto ----------------------------------------
+        pdir = build_dir(project)
+        render_project(pdir, stack_dir, stack, project, components, tags,
+                       names, pw, app_port, sftp_port, host=args.host,
+                       pg_major=pg_major, api_key=sec.token(24),
+                       want_cron="cron" in components,
+                       app_memory=args.app_memory or "",
+                       db_memory=args.db_memory or "")
+
+        # ---- reservar en el registry -------------------------------------
+        reg.reserve(data, project, app_port, sftp_port or 0)
+
+    if args.dry_run:
+        print(f"\n[dry-run] {project} generado en {pdir}, sin levantar")
+        print(f"  stack: {stack}")
+        print(f"  app:   {args.host}:{app_port}")
+        if sftp_port:
+            print(f"  sftp:  sftp://{names['SFTP_USER']}@{args.host}:{sftp_port}")
+        return 0
+
+    # ---- verificar imagen (NO compilar) ----------------------------------
+    # La imagen es compartida entre proyectos y se construye con
+    # `appctl build`. Acá solo se verifica que exista: si falta, el error
+    # dice que corras `appctl build`, con el tag exacto. Compilar acá
+    # seria lo que hace cada deploy lento.
+    # el tag sale del STACK (que ya sabe el motor), no del runtime suelto
+    img = image_tag(stack, tags.get(runtime_of(stack), DEFAULT_TAGS[runtime_of(stack)]))
+    if not _image_exists(img):
+        die(f"falta la imagen {img}\n"
+            f"  construila una vez:  appctl build\n"
+            f"  (no se compila en cada create: es el mismo build para todos "
+            f"los proyectos con el mismo PHP)")
+
+    # el compose tiene que pedir EXACTAMENTE la imagen que existe. Un tag
+    # distinto (':8.5' vs ':8.5-fpm-alpine') hace que el up falle con
+    # 'No such image' despues de crear las redes y los directorios.
+    compose_txt = (pdir / "compose.yaml").read_text()
+    if img not in compose_txt:
+        die(f"el compose pide una imagen distinta de la que existe\n"
+            f"  existe:  {img}\n"
+            f"  compose: busca otra cosa (revisar el template del stack)")
+
+    # El compose TIENE que parsear ANTES del up: un placeholder mal puesto
+    # lo deja invalido y el up muere con 'did not find expected key' DESPUES
+    # de reservar puertos y escribir archivos. Este check va antes.
+    _assert_compose_valid(pdir)
+
+    print(f"[1/3] levantando...")
+    r = subprocess.run(["docker", "compose", "up", "-d"],
+                       cwd=pdir, text=True, timeout=600, capture_output=True)
+    if r.returncode != 0:
+        # rollback: sin esto quedan los puertos reservados y el directorio a
+        # medias, y el proximo cliente que pida el 8001 recibe "ya asignado"
+        # sin saber por que.
+        print("\n[rollback] el up fallo: libero puertos y borro el directorio")
+        with reg.locked() as data:
+            reg.release(data, project)
+        sh("docker compose down -v --remove-orphans", cwd=pdir, timeout=180)
+        subprocess.run(["sudo", "-n", "rm", "-rf", str(pdir)],
+                       capture_output=True, timeout=180)
+        shutil.rmtree(pdir, ignore_errors=True)
+        out = (r.stdout + r.stderr).strip()
+        die(f"fallo el up:\n{out[-2500:]}\n"
+            f"(no quedo nada a medias: puertos liberados, directorio borrado)")
+
+    # ---- smoke ------------------------------------------------------------
+    print("[2/3] verificando...")
+    is_mysql = "mysql" in components
+    cfg = {
+        "project": project, "app_port": app_port,
+        "sftp_port": sftp_port, "sftp_user": names["SFTP_USER"],
+        "sftp_password": pw["SFTP_PASSWORD"],
+        "db_kind": "mysql" if is_mysql else "postgres",
+        "db_port": 3306 if is_mysql else 5432,
+        "db_image": (f"mariadb:{tags.get('mysql','11.8')}" if is_mysql
+                     else f"postgres:{pg_major}-alpine"),
+        # los tres roles del proyecto. Sin esto el check 'los tres roles
+        # existen' se queda sin nada que verificar y devuelve PASS: el
+        # chequeo mas importante del grupo, pasando siempre.
+        "db_users": [names["DB_USER"], names["DB_MIGRATION_USER"],
+                     names["DB_READONLY_USER"]],
+        # el .env real del proyecto (no el dict de la creacion): lo
+        # necesitan las consultas que piden password (los usuarios de
+        # mysql). load_env lo lee del disco, que es donde quedo.
+        "env": load_env(project),
+    }
+    checks = smokemod.all_checks(str(pdir), cfg, args.host)
+    failed = [c for c in checks if not c.ok]
+
+    print("\n[3/3] resultado:")
+    for c in checks:
+        print(f"  {c}")
+
+    if failed:
+        print(f"\n\033[31m{len(failed)} verificacion(es) fallaron.\033[0m")
+        print(f"  logs:  appctl {project} logs")
+        print(f"  shell: appctl {project} shell")
+        print(f"  el proyecto quedo creado. appctl {project} destroy lo reverse.\n")
+        return 2
+
+    # ---- summary ----------------------------------------------------------
+    print(render_create(project, stack, args.host, app_port, sftp_port,
+                         names, pw, str(pdir)))
+    return 0
+
+
+def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
+                   components: set[str], tags: dict, names: dict, pw: dict,
+                   app_port: int, sftp_port: int | None, host: str,
+                   pg_major: str, api_key: str,
+                   want_cron: bool = False,
+                   app_memory: str = "", db_memory: str = "") -> None:
+    """Escribe el directorio del proyecto. Todo bajo pdir: nada de volumes
+    nombrados, para que destroy --keep-data sea borrar una carpeta."""
+    # exist_ok=True: el chequeo de "ya existe" ya paso arriba, con mensaje
+    # propio. Si algo lo creo en el medio (dos appctl simultaneos), que no
+    # reviente con un traceback de pathlib.
+    pdir.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # Un directorio recien creado puede NO ser nuestro: si un contenedor de un
+    # create anterior quedo corriendo, recrea `<proj>/db` como root y el
+    # mkdir siguiente (que corre como el usuario normal) falla con
+    # PermissionError en un path que el admin no escribio. Verificar el
+    # owner/dicho por el path, no solo que exista, y decirlo claro.
+    if not os.access(pdir, os.W_OK):
+        du = sh(f"stat -c '%U:%G %a' {sh_quote(str(pdir))}", timeout=30)
+        die(f"{pdir} no es escribible por {os.environ.get('USER', 'este usuario')}\n"
+            f"  lo tiene: {du.stdout.strip() or '(desconocido)'}\n"
+            f"  es de otro proceso o de un contenedor. Corregilo y volve:\n"
+            f"    sudo chown -R $(id -un):$(id -gn) {pdir}")
+    # build/ es donde Next buildea (node_modules, .next). El codigo del
+    # cliente vive en sftp/home/upload; /app se arma solo en el arranque.
+    for sub in ("db/data", "db/init", "sftp/home/upload", "nginx",
+                "cron", "logs", "build"):
+        (pdir / sub).mkdir(parents=True, exist_ok=True)
+
+    # NOTA: la imagen NO se copia al proyecto. Se construye una vez con
+    # `appctl build` y la comparten todos los proyectos con el mismo PHP.
+    # Copiarla aca multiplicaba el build por cliente.
+
+    # compose
+    tmpl = (stack_dir / "compose.tmpl.yaml").read_text()
+    subs = {
+        "__PROYECTO__": project,
+        "__PHP_VERSION__": tags.get("php", "8.5-fpm-alpine"),
+    # el sufijo del hash va en el MISMO tag: sin esto el compose pide una
+    # imagen sin hash que no existe (o peor, usa una vieja con bugs).
+    # El NOMBRE COMPLETO de la imagen lo pone el CLI, no el template: el
+    # template con "appctl/php-fpm-alpine-nginx" hardcodeado se desincroniza
+    # en cuanto RUNTIME_IMAGES cambia (php-pg vs php-mysql), y el compose
+    # termina pidiendo una imagen que no existe.
+    # La DB NO se publica por defecto: __DB_PUBLISH__ se deja vacio y el
+    # servicio db queda sin ports:, con la red data internal:true. Es lo que
+    # hace que nadie de afuera la alcance. `appctl <p> db expose <puerto>`
+    # lo rellena despues sobre el compose ya escrito.
+    "__DB_PUBLISH__": "",
+    "__APP_IMAGE__": image_tag(stack, tags.get(runtime_of(stack),
+                                                 DEFAULT_TAGS[runtime_of(stack)])),
+
+    # "__CRON__" se reemplaza por el bloque de crontab (o por nada). Es una
+    # bandera, no un stack: `cron` no cambia la imagen ni la DB, solo hace
+    # que el entrypoint instale busybox-cron y lea el crontab del cliente.
+    "__CRON__": ("      CRON_ENABLED: '1'\n" if want_cron else
+                 "      CRON_ENABLED: '0'\n"),
+        "__PG_VERSION__": pg_major,
+        "__MYSQL_VERSION__": tags.get("mysql", "11.8"),
+        "__NODE_VERSION__": tags.get("nextjs", "22-alpine"),
+        "__TOMCAT_VERSION__": tags.get("tomcat", "11-jdk25-temurin-noble"),
+        "__APP_PORT__": str(app_port),
+        "__SFTP_PORT__": str(sftp_port or 0),
+    }
+    for k, v in subs.items():
+        tmpl = tmpl.replace(k, v)
+    # un placeholder sin sustituir = compose invalido. Fallar aca, con el
+    # nombre del placeholder, y no 3 minutos despues en el build de docker
+    left = re.findall(r"__[A-Z_]+__", tmpl)
+    if left:
+        raise RuntimeError(
+            f"el template del stack {stack} tiene placeholders sin sustituir: "
+            f"{sorted(set(left))}\n"
+            f"  agrega el valor al dict `subs` de render_project() en bin/appctl"
+        )
+    (pdir / "compose.yaml").write_text(tmpl)
+    (pdir / "compose.yaml").chmod(0o640)
+
+    # .env con los secretos
+    env_lines = [
+        "# Credenciales del proyecto. 0600, no se commitea, no se imprime.",
+        f"PROJECT={project}",
+        f"STACK={stack}",
+        f"APP_PORT={app_port}",
+    ]
+    # NOTA: no van args de build aca. La imagen se construye una vez con
+    # `appctl build`; el proyecto solo la referencia.
+    for k, v in {**names, **pw}.items():
+        env_lines.append(f"{k}={v}")
+    # El superuser de postgres NO puede ser el rol de la app: si coinciden,
+    # el init/10-roles.sh hace CREATE ROLE de un rol que postgres ya creo
+    # como superuser, contesta 'already exists' y con ON_ERROR_STOP=1 los
+    # roles de migracion y readonly nunca se crean. Nombre aparte, con
+    # prefijo, para que la diferencia sea visible en un `db users`.
+    if "psql" in tags or (stack and "postgres" in stack):
+        # El admin necesita SU password: con POSTGRES_PASSWORD=${DB_PASSWORD}
+        # el superuser <proyecto>_admin quedaba con la password de la app, y
+        # el .env no la tenia guardada en ningun lado. Cuando el clone genera
+        # passwords nuevas para cada rol, la del admin nunca existio y el
+        # restore fallaba con 'password authentication failed for user
+        # <proyecto>_admin' sin decir que faltaba una variable.
+        # DB_ADMIN_PASSWORD NO se agrega aca a mano: el `for k, v in
+        # {**names, **pw}` de mas arriba ya escribe TODA clave del dict pw.
+        # Agregarla tambien ponia la linea DOS veces en el .env.
+        # Y con pw['DB_ADMIN_PASSWORD'] sin default, un camino que arma el
+        # dict sin esa clave reventaba con KeyError.
+        env_lines.append(f"DB_ADMIN_USER={project}_admin")
+    env_lines.append(f"API_TOKEN={api_key}")
+    # Los limites de RAM/CPU solo van al .env si el admin los paso en el
+    # create. Si no, el compose usa el default del template (512M), que es
+    # lo correcto para el caso comun.
+    if app_memory:
+        env_lines.append(f"APP_MEMORY={app_memory}")
+    if db_memory:
+        env_lines.append(f"DB_MEMORY={db_memory}")
+    (pdir / ".env").write_text("\n".join(env_lines) + "\n")
+    (pdir / ".env").chmod(0o600)
+
+    # nginx vhost
+    (pdir / "nginx" / "site.conf").write_text(
+        (stack_dir / "nginx" / "site.conf").read_text()
+        if (stack_dir / "nginx" / "site.conf").exists()
+        else "# server block: lo genera el entrypoint si no existe\n"
+             "server { listen 80 default_server; server_name _;\n"
+             "  root /var/www/html; index index.php;\n"
+             "  location / { try_files $uri $uri/ =404; } }\n"
+    )
+
+    # init de la DB
+    init_src = stack_dir / "init"
+    if init_src.is_dir():
+        for f in init_src.iterdir():
+            dst = pdir / "db" / "init" / f.name
+            shutil.copy2(f, dst)
+            if f.suffix == ".sh":
+                dst.chmod(0o755)
+
+    # crontab
+    if "cron" in components:
+        (pdir / "cron" / "crontab").write_text(
+            "# crontab del proyecto. reload: appctl %s cron:reload\n"
+            "SHELL=/bin/sh\n"
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+            "# */5 * * * * cd /var/www/html && php artisan schedule:run >> /dev/null 2>&1\n"
+            % project
+        )
+
+    # state
+    state = {
+        "project": project, "stack": stack, "host": host,
+        "app_port": app_port, "sftp_port": sftp_port,
+        "components": sorted(components), "tags": tags,
+        "db": {"kind": "postgres" if "psql" in components else
+                     ("mysql" if "mysql" in components else None),
+               "name": names["DB_NAME"],
+               "users": {"app": names["DB_USER"],
+                         "migracion": names["DB_MIGRATION_USER"],
+                         "readonly": names["DB_READONLY_USER"]}},
+        "sftp": {"user": names["SFTP_USER"], "port": sftp_port} if sftp_port else None,
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "api_key": api_key,
+        "appctl_version": "0.1.0",
+    }
+    (pdir / "state.json").write_text(json.dumps(state, indent=2) + "\n")
+    (pdir / "state.json").chmod(0o600)
+
+
+# Imagen compartida por runtime. UN solo lugar donde se decide el nombre:
+# antes el compose pedia ':8.5' y la imagen era ':8.5-fpm-alpine', y el
+# deploy fallaba con 'No such image'.
+# Una imagen POR STACK, no por runtime.
+#
+# php-postgres-sftp y php-mysql-sftp comparten la base (php:8.5-fpm-alpine +
+# nginx + sshd) pero sus entrypoint.sh difieren en ~75 lineas: el stub que
+# se escribe es distinto (pg_connect vs mysqli_connect), y los permisos del
+# chroot se resuelven distinto. Con UNA sola imagen para los dos, el segundo
+# build pisa el stub del primero y el proyecto que no se recreo queda
+# sirviendo el stub del otro motor: un stack MariaDB mostrando pdo_pgsql.
+#
+# Con una imagen por stack: el nombre incluye el motor, no puede haber
+# confusion, y el hash del contenido es de un solo stack.
+RUNTIME_IMAGES = {
+    "php-postgres-sftp":    ("appctl/php-pg",    "php"),
+    "php-mysql-sftp":       ("appctl/php-mysql", "php"),
+    "nextjs-postgres-sftp": ("appctl/node-nginx-sftp", "nextjs"),
+    "tomcat-postgres-sftp": ("appctl/tomcat-sftp",     "tomcat"),
+}
+
+
+def stack_hash(stack: str) -> str:
+    """Hash corto del contenido del stack (Dockerfile + image/).
+
+    El tag es `base:version`. Si el Dockerfile cambia pero la version no,
+    el tag queda igual, la imagen vieja sigue "valida" y el create usa la
+    imagen con el bug sin avisar. El hash del contenido lo evita: cambia el
+    tag, la imagen se reconstruye y el stack viejo queda intacto para los
+    proyectos que ya lo usan.
+    """
+    import hashlib
+    d = STACKS_DIR / stack / "image"
+    if not d.is_dir():
+        return "nohash"
+    h = hashlib.sha256()
+    for f in sorted(d.rglob("*")):
+        if f.is_file():
+            h.update(str(f.relative_to(d)).encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()[:8]
+
+
+def runtime_of(stack: str) -> str:
+    """El runtime de un nombre de stack: 'php-postgres-sftp' -> 'php'."""
+    return stack.split("-")[0]
+
+
+def image_tag(stack: str, tag: str) -> str:
+    rt = runtime_of(stack)
+    base, _ = RUNTIME_IMAGES.get(stack, RUNTIME_IMAGES[f"{rt}-postgres-sftp"])
+    return f"{base}:{tag}-{stack_hash(stack)}"
+
+
+def _image_exists(tag: str) -> bool:
+    r = sh(f'docker image inspect "{tag}"', timeout=30)
+    return r.returncode == 0
+
+
+def cmd_build(args) -> int:
+    """Construye las imagenes base UNA vez. Cacheadas: re-ejecutable.
+
+    Se corre cuando se cambia un Dockerfile o una version de PHP, no en
+    cada create. Despues, `appctl <proj> php psql sftp` es instantaneo.
+    """
+    # el proxy va en el env: el CLI lo pasa como build arg al compose
+    px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if not px:
+        print("aviso: sin HTTPS_PROXY en el entorno. Si el build falla con "
+              "'no such package', el contenedor no llega a los repos de apk "
+              "ni a packagist: hace falta un proxy o una regla de firewall.")
+    # el runtime deduce el stack por defecto: appctl build --runtime nextjs
+    runtime = args.runtime or "php"
+    # --runtime php   -> php-postgres-sftp  (el default)
+    # --runtime mysql -> php-mysql-sftp     (ahora es un runtime propio)
+    stack = args.stack or ("php-mysql-sftp" if runtime == "mysql"
+                           else f"{runtime}-postgres-sftp")
+    stack_dir = STACKS_DIR / stack
+    if not stack_dir.is_dir():
+        die(f"stack no encontrado: {stack}")
+    # OJO: image se armaba con DEFAULT_TAGS y no con php_tag. Validaba
+    # 8.4, lo imprimia, y construia 8.5: `build --php 8.4` era un no-op que
+    # reportaba [ok] con el tag viejo. Si no se pide --php, el tag es el de
+    # DEFAULT_TAGS, que es lo mismo que pedia antes.
+    php_tag = args.php or DEFAULT_TAGS["php"]
+    if not php_version_ok(php_tag):
+        die(f"version de php invalida: {php_tag}")
+    if not php_tag.endswith("-fpm-alpine"):
+        php_tag = f"{php_tag}-fpm-alpine"
+    rt = runtime_of(stack)
+    if rt == "php":
+        image = image_tag(stack, php_tag)
+    else:
+        # nextjs/tomcat no llevan version de PHP: el runtime manda.
+        image = image_tag(stack, DEFAULT_TAGS[rt])
+
+    # el build necesita un compose. Reusa el de un proyecto existente si hay,
+    # o arma uno temporal con solo el servicio app.
+    tmp = Path(tempfile.mkdtemp(prefix="appctl-build-"))
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+    shutil.copytree(stack_dir / "image", tmp / "image")
+    for f in (tmp / "image").glob("*.sh"):
+        f.chmod(0o755)
+    (tmp / "compose.yaml").write_text(f"""name: appctl-build
+services:
+  app:
+    build:
+      context: ./image
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: "${{HTTP_PROXY:-}}"
+        HTTPS_PROXY: "${{HTTPS_PROXY:-}}"
+        NO_PROXY: "${{NO_PROXY:-localhost,127.0.0.1}}"
+        # La version de PHP se pasa aca. Sin este ARG el FROM era fijo en
+        # 8.5 y `build --php 8.4` etiquetaba 8.4 una imagen con contenido
+        # 8.5: el nombre mentia y el cliente recibia la version que no
+        # pidio.
+        PHP_VERSION: "{php_tag}"
+    image: {image}
+""")
+    print(f"construyendo {image}...")
+    before = _image_id(image)
+    print("  (cacheado: la segunda vez es instantaneo)")
+    # sin pipe: `docker compose build | tail` devuelve el exit code de tail
+    # y un build fallido se reporta como exitoso. Eso ya paso una vez.
+    r = subprocess.run(["docker", "compose", "build"],
+                       cwd=tmp, text=True, timeout=2400,
+                       capture_output=True)
+    if r.returncode != 0:
+        shutil.rmtree(tmp, ignore_errors=True)
+        out = (r.stdout + r.stderr).strip()
+        # el error util de docker-php-ext-install esta al final
+        die(f"fallo el build de {image}:\n{out[-3000:]}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not _image_exists(image):
+        die(f"docker dijo que ok pero la imagen {image} no existe")
+    after = _image_id(image)
+    if before and after and before == after and not args.force:
+        print(f"\n[id] {image} sin cambios (cacheado, {after[:12]})")
+        print("  si esperabas un cambio y no lo hubo, el Dockerfile no se")
+        print("  actualizó o el COPY no cambió. usá: appctl build --force")
+    else:
+        print(f"\n[ok] {image}  {after[:12]}")
+    print(f"  ahora: appctl <proyecto> php psql sftp   (sin compilar)")
+    return 0
+
+
+def _image_id(tag: str) -> str:
+    r = sh(f'docker image inspect --format "{{{{.Id}}}}" "{tag}"', timeout=30)
+    return r.stdout.strip()
+
+
+# ------------------------------------------------------------- lifecycle ---
+
+def load_state(project: str) -> dict:
+    f = build_dir(project) / "state.json"
+    if not f.exists():
+        die(f"no existe el proyecto {project!r} en {build_dir(project)}")
+    return json.loads(f.read_text())
+
+
+def load_env(project: str) -> dict[str, str]:
+    env = {}
+    for line in (build_dir(project) / ".env").read_text().splitlines():
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            env[k] = v
+    return env
+
+
+def cmd_list(args) -> int:
+    print(render_list(str(PROJECTS_DIR)))
+    return 0
+
+
+def cmd_limits(args) -> int:
+    """Cambia los limites de CPU/RAM de un proyecto, EN CALIENTE.
+
+    `docker update` cambia el limite de un contenedor vivo sin reiniciarlo:
+    el proceso no se corta, el PID no cambia y la web sigue respondiendo.
+    Verificado en produccion: mem 1G -> 2G -> 512M con restarted=0 y la
+    pagina respondiendo 200 en las tres.
+
+    LA TRAMPA: el cambio no se persiste en el compose. Si despues corres
+    `appctl <p> restart` o cualquier `docker compose up -d`, el contenedor
+    vuelve al valor del compose.yaml. Por eso `--save` escribe el valor en
+    el .env del proyecto (que es lo que el compose lee) y actualiza el
+    compose para que apunte ahi.
+
+    Sin --save el cambio es temporal, y eso se dice en la salida.
+    """
+    project = args.proyecto
+    pdir = build_dir(project)
+    if not (pdir / "compose.yaml").exists():
+        die(f"no existe el proyecto {project}")
+
+    cambios = []
+    for svc in ("app", "db"):
+        cont = f"{project}_{svc}"
+        cmd = ["docker", "update"]
+        if args.memory:
+            mem = _to_bytes(args.memory)
+            if not mem:
+                die(f"no entiendo el valor de memoria: {args.memory}\n"
+                    f"  formatos: 512M, 2G, 1.5G")
+            # memory-swap = 2x memory: permite swap, que en un server con
+            # RAM justa es la diferencia entre "se frena" y "muere".
+            swap = _to_bytes(args.swap) if args.swap else mem * 2
+            cmd += [f"--memory={mem}", f"--memory-swap={swap}"]
+        if args.cpus:
+            cmd += [f"--cpus={args.cpus}"]
+        if len(cmd) == 1:
+            continue
+        r = subprocess.run(cmd + [cont], capture_output=True, text=True)
+        if r.returncode != 0:
+            die(f"no se pudo actualizar {cont}: "
+                f"{(r.stderr or r.stdout).strip()[:160]}")
+        cambios.append(svc)
+
+    if not cambios:
+        die("decime que cambiar: --memory, --cpus o --swap")
+
+    # mostrar el estado real, leido de docker (no del compose)
+    print(f"aplicado en caliente a: {', '.join(cambios)}")
+    for svc in cambios:
+        cont = f"{project}_{svc}"
+        r = sh(f"docker inspect --format '{{{{.HostConfig.Memory}}}} "
+               f"{{{{.HostConfig.NanoCpus}}}}' {cont}")
+        mem, nano = r.stdout.split()[:2] if len(r.stdout.split()) >= 2 else ("?", "?")
+        print(f"  {cont:<20} mem={int(mem)//1024//1024}M  "
+              f"cpu={int(nano)/1e9:.2f}")
+
+    if not args.save:
+        print("\nATENCION: esto NO se guardo en el compose.")
+        print("  un `appctl %s restart` lo vuelve al valor del compose." % project)
+        print("  para que sea permanente: appctl %s limits --save ..." % project)
+        return 0
+
+    # --save: al .env, que es lo que el compose lee
+    env_path = pdir / ".env"
+    env_ = load_env(project)
+    if args.memory:
+        env_["APP_MEMORY" if cambios == ["app"] else "APP_MEMORY"] = args.memory
+        env_["DB_MEMORY"] = args.db_memory or env_.get("DB_MEMORY", "512M")
+    txt = env_path.read_text()
+    for k in ("APP_MEMORY", "DB_MEMORY", "APP_CPUS", "DB_CPUS"):
+        if k in env_:
+            import re as _re
+            if _re.search(rf"^{k}=.*$", txt, _re.M):
+                txt = _re.sub(rf"^{k}=.*$", f"{k}={env_[k]}", txt, flags=_re.M)
+            else:
+                txt += f"{k}={env_[k]}\n"
+    env_path.write_text(txt)
+    os.chmod(env_path, 0o600)
+    print(f"\nguardado en {env_path.name}")
+    print(f"  proximo restart: los limites quedan {args.memory or '(sin cambio)'}")
+    return 0
+
+
+def _to_bytes(v: str) -> int:
+    """'512M' -> bytes. Acepta K/M/G, con o sin decimal ('1.5G')."""
+    v = str(v).strip().upper().rstrip("B")
+    mult = 1
+    if v.endswith("K"):
+        mult, v = 1024, v[:-1]
+    elif v.endswith("M"):
+        mult, v = 1024**2, v[:-1]
+    elif v.endswith("G"):
+        mult, v = 1024**3, v[:-1]
+    try:
+        return int(float(v) * mult)
+    except ValueError:
+        return 0
+
+
+def _wait_db_ready(pdir: Path | str, timeout: int = 180) -> bool:
+    """Espera a que la base responda DENTRO del contenedor.
+
+    `docker compose up -d` levanta y sigue: no dice que el postgres haya
+    terminado el initdb. Restaurar o probar contra una db que todavia no
+    escucha falla con 'No such file or directory' (el socket) y el error
+    no dice que el problema es el tiempo.
+
+    Se pregunta al contenedor de la db, no al host: es el unico que sabe
+    si su propio postgres esta listo.
+    """
+    import time
+    pdir = Path(pdir)
+    project = pdir.name
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = subprocess.run(
+            ["docker", "inspect", f"{project}_db", "--format",
+             "{{.State.Health.Status}}"],
+            capture_output=True, text=True, timeout=20)
+        estado = (r.stdout or "").strip()
+        if estado == "healthy":
+            return True
+        if estado in ("unhealthy", "exited", "dead"):
+            # unhealthy durante el start_period es normal; exited no.
+            if estado == "exited":
+                return False
+        time.sleep(3)
+    return False
+
+
+def cmd_clone(args) -> int:
+    """Copia un proyecto CON TODOS SUS DATOS, en otro puerto.
+
+    Para que probar un stack nuevo (un PHP 8.6, un Tomcat 11.1) no sea un
+    riesgo en produccion: se clona con la base y todo, se le corre el stack
+    que uno quiere probar, y si anda se aplica al real con `upgrade -y`.
+
+    QUE COPIA: el directorio entero (codigo del cliente por SFTP, webroot,
+    configuracion) y un dump de la base.
+    QUE NO COPIA: las credenciales. El clon genera las suyas: si copiara las
+    mismas, dos proyectos con el mismo usuario de base seria dos clientes
+    pensando que son el mismo.
+    """
+    src = args.origen
+    if not (build_dir(src) / "state.json").exists():
+        die(f"no existe el proyecto {src}")
+
+    dst = args.nuevo
+    try:
+        portsmod.valid_project(dst)
+    except portsmod.PortError as e:
+        die(str(e))
+    if build_dir(dst).exists():
+        die(f"ya existe {dst}\n"
+            f"  si querias empezar de nuevo: appctl {dst} destroy")
+
+    src_dir = build_dir(src)
+    src_state = load_state(src)
+    src_env = load_env(src)
+    stack = src_state["stack"]
+    components = set(src_state.get("components") or [])
+    runtime = next((r for r in ("php", "nextjs", "tomcat") if r in components), "php")
+
+    print(f"clonando {src} -> {dst}")
+    print(f"  stack   {stack}")
+
+    # ---- 1. el dump de la base, ANTES de tocar nada ---------------------
+    db_kind = "mysql" if "mysql" in stack else "postgres"
+    dump_path = None
+    db_ok = True
+    try:
+        if db_kind == "mysql":
+            r = sh(f"docker compose exec -T db mariadb-dump "
+                   f"-u{sh_quote(src_env['DB_USER'])} "
+                   f"-p{sh_quote(src_env['DB_PASSWORD'])} "
+                   f"--single-transaction --routines "
+                   f"{sh_quote(src_env['DB_NAME'])}",
+                   cwd=src_dir, timeout=900)
+        else:
+            # SIN --clean --if-exists a proposito. Con eso el dump lleva
+            # 'DROP ROLE <rol_del_origen>' y al restaurarlo en el clon
+            # tumba el rol NUEVO del clon:
+            #   FATAL: role "cli-dos" does not exist
+            # El proyecto quedaria entero y sin base utilizable. El clon
+            # es una base VIRGEN: no hay nada que limpiar.
+            # PGPASSWORD va explicito. Antes no hacia falta porque el
+            # pg_hba estaba en `trust` (un agujero que se cerro); ahora que
+            # pide scram, un pg_dump sin password falla con 'fe_sendauth: no
+            # password supplied' y el clon queda sin datos.
+            # --no-owner: sin esto la tabla quedaiedad del rol del ORIGEN
+            # (orig_app) y en el clon el rol del cliente (clo_app) recibe
+            # 'permission denied for table clientes'. El dump tiene que ser
+            # de los DATOS, no de los owners.
+            r = sh(f"docker compose exec -T -e PGPASSWORD={sh_quote(src_env['DB_PASSWORD'])} "
+                   f"db pg_dump -U {sh_quote(src_env['DB_USER'])} "
+                   f"--no-owner --no-acl "
+                   f"-d {sh_quote(src_env['DB_NAME'])}",
+                   cwd=src_dir, timeout=900)
+        if r.returncode == 0 and r.stdout.strip():
+            fd, dump_name = tempfile.mkstemp(
+                prefix=f"appctl-clone-{src}-{dst}-", suffix=".sql")
+            os.close(fd)
+            dump_path = Path(dump_name)
+            dump_path.chmod(0o600)
+            atexit.register(dump_path.unlink, missing_ok=True)
+            dump_path.write_text(r.stdout)
+            size = dump_path.stat().st_size
+            print(f"  base     dump OK ({size/1024:.0f} KB)")
+        else:
+            db_ok = False
+            print(f"  base     NO se pudo dumpear: {(r.stderr or r.stdout)[-160:]}")
+            if not args.force:
+                die("sin datos no es un clon. Con --force clona igual (base vacia).")
+    except Exception as e:
+        db_ok = False
+        print(f"  base     error: {e}")
+        if not args.force:
+            die("sin datos no es un clon. Con --force clona igual (base vacia).")
+
+    # ---- 2. crear el proyecto destino con credenciales nuevas ------------
+    api_key = sec.token(24)
+    reg = portsmod.Registry(str(APPCTL_HOME / "registry.json"))
+    with reg.locked() as data:
+        # El registro del PROYECTO ORIGEN tambien importa: `origen` tiene
+        # 8001, asi que el clon no puede tomarlo. Sin esta linea el clon se
+        # lleva el puerto del proyecto del que salio.
+        # el puerto del ORIGEN sale del state.json, no del .env (el .env no
+        # lo tiene: APP_PORT solo vive en el state y en el compose).
+        ports = dict(data.get("ports", {}))
+        ports[str(src_state.get("app_port"))] = src
+        if src_state.get("sftp_port"):
+            ports[str(src_state["sftp_port"])] = src
+        # find_free(start, end, taken, key): el rango va DESCOMPUESTO y el
+        # taken es el mapa puerto->proyecto. Hay que validar el puerto pedido
+        # a mano: find_free busca uno libre, no revisa el que le pasaron.
+        if args.port:
+            app_port = args.port
+            if str(app_port) in ports:
+                die(f"puerto {app_port} ya lo tiene {ports[str(app_port)]}")
+            if app_port in portsmod.RESERVED or app_port not in APP_PORT_RANGE:
+                die(f"puerto {app_port} fuera del rango {APP_PORT_RANGE} "
+                    f"o reservado")
+        else:
+            app_port = portsmod.find_free(APP_PORT_RANGE[0], APP_PORT_RANGE[1],
+                                          ports, f"app de {dst}")
+        if args.sftp_port:
+            sftp_port = args.sftp_port
+            if str(sftp_port) in ports:
+                die(f"puerto {sftp_port} ya lo tiene {ports[str(sftp_port)]}")
+            if sftp_port in portsmod.RESERVED or sftp_port not in SFTP_PORT_RANGE:
+                die(f"puerto {sftp_port} fuera del rango {SFTP_PORT_RANGE} "
+                    f"o reservado")
+        else:
+            sftp_port = portsmod.find_free(SFTP_PORT_RANGE[0], SFTP_PORT_RANGE[1],
+                                           ports, f"sftp de {dst}")
+        reg.reserve(data, dst, app_port, sftp_port)
+
+    names = {k: v for k, v in src_env.items()
+             if k.startswith("DB_") or k == "SFTP_USER"}
+    names["SFTP_USER"] = dst
+    pw = {"DB_ADMIN_PASSWORD": sec.password(24),
+          "DB_PASSWORD": sec.password(24),
+          "DB_MIGRATION_PASSWORD": sec.password(24),
+          "DB_READONLY_PASSWORD": sec.password(24),
+          "SFTP_PASSWORD": sec.password(20),
+          "APP_KEY": sec.app_key()}
+    # los nombres de usuario siguen el nombre del proyecto: el clon es un
+    # cliente distinto, aunque copie los datos de otro.
+    for pre in ("DB_NAME", "DB_USER", "DB_MIGRATION_USER", "DB_READONLY_USER"):
+        # Mismo criterio que el create: DB_USER es el nombre del proyecto tal
+        # cual (orig -> clo), los otros llevan sufijo (orig_mig -> clo_mig).
+        # Antes el clone aplicaba el sufijo _app al rol de la app y el clon
+        # quedaba con DB_USER=clo_app mientras el create da orig: dos
+        # convenciones para el mismo rol.
+        sufijo = names[pre].split("_", 1)[1] if "_" in names[pre] else None
+        names[pre] = dst if sufijo is None else f"{dst}_{sufijo}"
+    names["DB_USER"] = dst
+    # DB_ADMIN_USER tambien. El clon hereda names del origen, asi que sin esto
+    # el superuser del clon se llamaba <origen>_admin y el .env terminaba con
+    # las dos lineas: el nombre del origen y el que pone render_project. El
+    # compose se queda con una, el restore conecta con el nombre del otro, y
+    # el error es 'password authentication failed for user <clon>_admin'
+    # aunque la password este bien: el rol con ese nombre no existe.
+    names["DB_ADMIN_USER"] = f"{dst}_admin"
+
+    tags = {k: src_env[k] for k in DEFAULT_TAGS if k in src_env}
+    if args.php:
+        tags["php"] = f"{args.php}-fpm-alpine"
+    pg_major = tags.get("psql", "18-alpine").split("-")[0]
+
+    dst_dir = build_dir(dst)
+    stack_dir = STACKS_DIR / stack
+    render_project(dst_dir, stack_dir, stack, dst, components, tags,
+                   names, pw, app_port, sftp_port, host=src_state["host"],
+                   pg_major=pg_major, api_key=api_key,
+                   want_cron="cron" in components)
+
+    print(f"  puertos  app={app_port} sftp={sftp_port}")
+    print(f"  imagen   {src_state.get('image', '(la misma)')}"
+          f"{'  [php ' + args.php + ']' if args.php else ''}")
+
+    if args.no_up:
+        print("\ncreado sin levantar (--no-up). Para levantarlo: appctl "
+              + f"{dst} restart")
+        return 0
+
+    # ---- 3. levantar y restaurar los datos ------------------------------
+    print("  levantando...")
+    r = sh("docker compose up -d", cwd=dst_dir, timeout=900)
+    if r.returncode != 0:
+        die(f"el up fallo: {(r.stderr or r.stdout)[-400:]}")
+
+    if dump_path:
+        # Esperar a que la DB este LISTA antes de restaurar. `up -d` levanta
+        # el contenedor y sigue: el postgres/mariadb de una DB nueva puede
+        # tardar 20-30s en terminar el initdb, y restaurar contra un socket
+        # que todavia no existe da 'No such file or directory' con el
+        # proyecto ya creado a medias. El dump se conserva en el host asi
+        # que el reintento es manual si hace falta.
+        print("  esperando que la db este lista...")
+        if not _wait_db_ready(dst, timeout=180):
+            die(f"la db de {dst} no quedo lista en 180s.\n"
+                f"  logs: appctl {dst} logs --service db\n"
+                f"  el dump del origen quedo en: {dump_path}")
+        print("  restaurando la base...")
+        # Restaurar el dump: entra por el cliente de la propia imagen de la
+        # DB, que ya esta corriendo y trae las herramientas. La base y el
+        # usuario los creo la entrypoint del contenedor con este .env.
+        # El restore entra con el ROL DE LA APP, no con el admin.
+        #
+        # Si entra como admin, todas las tablas quedan con owner=admin
+        # (aunque el dump lleve --no-owner: el CREATE TABLE lo hace el
+        # usuario que corre el psql) y el rol del cliente recibe
+        # 'permission denied for table clientes' apenas toca sus datos.
+        # Es el mismo problema del pg_dump --clean del origen, al reves:
+        # no es el owner del dump, es QUIEN restaura.
+        #
+        # Y PGPASSWORD explicito en el sh -c: `docker compose exec` no
+        # propaga el entorno del contenedor, asi que $POSTGRES_PASSWORD
+        # llega vacio.
+        env_dst = load_env(dst)
+        pw_app = env_dst.get("DB_PASSWORD") or ""
+        user_app = env_dst.get("DB_USER") or ""
+        db_app = env_dst.get("DB_NAME") or ""
+        restore = (_restore_cmd(db_kind)
+                   .replace('"$POSTGRES_USER"', sh_quote(user_app))
+                   .replace('"$POSTGRES_DB"', sh_quote(db_app)))
+        r2 = sh(f"docker compose exec -T db sh -c "
+                f"'PGPASSWORD={sh_quote(pw_app)} {restore}' "
+                f"< {sh_quote(str(dump_path))}",
+                cwd=dst_dir, timeout=1800)
+        if r2.returncode == 0:
+            print("  datos    restaurados")
+        else:
+            print(f"  AVISO: la restauracion fallo: {(r2.stderr or r2.stdout)[-200:]}")
+            print(f"  el dump quedo en {dump_path} por si hay que hacerlo a mano")
+            return 1
+        dump_path.unlink(missing_ok=True)
+
+    # ---- 4. resumen ------------------------------------------------------
+    print()
+    print(f"clon listo: {dst}")
+    print(f"  app    {src_state['host']}:{app_port}")
+    print(f"  sftp   {src_state['host']}:{sftp_port}  user {dst}")
+    print(f"  db     {names['DB_NAME']}  (datos copiados de {src})")
+    print(f"  pass   {pw['DB_PASSWORD']}")
+    print()
+    print("  OJO: el codigo del cliente se copio del origen, pero las")
+    print("  credenciales son nuevas. Si el codigo tiene las del anterior")
+    print("  hardcodeadas, hay que revisarlo.")
+    return 0
+
+
+def _restore_cmd(db_kind: str) -> str:
+    """El comando de restore, para correr DENTRO del contenedor db.
+
+    El PGPASSWORD va explicito (con comillas) y no como $POSTGRES_PASSWORD:
+    `docker compose exec` no hereda el entorno del contenedor, asi que la
+    variable llega vacia y postgres contesta 'password authentication
+    failed'. Medido: con $POSTGRES_PASSWORD falla, con PGPASSWORD='...' pasa.
+
+    El password se interpola desde el .env del proyecto; por eso va en el
+    formato, no hardcodeado.
+    """
+    if db_kind == "mysql":
+        return ("mariadb -u\"$MYSQL_USER\" -p\"$MYSQL_PASSWORD\" \"$MYSQL_DATABASE\"")
+    return ("psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\" "
+            "-v ON_ERROR_STOP=1")
+
+
+def db_kind_of(stack: str) -> str:
+    """mysql o postgres, segun el nombre del stack."""
+    return "mysql" if "mysql" in stack else "postgres"
+
+
+def _stack_for_runtime(runtime: str, db_kind: str) -> str | None:
+    """El stack que corresponde a un runtime y motor de base, o None.
+
+    Los stacks se llaman <runtime>-<db>-sftp, asi que el nombre se
+    deduce. Se verifica contra el disco: si el directorio no existe se
+    devuelve None en vez de componiendo un nombre que va a fallar tres
+    lineas mas abajo con un error que no nombra el problema.
+    """
+    cand = f"{runtime}-{db_kind}-sftp"
+    return cand if (STACKS_DIR / cand).is_dir() else None
+
+
+def cmd_upgrade(args) -> int:
+    """Re-renderiza el compose con la version actual de los stacks.
+
+    Que el compose se genere desde un template tiene un costo: si cambia el
+    template (una correccion de seguridad, un limite de memoria) hay que
+    re-renderizar el compose del proyecto. Editarlo a mano no sirve: al
+    proximo upgrade se pierde, y el archivo lleva un comentario que lo
+    dice.
+
+    QUE NO HACE, y es importante: NO cambia la version de PHP ni la de la
+    DB. Eso es `appctl <proj> upgrade --php 8.4` y requiere que la imagen
+    este construida. Los tags quedan FIJOS en el compose: por eso el
+    state.json guarda con que imagen se creo el proyecto. Cambiar la
+    version de PHP sin querer deja el cliente en una imagen que no esta
+    construida, y eso se decide a proposito con --php.
+
+    El estado de los datos no se toca: solo el compose y el state.
+    """
+    project = args.proyecto
+    pdir = build_dir(project)
+    st = load_state(project)
+    env = load_env(project)
+
+    stack = st["stack"]
+    stack_dir = STACKS_DIR / stack
+    if not stack_dir.is_dir():
+        die(f"el stack {stack!r} ya no existe en el repo\n"
+            f"  stacks: {', '.join(sorted(p.name for p in STACKS_DIR.iterdir() if p.is_dir()))}")
+
+    # Los tags exactos viven en state.json: el upgrade no debe sustituirlos
+    # por los defaults actuales si el operador no pidió cambiar runtime/version.
+    tags = dict(st.get("tags") or {})
+    tags.update({k: env[k] for k in DEFAULT_TAGS if k in env})
+    # Migracion del .env: los proyectos creados antes de DB_ADMIN_* no
+    # tienen esas claves y el compose nuevo las exige (POSTGRES_USER es el
+    # superuser _admin, que necesita SU password). Sin esto el upgrade
+    # renderiza un compose que no arranca y el check de roles falla con
+    # 'password authentication failed'.
+    if "psql" in tags or "postgres" in stack:
+        if not env.get("DB_ADMIN_USER"):
+            env["DB_ADMIN_USER"] = f"{project}_admin"
+        if not env.get("DB_ADMIN_PASSWORD"):
+            # NO se genera una nueva: el rol <proyecto>_admin ya existe en
+            # la base (lo creo el init original) y tiene la password que
+            # entonces era POSTGRES_PASSWORD, que era DB_PASSWORD. Inventar
+            # una nueva deja el .env y la base desincronizados para siempre:
+            # el compose levanta con una, la base acepta otra, y todo lo que
+            # conecte con el admin falla sin explicar por que.
+            env["DB_ADMIN_PASSWORD"] = env.get("DB_PASSWORD") or sec.password(24)
+            print(f"  .env migrado: DB_ADMIN_PASSWORD para "
+                  f"{env['DB_ADMIN_USER']} (la que ya tiene la base)")
+    pg_major = tags.get("psql", "18-alpine").split("-")[0]
+    components = set(st.get("components") or [])
+    # forzar=True cuando --php/--runtime cambian algo que el diff de texto
+    # NO ve (el compose se re-renderiza igual y solo cambia la linea del
+    # tag). Sin esta variable, migrar de PHP imprimia "ya al dia" y hacia
+    # nada: el flag se aceptaba y se ignoraba.
+    forzar = False
+
+    # --php / --runtime: lo que el parser declaraba y el handler NUNCA
+    # leia. El flag se aceptaba, se ignoraba y se reportaba exito:
+    # el cliente pedia 8.4 y se quedaba en 8.5 sin enterarse.
+    if args.runtime:
+        nuevo_rt = args.runtime
+        actual = runtime_of(stack)
+        if nuevo_rt == actual:
+            print(f"el proyecto ya usa {nuevo_rt}: nada que migrar")
+            return 0
+        destino_stack = _stack_for_runtime(nuevo_rt, db_kind_of(stack))
+        if destino_stack is None:
+            die(f"no hay stack {nuevo_rt}+{db_kind_of(stack)} en el repo\n"
+                f"  stacks: {', '.join(sorted(p.name for p in STACKS_DIR.iterdir() if p.is_dir()))}")
+        print(f"migrando de {stack} a {destino_stack}...")
+        stack = destino_stack
+        tags.pop(actual, None)
+        forzar = True
+    if args.php:
+        rt = runtime_of(stack)
+        if rt != "php":
+            die(f"--php solo aplica a stacks php; {stack} usa {rt}.\n"
+                f"  para nextjs/tomcat la version va en el runtime.")
+        nuevo_tag = f"{args.php}-fpm-alpine"
+        if tags.get("php") == nuevo_tag:
+            print(f"ya corre PHP {args.php}: nada que hacer")
+            return 0
+        img = image_tag(stack, nuevo_tag)
+        if not _image_exists(img):
+            die(f"la imagen {img} no esta construida en este server.\n"
+                f"  construirla: appctl build --runtime php --php {args.php}\n"
+                f"  (migrar a un PHP sin imagen deja al cliente sin arrancar)")
+        print(f"PHP {tags.get('php','?').split('-')[0]} -> {args.php}")
+        tags["php"] = nuevo_tag
+        forzar = True
+    if "cron" in env.get("EXTRA", "").split(","):
+        components.add("cron")
+
+    before = (pdir / "compose.yaml").read_text()
+
+    api_key = env.get("API_TOKEN") or st.get("api_key") or sec.token(24)
+    names = {k: env[k] for k in
+             ("DB_NAME", "DB_USER", "DB_MIGRATION_USER",
+              "DB_READONLY_USER", "SFTP_USER")}
+    pw = {k: v for k, v in env.items()
+          if k.endswith("_PASSWORD") or k == "APP_KEY"}
+
+    # Renderizar en staging: `upgrade` sin --yes es una vista previa y no debe
+    # tocar ni compose, ni .env, ni state, ni los archivos del stack.
+    stage = Path(tempfile.mkdtemp(prefix="appctl-upgrade-"))
+    atexit.register(shutil.rmtree, stage, ignore_errors=True)
+    render_project(stage, stack_dir, stack, project, components, tags,
+                   names, pw, int(st["app_port"]), st.get("sftp_port"),
+                   host=st["host"], pg_major=pg_major, api_key=api_key,
+                   want_cron="cron" in components)
+    after = (stage / "compose.yaml").read_text()
+
+    if before == after and not forzar:
+        # "Nada que hacer en el compose" NO es lo mismo que "el proyecto
+        # esta al dia": la imagen pudo cambiar (hash distinto) sin que el
+        # compose cambie, y el cliente quedaria con la version vieja sin
+        # enterarse. Por eso se verifica igual.
+        img = image_tag(stack, tags.get(runtime_of(stack),
+                                       DEFAULT_TAGS[runtime_of(stack)]))
+        if _image_exists(img):
+            print(f"el compose ya estaba al dia y la imagen esta "
+                  f"({img.split(':')[-1]})")
+            return 0
+        print(f"el compose esta igual pero la IMAGEN cambio:\n"
+              f"  en el compose: {img}\n"
+              f"  el proyecto corre con una imagen vieja.\n"
+              f"  re-construir la imagen: appctl build "
+              f"--runtime {runtime_of(stack)}")
+        return 1
+
+    if not args.yes:
+        diff = difflib.unified_diff(
+            before.splitlines(keepends=True), after.splitlines(keepends=True),
+            fromfile=str(pdir / "compose.yaml"),
+            tofile=str(pdir / "compose.yaml") + " (nuevo)")
+        print("compose pendiente (vista previa; no se escribio nada):")
+        print("".join(diff) or "  (solo cambiarian archivos auxiliares)")
+        print(f"\nse aplica con: appctl {project} upgrade --yes")
+        return 0
+
+    backup = pdir / f"compose.yaml.bak.{time.strftime('%Y%m%d-%H%M%S')}"
+    backup.write_text(before)
+    generated = ("compose.yaml", ".env", "state.json", "nginx", "db/init", "cron")
+    rollback = Path(tempfile.mkdtemp(prefix="appctl-upgrade-rollback-"))
+    atexit.register(shutil.rmtree, rollback, ignore_errors=True)
+    for relative in generated:
+        source = pdir / relative
+        if source.is_dir():
+            shutil.copytree(source, rollback / relative)
+        elif source.exists():
+            (rollback / relative).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, rollback / relative)
+
+    def restore_generated() -> None:
+        for relative in generated:
+            target = pdir / relative
+            snapshot = rollback / relative
+            if target.is_dir():
+                shutil.rmtree(target)
+            elif target.exists():
+                target.unlink()
+            if snapshot.is_dir():
+                shutil.copytree(snapshot, target)
+            elif snapshot.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snapshot, target)
+
+    for relative in ("compose.yaml", ".env", "state.json", "nginx/site.conf"):
+        shutil.copy2(stage / relative, pdir / relative)
+    shutil.copytree(stage / "db" / "init", pdir / "db" / "init", dirs_exist_ok=True)
+    if (stage / "cron" / "crontab").exists():
+        shutil.copy2(stage / "cron" / "crontab", pdir / "cron" / "crontab")
+
+    # El .env se escribe siempre, no solo con --php/--runtime: es donde se
+    # acabo de meter DB_ADMIN_* para los proyectos viejos, y si no se
+    # escribe el compose nuevo queda apuntando a una clave que no existe.
+    for k_, v_ in tags.items():
+        if k_ in env:
+            env[k_] = v_
+    _write_env(pdir, env)
+    st["stack"] = stack
+    st["runtime"] = runtime_of(stack)
+    (pdir / "state.json").write_text(json.dumps(st, indent=2) + "\n")
+    (pdir / "state.json").chmod(0o600)
+
+    if before == after and not forzar:
+        backup.unlink()
+        # "Nada que hacer en el compose" NO es lo mismo que "el proyecto
+        # esta al dia": la imagen pudo cambiar (hash distinto) sin que el
+        # compose cambie, y el cliente quedaria con la version vieja sin
+        # enterarse. Por eso se verifica igual.
+        img = image_tag(stack, tags.get(runtime_of(stack),
+                                       DEFAULT_TAGS[runtime_of(stack)]))
+        if _image_exists(img):
+            print(f"el compose ya estaba al dia y la imagen esta "
+                  f"({img.split(':')[-1]})")
+            return 0
+        print(f"el compose esta igual pero la IMAGEN cambio:\n"
+              f"  en el compose: {img}\n"
+              f"  el proyecto corre con una imagen vieja.\n"
+              f"  re-construir la imagen: appctl build "
+              f"--runtime {runtime_of(stack)}")
+        return 1
+
+    print(f"compose actualizado  (respaldo: {backup.name})")
+    if not args.yes:
+        print("\nse re-aplica con: appctl %s restart" % project)
+        print("revisalo con:      appctl %s info" % project)
+        return 0
+
+    try:
+        _assert_compose_valid(pdir)
+    except SystemExit:
+        restore_generated()
+        raise
+
+    r = sh("docker compose up -d", cwd=pdir, timeout=900)
+    if r.returncode != 0:
+        print(r.stdout[-800:], r.stderr[-800:])
+        restore_generated()
+        die("el up fallo: se restauraron los archivos anteriores\n"
+            f"  logs del que fallo:  appctl {project} logs")
+
+    # ---- verificar, y volver atras SOLO si algo se rompio ---------------
+    # Sin esto, un stack nuevo que rompe deja al cliente caido y uno se
+    # entera cuando el cliente llama. Con esto, el upgrade se deshace solo.
+    print("\nverificando con los 9 checks...")
+    # NO `cfg = dict(env)`: env es un dict PLANO de credenciales (una clave
+    # por variable), no el cfg que espera el smoke. Armarlo asi dejaba los
+    # checks que leen cfg["db_users"] / cfg["env"] sin nada, y el de los
+    # roles devolvia FAIL ('no se le paso la lista de roles') en un
+    # proyecto con los cuatro roles perfectamente creados.
+    cfg = {
+        "project": project,
+        "stack": stack,
+        "app_port": int(st["app_port"]),
+        "sftp_port": st.get("sftp_port"),
+        "db_kind": "mysql" if "mysql" in stack else "postgres",
+        "db_port": 3306 if ("mysql" in stack) else 5432,
+        "db_image": (f"mariadb:{tags.get('mysql', '11.8')}" if "mysql" in stack
+                     else f"postgres:{pg_major}-alpine"),
+        "sftp_user": env["SFTP_USER"],
+        "sftp_password": env["SFTP_PASSWORD"],
+        # los tres roles del proyecto: sin esto el check 'los tres roles
+        # existen' no puede verificar y devuelve FAIL.
+        "db_users": [env.get("DB_USER"), env.get("DB_MIGRATION_USER"),
+                     env.get("DB_READONLY_USER")],
+        # el .env entero, para las consultas que piden password.
+        "env": env,
+    }
+
+    checks = smokemod.all_checks(str(pdir), cfg, st["host"])
+    fallos = [c for c in checks if not c.ok]
+    for c in checks:
+        print(f"  {'PASS' if c.ok else 'FAIL'}  {c.name}")
+        if not c.ok and c.detail:
+            print(f"        {c.detail}")
+
+    if fallos:
+        print(f"\n{len(fallos)} verificacion(es) fallaron: se vuelve atras.")
+        restore_generated()
+        sh("docker compose up -d", cwd=pdir, timeout=900)
+        print("archivos anteriores restaurados y stack levantado de nuevo.")
+        print(f"  que fallo: {', '.join(c.name for c in fallos)}")
+        print(f"  el respaldo queda en {backup.name} por si queres revisarlo")
+        die("upgrade revertido: el proyecto quedo como estaba")
+
+    print("\naplicado y verificado")
+    backup.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_info(args) -> int:
+    st = load_state(args.proyecto)
+    env = load_env(args.proyecto)
+    r = sh("docker compose ps --format '{{.Service}}\t{{.State}}\t{{.Health}}'",
+           cwd=build_dir(args.proyecto))
+    print(render_info(st, env, r.stdout))
+    return 0
+
+
+def cmd_creds(args) -> int:
+    env = load_env(args.proyecto)
+    st = load_state(args.proyecto)
+    print(render_create(st["project"], st["stack"], st["host"],
+                        st["app_port"], st["sftp_port"],
+                        {k: env[k] for k in
+                         ("DB_NAME", "DB_USER", "DB_MIGRATION_USER",
+                          "DB_READONLY_USER", "SFTP_USER")},
+                        {k: env[k] for k in
+                         ("DB_PASSWORD", "DB_MIGRATION_PASSWORD",
+                          "DB_READONLY_PASSWORD", "SFTP_PASSWORD")},
+                        str(build_dir(args.proyecto)), creds_only=True))
+    return 0
+
+
+def cmd_logs(args) -> int:
+    cmd = ["docker", "compose", "logs"]
+    if args.follow:
+        cmd.append("-f")
+    if args.service:
+        cmd.append(args.service)
+    cmd.append("-t" if not args.follow else "-f")
+    return subprocess.run(cmd, cwd=build_dir(args.proyecto)).returncode
+
+
+def cmd_shell(args) -> int:
+    return subprocess.run(
+        ["docker", "compose", "exec", args.service or "app",
+         "sh" if not args.bash else "bash"],
+        cwd=build_dir(args.proyecto)).returncode
+
+
+def cmd_ps(args) -> int:
+    """Los stacks de appctl, legibles.
+
+    `docker ps` no sirve para esto: el nombre del contenedor es
+    `<proyecto>_app`, pero la columna IMAGE muestra el runtime COMPARTIDO
+    (tres proyectos con PHP se ven identicos, con la misma imagen y el
+    mismo hash). Y en un server con otra decena de containers, `docker ps`
+    es un bloque de texto sin contexto de quien es cada cosa.
+
+    Acá se ve proyecto, stack, puertos y estado, en una fila por servicio,
+    mas el uso de CPU y RAM (que es lo que se mira cuando un cliente se
+    queja de que va lento).
+    """
+    if not PROJECTS_DIR.is_dir():
+        print(f"no existe {PROJECTS_DIR}")
+        return 0
+
+    proyectos = sorted(p.parent.name for p in PROJECTS_DIR.glob("*/state.json")
+                       if (p.parent / "compose.yaml").exists())
+    if not proyectos:
+        print("no hay proyectos")
+        return 0
+
+    print(f"{'PROYECTO':<16} {'STACK':<24} {'ROL':<5} {'ESTADO':<11} "
+          f"{'APP':<6} {'SFTP':<6}")
+    print("-" * 78)
+    filas = []
+    for nombre in proyectos:
+        d = PROJECTS_DIR / nombre
+        st = json.loads((d / "state.json").read_text())
+        stack = st.get("stack", "?")
+        r = sh("docker compose ps --format json", cwd=d, timeout=30)
+        for svc in _compose_ps_rows(r.stdout):
+            svc_name = svc.get("Service", "?")
+            state = svc.get("State", "?")
+            puertos = {}
+            for pub in svc.get("Publishers") or []:
+                if isinstance(pub, dict) and pub.get("PublishedPort"):
+                    # TargetPort viene como INT en el JSON de compose, no como
+                    # string. Buscarlo con str(80) no matchea y la columna de
+                    # puertos sale "-" en todos los proyectos.
+                    puertos[str(pub.get("TargetPort"))] = pub["PublishedPort"]
+            # el app web es el puerto 80/8080 Published; el sftp es el 22
+            app_p = puertos.get("80") or puertos.get("8080") or "-"
+            sftp_p = puertos.get("22") or "-"
+            filas.append((nombre, stack, svc_name, state, app_p, sftp_p))
+            print(f"{nombre:<16} {stack:<24} {svc_name:<5} {state:<11} "
+                  f"{str(app_p):<6} {str(sftp_p):<6}")
+
+    # uso de recursos: lo que se necesita cuando un cliente se queja
+    r = sh("docker stats --no-stream --format '{{.Name}}|{{.CPUPerc}}|"
+           "{{.MemUsage}}'", timeout=90)
+    nombres = {f"{n}_app": n for n, _, _, _, _, _ in filas}
+    uso = [l for l in r.stdout.strip().splitlines()
+           if l.split("|")[0] in nombres]
+    if uso:
+        print()
+        print(f"{'PROYECTO':<16} {'ROL':<5} {'CPU':<9} MEM")
+        print("-" * 46)
+        for line in uso:
+            cname, cpu, mem = line.split("|", 2)
+            rol = "app" if cname.endswith("_app") else "db"
+            print(f"{nombres[cname]:<16} {rol:<5} {cpu:<9} {mem}")
+    return 0
+
+
+def _compose_ps_rows(txt) -> list[dict]:
+    """`docker compose ps --format json` devuelve un objeto por linea en
+    unas versiones y un array en otras. Parseo las dos."""
+    txt = (txt or "").strip()
+    if not txt:
+        return []
+    try:
+        data = json.loads(txt)
+        return data if isinstance(data, list) else [data]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    out = []
+    for line in txt.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                out.append(json.loads(line))
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return out
+
+
+def cmd_psql(args) -> int:
+    env = load_env(args.proyecto)
+    user = args.user or env.get("DB_USER", "postgres")
+    db = args.db or env.get("DB_NAME")
+    return subprocess.run(
+        ["docker", "compose", "exec", "db", "psql", "-U", user, "-d", db],
+        cwd=build_dir(args.proyecto)).returncode
+
+
+def cmd_restart(args) -> int:
+    r = sh("docker compose restart", cwd=build_dir(args.proyecto), timeout=300)
+    return r.returncode
+
+
+# --------------------------------------------------------------- rotate ----
+
+def cmd_rotate(args) -> int:
+    """Cambia una credencial y la propaga a donde corresponda.
+
+    El detalle que importa: rotar la password de la DB no es escribirla en
+    el .env. Hay que cambiarla DENTRO de la base, o la app se rompe en el
+    proximo restart. Y hay que reiniciar el contenedor de la app para que
+    php-fpm tome el valor nuevo (clear_env=no hace que lo lea solo).
+    """
+    project = args.proyecto
+    what = args.que
+    pdir = build_dir(project)
+    env = load_env(project)
+    st = load_state(project)
+
+    if what == "sftp":
+        new = sec.password(20)
+        env["SFTP_PASSWORD"] = new
+        _write_env(pdir, env)
+        print("[1/2] reiniciando el contenedor para tomar la password nueva...")
+        r = sh("docker compose up -d --force-recreate app", cwd=pdir, timeout=600)
+        if r.returncode != 0:
+            die(f"fallo el recreate:\n{r.stderr[-1500:]}")
+        print("[2/2] probando el login con la nueva password...")
+        chk = smokemod.sftp_login(str(pdir), st["host"], st["sftp_port"],
+                                  env["SFTP_USER"], new)
+        print(f"  {chk}")
+        if not chk.ok:
+            die("la nueva password no funciona; el proyecto quedo con ella "
+                "de todas formas, revisa con appctl %s logs" % project)
+        print(render_rotate(project, "SFTP", [(env["SFTP_USER"], new)],
+                            st["host"], st["sftp_port"]))
+        return 0
+
+    if what in ("db", "mig", "ro"):
+        key = {"db": "DB_PASSWORD", "mig": "DB_MIGRATION_PASSWORD",
+               "ro": "DB_READONLY_PASSWORD"}[what]
+        user = {"db": "DB_USER", "mig": "DB_MIGRATION_USER",
+                "ro": "DB_READONLY_USER"}[what]
+        new = sec.password(24)
+        # cambiar la password DENTRO de postgres; sin esto, escribirla en el
+        # .env deja la app con una password que la base no conoce
+        q = f"ALTER ROLE \"{env[user]}\" WITH PASSWORD '{new}';"
+        # con el superuser, no con el rol que se esta cambiando: un rol no
+        # puede alterar su propia password (si no, cambiarla seria trivial).
+        admin = env.get("DB_ADMIN_USER") or env["DB_USER"]
+        # PGPASSWORD explicita: con el pg_hba en scram, un psql sin password
+        # falla con 'fe_sendauth: no password supplied'. Antes no hacia falta
+        # porque el pg_hba estaba en trust.
+        r = sh(f'docker compose exec -T -e PGPASSWORD={sh_quote(env["DB_PASSWORD"])} '
+               f'db psql -U "{admin}" '
+               f'-d "{env["DB_NAME"]}" -c "{q}"', cwd=pdir, timeout=120)
+        if r.returncode != 0:
+            die(f"no se pudo cambiar la password en postgres:\n{r.stderr[-1500:]}")
+        env[key] = new
+        _write_env(pdir, env)
+        print("[2/2] reiniciando la app para que tome la nueva...")
+        sh("docker compose up -d --force-recreate app", cwd=pdir, timeout=600)
+        print(render_rotate(project, f"DB ({user})", [(user, new)],
+                            st["host"], st["app_port"]))
+        return 0
+
+    die(f"que rotar: sftp | db | mig | ro  (no {what!r})")
+
+
+def _write_env(pdir: Path, env: dict) -> None:
+    lines = ["# Credenciales del proyecto. 0600, no se commitea, no se imprime."]
+    for k, v in env.items():
+        if k == "PROJECT":
+            lines.append(f"PROJECT={v}")
+    for k, v in env.items():
+        if k not in ("PROJECT",):
+            lines.append(f"{k}={v}")
+    (pdir / ".env").write_text("\n".join(lines) + "\n")
+    (pdir / ".env").chmod(0o600)
+
+
+def cmd_destroy(args) -> int:
+    project = args.proyecto
+    pdir = build_dir(project)
+    if not pdir.exists():
+        die(f"no existe {pdir}")
+
+    reg = portsmod.Registry(str(APPCTL_HOME / "registry.json"))
+    st = json.loads((pdir / "state.json").read_text()) if (pdir / "state.json").exists() else {}
+
+    print(f"proyecto: {project}")
+    print(f"  dir:    {pdir}")
+    print(f"  app:    {st.get('host', '?')}:{st.get('app_port', '?')}")
+    if st.get("sftp_port"):
+        print(f"  sftp:   {st.get('host')}:{st['sftp_port']}")
+    if args.keep_data:
+        print("  DATOS:  se conservan (--keep-data)")
+
+    if not args.yes and not args.keep_data:
+        r = input("  esto borra la DB y el codigo..confirmar? [s/N] ")
+        if r.strip().lower() not in ("s", "si", "y", "yes"):
+            print("cancelado")
+            return 1
+
+    with reg.locked() as data:
+        sh("docker compose down -v --remove-orphans", cwd=pdir, timeout=300)
+        if not args.keep_data:
+            # los archivos de db/data los crea postgres con uid 999, y los
+            # de app/ el usuario del contenedor con uid 1000. rm -rf sin
+            # sudo no los toca: "Permission denied" y el proyecto queda a
+            # medias. Con sudo, o si el usuario no tiene, avisar.
+            if os.geteuid() != 0:
+                r = subprocess.run(["sudo", "-n", "rm", "-rf", str(pdir)],
+                                   capture_output=True, text=True, timeout=300)
+                if r.returncode != 0:
+                    shutil.rmtree(pdir, ignore_errors=True)
+                    if pdir.exists():
+                        die(f"no pude borrar {pdir}\n"
+                            f"  sudo rm -rf {pdir}   (los archivos son del "
+                            f"contenedor, no del usuario)\n"
+                            f"  {r.stderr.strip()[:200]}")
+            else:
+                shutil.rmtree(pdir, ignore_errors=True)
+        reg.release(data, project)
+
+    print(f"\n[ok] {project} destruido" + (" (datos conservados)" if args.keep_data else ""))
+    if args.keep_data:
+        print(f"  datos en: {pdir}/app {pdir}/db/data {pdir}/sftp/home")
+    return 0
+
+
+
+# --- dump y restore de la base (lib/dbtool.py) ----------------------------
+
+def _load_dbtool():
+    """Importa lib/dbtool.py desde el directorio de appctl, no del cwd."""
+    import importlib.util
+    lib = Path(__file__).resolve().parent.parent / "lib" / "dbtool.py"
+    spec = importlib.util.spec_from_file_location("appctl_dbtool", lib)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _assert_compose_valid(pdir: Path) -> None:
+    """El compose TIENE que ser YAML valido antes de cualquier otra cosa.
+
+    Este check existe porque un placeholder mal puesto genero
+    `\n    __DB_PUBLISH__    restart:` -> al sustituir, `restart:` quedava con
+    8 espacios y el `up` moria con 'did not find expected key' (linea 111)
+    en los cuatro stacks a la vez. El rollback de create lo reportaba bien
+    pero el create ya habia reservado puertos y habia escrito todo.
+
+    Se valida con `docker compose config` porque es el parser REAL: un
+    round-trip con PyYAML acepta cosas que compose rechaza (y al reescribir
+    perderia los comentarios, que son la documentacion del stack).
+    """
+    r = subprocess.run(["docker", "compose", "-f", str(pdir / "compose.yaml"),
+                        "config", "-q"],
+                       capture_output=True, text=True, cwd=pdir, timeout=90)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        # sacar el numero de linea si aparece: es lo que hace falta arreglar
+        die(f"el compose generado no es valido:\n{msg[:400]}\n"
+            f"  archivo: {pdir / 'compose.yaml'}")
+
+
+def _db_paths(args):
+    """(directorio del proyecto, stack) con error claro si no existe."""
+    st = load_state(args.proyecto)
+    return build_dir(args.proyecto), st["stack"]
+
+
+
+DB_PUBLISH_KEY = "db_host_port"
+
+
+def _render_publish(port: int | None, stack: str = "php-postgres-sftp") -> str:
+    """El bloque ports: del servicio db. Sin puerto: la nada.
+
+    El puerto INTERNO lo decide el stack: hardcodear 5432 hacia que un
+    stack mariadb publicara 13306:5432, un puerto abierto que no va a la
+    base.
+
+    SOLO el ports:. La red extra que hace falta para que el puerto se
+    publique la agrega _add_egress_to_db(), que es la que sabe tocar la
+    lista de redes del servicio db. Ponerla tambien aca duplicaba la
+    entrada (`- egress` dos veces) y el compose dejaba de parsear.
+    """
+    if not port:
+        return ""
+    interno = 3306 if "mysql" in stack else 5432
+    return ("    ports:\n"
+            f'      - "0.0.0.0:{port}:{interno}"')
+
+
+
+def cmd_db_expose(args) -> int:
+    """Publicar la DB en un puerto del host.
+
+    No cambia el stack ni la imagen: solo agrega ports: y levanta el
+    contenedor de la db. Antes se guarda una copia del compose para poder
+    volver atras con `db unexpose`.
+    """
+    d, stack = _db_paths(args)
+    port = args.puerto
+    if not (1024 <= port <= 65535):
+        die(f"puerto {port} fuera de rango (1024-65535)")
+
+    compose = d / "compose.yaml"
+    bak = d / "compose.yaml.pre-expose"
+    if not bak.exists():
+        shutil.copy2(compose, bak)
+
+    texto = _set_publish(compose.read_text(encoding="utf-8"), port, stack,
+                       state=load_state(args.proyecto))
+    compose.write_text(texto, encoding="utf-8")
+
+    # Validar el compose generado ANTES de recrear la base: si el render
+    # queda mal, no se debe interrumpir un contenedor sano ni dejar el YAML
+    # inválido escrito en el proyecto.
+    try:
+        _assert_compose_valid(d)
+    except SystemExit:
+        shutil.copy2(bak, compose)
+        raise
+    print(f"  publicando {args.proyecto} db en 0.0.0.0:{port}")
+    r = sh("docker compose up -d --force-recreate db", cwd=d)
+    if r.returncode != 0:
+        # no dejar el compose a medias si el up fallo
+        shutil.copy2(bak, compose)
+        die(f"docker compose up fallo:\n{r.stderr[:400]}")
+
+    ok, detalle = _verify_expose(args.proyecto, port)
+    if not ok:
+        # revertir el compose: dejar el proyecto como estaba es mejor que
+        # dejarlo con un puerto que no abre
+        shutil.copy2(bak, compose)
+        sh("docker compose up -d --force-recreate db", cwd=d)
+        die(f"expuse: {detalle}\n"
+            f"  se volvio a dejar la db cerrada (como estaba antes).")
+    print(f"  el {port} responde desde el host")
+    return 0
+
+
+def cmd_db_unexpose(args) -> int:
+    d, stack = _db_paths(args)
+    compose = d / "compose.yaml"
+    bak = d / "compose.yaml.pre-expose"
+    if not bak.exists():
+        die(f"{args.proyecto} no tiene db publicada (no hay compose.yaml.pre-expose)")
+    shutil.copy2(bak, compose)
+    print(f"  cerrando {args.proyecto} db")
+    # tambien --force-recreate: sacar un ports: de un contenedor vivo
+    # tampoco se aplica solo.
+    r = sh("docker compose up -d --force-recreate db", cwd=d)
+    if r.returncode != 0:
+        die(f"docker compose up fallo:\n{r.stderr[:400]}")
+    ok = _host_port_closed(int(args.puerto or 0)) if args.puerto else True
+    if args.puerto and not ok:
+        print(f"  aviso: el {args.puerto} sigue respondiendo. Puede ser otro "
+              f"proceso: appctl ps")
+    return 0
+
+
+def _add_egress_to_db(compose: str) -> str:
+    """Agrega `- egress` a la lista de redes del SERVICIO db.
+
+    Hay que estar dentro de `services:` Y dentro del servicio `db:`. El
+    archivo tiene un segundo `networks:` arriba (la seccion que DECLARA las
+    redes del compose); sin las dos guardas el helper le agregaba `- egress`
+    ahi y dejaba un bloque invalido.
+
+    El template ya trae `networks:` con `- data`: se MODIFICA esa lista, no
+    se agrega otra clave `networks:` (YAML no admite la clave dos veces).
+    """
+    lineas = compose.splitlines(keepends=True)
+    out: list[str] = []
+    en_services = False
+    nivel = 0            # 0 = fuera de db, 1 = dentro de db
+    i = 0
+    while i < len(lineas):
+        l = lineas[i]
+        s = l.rstrip("\n")
+        indent = len(s) - len(s.lstrip())
+
+        if s == "services:":
+            en_services = True
+        elif en_services and s and indent == 0 and s != "services:":
+            # salio de la seccion services (networks:, volumes:, etc. de raiz)
+            nivel = 0
+            en_services = False
+
+        if en_services and s == "  db:":
+            nivel = 1
+            out.append(l)
+            i += 1
+            continue
+
+        if nivel == 1 and s == "    networks:":
+            out.append(l)
+            i += 1
+            redes = []
+            while i < len(lineas):
+                nx = lineas[i].rstrip("\n")
+                nxi = len(nx) - len(nx.lstrip())
+                if not (nxi == 6 and nx.strip().startswith("- ")
+                        and ":" not in nx.split(":", 1)[0]):
+                    break
+                redes.append(nx.strip())
+                i += 1
+            for rd in redes:
+                if rd != "- egress":
+                    out.append("      " + rd + "\n")
+            if "- egress" not in redes:
+                out.append("      - egress   # el puerto publicado sale "
+                           "por aca; data es internal\n")
+            continue
+
+        if nivel == 1 and s and indent <= 2:
+            nivel = 0      # termino el servicio db
+
+        out.append(l)
+        i += 1
+    return "".join(out)
+
+
+def _set_publish(texto: str, port: int | None, stack: str = "php-postgres-sftp",
+                 state: dict | None = None) -> str:
+    """Poner o sacar el bloque ports: del servicio db.
+
+    NO se edita el YAML linea por linea. Editarlo a mano fallo dos veces:
+      - insertando despues de `container_name:` cortaba el `labels:` a la
+        mitad y dejaba 3 lineas colgando
+        -> 'did not find expected - indicator'
+      - intentar "copiar el bloque de labels" tampoco servia: la linea
+        siguiente a container_name tiene 4 espacios, no 6.
+
+    Para PONER: se vuelve a renderizar el template con el bloque ya puesto.
+    Para SACAR: se borra el bloque del compose actual.
+
+    Y al re-renderizar NO se re-derivan los valores: se LEEN del compose
+    que ya esta escrito. Si se calcularan de nuevo, expose cambiaria el
+    proyecto (puertos, hash de imagen) sin que nadie lo pidiera.
+    """
+    if not port:
+        return _strip_ports(texto)
+
+    tmpl = (STACKS_DIR / stack / "compose.tmpl.yaml").read_text(encoding="utf-8")
+    subs = _subs_from_existing(texto, state)
+    subs["__DB_PUBLISH__"] = _render_publish(port, stack)
+    for k, v in subs.items():
+        tmpl = tmpl.replace(k, v)
+    # El db tiene que estar tambien en egress: su unica red (data) es
+    # internal:true, sin gateway, y docker NO publica un puerto de ahi
+    # (lo deja en null sin decir por que). data sigue internal, asi que
+    # publicar el puerto no abre la db a los demas contenedores de la red.
+    return _add_egress_to_db(tmpl)
+
+
+def _subs_from_existing(texto: str, state: dict | None = None) -> dict:
+    """Los valores del compose ya renderizado, para re-renderizarlo igual."""
+    import re as _re
+
+    subs: dict[str, str] = {}
+    m = _re.search(r"container_name:\s*([A-Za-z0-9._-]+?)_db\b", texto)
+    if m:
+        subs["__PROYECTO__"] = m.group(1)
+    m = _re.search(r"image:\s*(appctl/[\w.-]+:\S+)-([0-9a-f]{8})", texto)
+    if m:
+        # __APP_IMAGE__ es el tag COMPLETO (repo:version-hash). Armarlo por
+        # partes dejaba __APP_IMAGE__ sin sustituir en los cuatro stacks.
+        subs["__APP_IMAGE__"] = m.group(1) + "-" + m.group(2)
+        subs["__STACK_HASH__"] = m.group(2)
+        ver = m.group(1).rsplit(":", 1)[-1]
+        if ver.startswith("8."):
+            subs["__PHP_VERSION__"] = ver
+        elif ver.startswith("11-"):
+            subs["__TOMCAT_VERSION__"] = ver
+        else:
+            subs["__NODE_VERSION__"] = ver
+    else:
+        # sin el dato, al menos el hash: el nombre se arma con runtime_of
+        h = _re.search(r"appctl/[\w.-]+:\S+-([0-9a-f]{8})", texto)
+        if h:
+            subs["__STACK_HASH__"] = h.group(1)
+    # postgres:18-alpine / mariadb:11.8  (mariadb NO lleva -alpine)
+    m = _re.search(r"image: postgres:(\S+?)-alpine\b", texto)
+    if m:
+        subs["__PG_VERSION__"] = m.group(1)
+    m = _re.search(r"image: mariadb:(\S+?)\b(?!-alpine)", texto)
+    if m:
+        subs["__MYSQL_VERSION__"] = m.group(1)
+    # Los puertos NO estan en el compose: el compose dice `":80"` y
+    # `":22"` a secas (docker los bindea al puerto que dice el .env) y el
+    # valor real vive en state.json. Buscarlos en el compose daba "" y
+    # dejaba __APP_PORT__ sin sustituir -> 'invalid hostPort: __APP_PORT__'.
+    st = state or {}
+    subs["__APP_PORT__"] = str(st.get("app_port", ""))
+    subs["__SFTP_PORT__"] = str(st.get("sftp_port", "") or "")
+    subs["__CRON__"] = _extract_cron(texto)
+    subs["__DB_PUBLISH__"] = ""
+    return subs
+
+
+def _extract_cron(texto: str) -> str:
+    """El bloque __CRON__ del compose actual, o cadena vacia si no hay."""
+    if "CRON_ENABLED" not in texto:
+        return ""
+    partes = []
+    for l in texto.split("\n"):
+        s = l.strip()
+        if s.startswith("CRON_ENABLED") or s.startswith("CRON_TZ"):
+            partes.append("      " + s)
+    return "\n".join(partes) + "\n"
+
+
+def _strip_ports(texto: str) -> str:
+    """Cierra la db: saca `ports:` y deja las redes como estaban.
+
+    Al cerrar hay que REESCRIBIR la lista de redes del db para saca
+    `egress` (que solo existe porque el puerto publicado necesita gateway),
+    dejando `data`. Se reescribe la lista completa en vez de saltarse el
+    `networks:` con un `continue`: asi se dejaba la clave sin sus valores y
+    el compose quedaba con `networks: default` (el db sin red ninguna),
+    que es PEOR que dejarlo como estaba.
+    """
+    lineas = texto.splitlines(keepends=True)
+    out: list[str] = []
+    en_services = False
+    en_db = False
+    i = 0
+    while i < len(lineas):
+        l = lineas[i]
+        s = l.rstrip("\n")
+        indent = len(s) - len(s.lstrip())
+
+        if s == "services:":
+            en_services = True
+        elif en_services and s and indent == 0:
+            en_services = False
+            en_db = False
+        if en_services and s == "  db:":
+            en_db = True
+            out.append(l)
+            i += 1
+            continue
+
+        if en_db and s == "    ports:":
+            i += 1
+            while i < len(lineas):
+                nx = lineas[i].rstrip("\n")
+                ni = len(nx) - len(nx.lstrip())
+                if nx.strip() and not (ni == 6 and nx.strip().startswith("- ")):
+                    break
+                i += 1
+            continue
+
+        if en_db and s == "    networks:":
+            out.append(l)
+            i += 1
+            while i < len(lineas):
+                nx = lineas[i].rstrip("\n")
+                ni = len(nx) - len(nx.lstrip())
+                if not (ni == 6 and nx.strip().startswith("- ")
+                        and ":" not in nx.split(":", 1)[0]):
+                    break
+                # comparacion por PREFIJO: la linea trae comentario
+                # ('- egress   # el puerto...') y con igualdad exacta no
+                # hacia match y el egress se quedaba.
+                if not nx.strip().startswith("- egress"):
+                    out.append("      " + nx.strip() + "\n")
+                i += 1
+            continue
+
+        if en_db and s and indent <= 2:
+            en_db = False
+        out.append(l)
+        i += 1
+    return "".join(out)
+
+
+def _verify_expose(proyecto: str, port: int) -> tuple[bool, str]:
+    """Prueba que el puerto responde DE VERDAD. Devuelve (ok, detalle).
+
+    Un `docker compose up -d` que sale con 0 no dice que el puerto quedo
+    abierto: dice que el contenedor arranco. La prueba es de red, desde el
+    propio host.
+
+    Que devuelva el resultado en vez de imprimirlo es lo que hace util al
+    que llama: antes imprimia "FALLA" y igual salia con codigo 0, y eso es
+    un check que no puede hacer fallar nada.
+    """
+    import time
+    ultimo = ""
+    for intento in range(1, 16):
+        r = subprocess.run(
+            ["docker", "run", "--rm", "--network", "host",
+             "--entrypoint", "sh", "busybox:latest", "-c",
+             f"nc -z -w 2 127.0.0.1 {port}"],
+            capture_output=True, timeout=60)
+        if r.returncode == 0:
+            return True, f"responde (intento {intento})"
+        ultimo = (r.stderr or "").strip()[:120]
+        time.sleep(3)
+    # por que no abrio: el contenedor tiene el puerto?
+    insp = subprocess.run(
+        ["docker", "inspect", f"{proyecto}_db", "--format",
+         "{{json .NetworkSettings.Ports}}"],
+        capture_output=True, text=True, timeout=30)
+    puertos = (insp.stdout or "").strip()
+    return False, (f"el {port} no responde desde el host tras 45s.\n"
+                   f"    lo que dice docker del contenedor: {puertos or '(nada)'}\n"
+                   f"    appctl {proyecto} logs --service db")
+
+
+def _host_port_closed(port: int) -> bool:
+    r = subprocess.run(
+        ["docker", "run", "--rm", "--network", "host", "--entrypoint", "sh",
+         "busybox:latest", "-c", f"nc -z -w 2 127.0.0.1 {port}"],
+        capture_output=True, timeout=60)
+    return r.returncode != 0
+
+
+def cmd_db_grant(args) -> int:
+    """Dar acceso a un usuario externo, con su password y su origen."""
+    d, stack = _db_paths(args)
+    db = _load_dbtool()
+    pw = args.password
+    if not pw:
+        if not sys.stdin.isatty():
+            pw = sys.stdin.read().strip().split("\n")[0]
+        else:
+            import getpass
+            try:
+                pw = getpass.getpass(f"  password de {args.usuario}: ")
+            except Exception:
+                die("no se pudo leer la password")
+    try:
+        print("  " + db.grant(d, stack, user=args.usuario, password=pw,
+                              cidr=args.cidr, role=args.rol,
+                              schema=args.schema, migrate=args.rol == "migrate")
+              .replace("\n", "\n  "))
+    except db.DbError as e:
+        die(str(e))
+
+    print(f"\n  IMPORTANTE: este usuario solo entra si la db esta publicada.\n"
+          f"    appctl {args.proyecto} db expose <puerto>\n"
+          f"  y solo desde {args.cidr} (o el % que le diste).")
+    return 0
+
+
+def cmd_db_revoke(args) -> int:
+    d, stack = _db_paths(args)
+    db = _load_dbtool()
+    if not args.yes:
+        die(f"esto saca el acceso de {args.usuario} de inmediato.\n"
+            f"  confirmar: appctl {args.proyecto} db revoke {args.usuario} --yes")
+    try:
+        print("  " + db.revoke(d, stack, user=args.usuario))
+    except db.DbError as e:
+        die(str(e))
+    return 0
+
+
+def cmd_db_users(args) -> int:
+    """Los usuarios de la base y de donde pueden entrar.
+
+    En mariadb NO se consulta `mysql.user`: esa tabla es del servidor y el
+    usuario del proyecto no tiene permiso (SELECT command denied). Se usa
+    information_schema, que si es legible.
+    """
+    d, stack = _db_paths(args)
+    db = _load_dbtool()
+    nombre_db = db._db_name(d, stack)
+    if db.db_kind(stack) == "mysql":
+        sql = ("select distinct grantee from information_schema.user_privileges "
+               f"where table_schema = '{nombre_db}' order by grantee")
+        r = db._sql(d, stack, [sql], admin=True)
+        if r.returncode != 0:
+            die(db._err(r).strip() or "no se pudieron leer los privilegios")
+        filas = []
+        for linea in (r.stdout or "").splitlines():
+            g = linea.strip()
+            if not g or g.lower().startswith(("warning", "note", "empty")):
+                continue
+            # el grantee viene como 'usuario'@'host'
+            if "@" in g:
+                u, h = g.split("@", 1)
+                filas.append((u.strip("'` "), h.strip("'` ")))
+            else:
+                filas.append((g, ""))
+        print(f"  {'USUARIO':<28} ORIGEN")
+        for u, h in sorted(filas):
+            print(f"  {u:<28} {h}")
+        print("\n  (mariadb: el origen va DENTRO del usuario, no en un "
+              "archivo aparte)")
+        return 0
+
+    sql = "select rolname, rolcanlogin from pg_roles where rolcanlogin order by rolname"
+    r = db._sql(d, stack, [sql], admin=True)
+    if r.returncode != 0:
+        die(db._err(r).strip() or "no se pudieron leer los roles")
+    print(f"  {'USUARIO':<28} ORIGEN")
+    for linea in (r.stdout or "").strip().splitlines():
+        if linea.strip():
+            u = linea.split("\t")
+            print(f"  {u[0]:<28} {u[1] if len(u) > 1 else ''}")
+    print("\n  postgres: el ORIGEN de conexion vive en pg_hba.conf; aca "
+          "solo el rol.")
+    print("  para verlo:  docker exec <proyecto>__db grep appctl: "
+          "$(printenv PGDATA)/pg_hba.conf")
+    return 0
+
+
+def cmd_db_dump(args) -> int:
+    d, stack = _db_paths(args)
+    db = _load_dbtool()
+    out = db.dump(d, stack, out=args.output, timeout=args.timeout)
+    meta = json.loads(out.with_suffix(out.suffix + ".json").read_text())
+    print(f"  dump: {out}")
+    print(f"        {out.stat().st_size/1024:.1f} KiB  motor={meta['motor']}  "
+          f"sha256={meta['sha256'][:16]}...")
+    print(f"  meta: {out.with_suffix(out.suffix + '.json')}")
+    print(f"  restaurar: appctl {args.proyecto} db restore {out.name}")
+    return 0
+
+
+def cmd_db_restore(args) -> int:
+    d, stack = _db_paths(args)
+    if not args.yes:
+        die(f"un restore PISA la base entera.\n"
+            f"  confirmar: appctl {args.proyecto} db restore {args.archivo} --yes\n"
+            f"  (el dump de seguridad automatico se hace igual)")
+    db = _load_dbtool()
+    antes = db.tables_count(d, stack)
+    print(f"  restaurando {args.archivo} en {args.proyecto} "
+          f"(tablas antes: {antes})...")
+    safety = db.restore(d, stack, args.archivo, timeout=args.timeout,
+                        clean=args.clean)
+    print(f"  tablas: {antes} -> {db.tables_count(d, stack)}")
+    if safety:
+        print(f"  el estado ANTERIOR quedo en: {safety.name}")
+        print(f"  para volver atras:  appctl {args.proyecto} db restore "
+              f"{safety.name} --yes")
+    else:
+        print("  (sin dump de seguridad: el anterior no se pudo sacar)")
+    return 0
+
+
+def cmd_db_list(args) -> int:
+    import datetime as _dt
+    d, _ = _db_paths(args)
+    bdir = d / "backups"
+    if not bdir.is_dir():
+        print(f"  no hay backups todavia:  appctl {args.proyecto} db dump")
+        return 0
+    exts = {".dump", ".sql", ".gz"}
+    files = sorted((f for f in bdir.iterdir()
+                    if f.suffix in exts or f.name.endswith(".sql.gz")),
+                   key=lambda f: f.stat().st_mtime, reverse=True)
+    if not files:
+        print("  (vacio)")
+        return 0
+    print(f"  {'ARCHIVO':<40} {'PESO':>10}  FECHA")
+    for f in files[:args.limit]:
+        when = _dt.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        print(f"  {f.name:<40} {f.stat().st_size/1024:>9.1f}K  {when}")
+    if len(files) > args.limit:
+        print(f"  ... y {len(files) - args.limit} mas")
+    return 0
+
+
+def cmd_db_rm(args) -> int:
+    d, _ = _db_paths(args)
+    backups = (d / "backups").resolve()
+    requested = Path(args.archivo)
+    if requested.name != args.archivo:
+        die("el backup debe ser un nombre de archivo dentro de backups")
+    f = (backups / requested.name).resolve()
+    if backups not in f.parents:
+        die("el backup debe estar dentro del directorio backups")
+    if f.suffix not in {".dump", ".sql", ".gz"} and not f.name.endswith(".sql.gz"):
+        die("tipo de backup no permitido (se esperan .dump, .sql o .gz)")
+    if not f.exists():
+        die(f"no existe: {f}")
+    if not args.yes:
+        die(f"borrar un backup no se puede deshacer.\n"
+            f"  confirmar: appctl {args.proyecto} db rm {args.archivo} --yes")
+    f.unlink()
+    meta = f.with_suffix(f.suffix + ".json")
+    if meta.exists():
+        meta.unlink()
+    print(f"  borrado: {f.name}")
+    return 0
+
+def cmd_doctor(args) -> int:
+    print(f"host:        {DEFAULT_HOST}")
+    for label, cmd in [
+        ("docker", ["docker", "--version"]),
+        ("compose", ["docker", "compose", "version"]),
+        ("ss", None),
+        ("df /data", ["df", "-h", str(PROJECTS_DIR.parent)]),
+    ]:
+        if cmd is None:
+            continue
+        r = run(cmd)
+        print(f"{label:12s} {r.stdout.strip().splitlines()[0] if r.stdout.strip() else 'NO ENCONTRADO'}")
+    print(f"proyectos:   {PROJECTS_DIR}")
+    print(f"registry:    {APPCTL_HOME / 'registry.json'}")
+    # el proxy: en redes cerradas hace falta para apk y para composer. Sin
+    # avisar, el build falla con 'no such package' que no dice nada.
+    px = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if px:
+        print(f"build proxy: {px}")
+    else:
+        print("build proxy: NINGUNO")
+        print("  si el build falla con 'no such package', falta el proxy:")
+        print("  export HTTPS_PROXY=http://<tu-proxy>:8080")
+
+    # sudo sin password: destroy necesita borrar archivos que creo el
+    # contenedor (postgres uid 999, app uid 1000), no el usuario. Sin esto,
+    # el primer destroy falla con Permission denied.
+    if os.geteuid() != 0:
+        r = run(["sudo", "-n", "true"], timeout=10)
+        print(f"sudo -n:     {'ok' if r.returncode == 0 else 'NO FUNCIONA (destroy fallara)'}")
+
+    # sshpass: sin esto, el check de login SFTP se saltea. No es critico
+    # (el cliente entra igual), pero conviene tenerlo para verificar.
+    r = run(["which", "sshpass"], timeout=10)
+    if r.returncode != 0:
+        print("sshpass:     NO INSTALADO -> el check de SFTP se va a saltar")
+        print("             apt install sshpass")
+    else:
+        print("sshpass:     ok")
+    return 0
+
+
+# ------------------------------------------------------------------ main ----
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="appctl", description="provisionador de stacks por cliente",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            componentes:
+              php      PHP-FPM + nginx + sshd (5 servicios juntos)
+              nextjs   Node 22 + Next.js
+              tomcat   Tomcat 11 + nginx (4 servicios: nginx aparte)
+              psql     PostgreSQL
+              mysql    MariaDB / MySQL
+              sftp     SFTP con chroot
+              cron     crontab con supervisor
+
+            ejemplos:
+              appctl acme php psql sftp
+              appctl acme php psql sftp --app-port 3001
+              appctl acme php mysql
+              appctl acme list
+              appctl acme rotate sftp
+              appctl acme destroy
+            """))
+    ap.add_argument("--version", action="version", version="appctl 0.1.0")
+    sub = ap.add_subparsers(dest="cmd")
+
+    c = sub.add_parser("create", help="crear un proyecto")
+    c.add_argument("proyecto")
+    c.add_argument("componentes", nargs="+", metavar="COMPONENT",
+                   help="php nextjs tomcat psql mysql sftp cron")
+    c.add_argument("--app-port", type=int)
+    c.add_argument("--sftp-port", type=int)
+    c.add_argument("--php", help="fijar version, ej: 8.3")
+    c.add_argument("--app-memory", help="RAM del contenedor de app, ej: 2G")
+    c.add_argument("--db-memory", help="RAM del contenedor de db, ej: 1G")
+    c.add_argument("--host", default=DEFAULT_HOST)
+    c.add_argument("--dry-run", action="store_true")
+    c.set_defaults(func=cmd_create)
+
+    for name, help_ in [("list", "ver todos los proyectos"),
+                        ("doctor", "estado del host")]:
+        s = sub.add_parser(name, help=help_)
+        s.set_defaults(func=cmd_list if name == "list" else cmd_doctor)
+
+    p = sub.add_parser("ps", help="los stacks de appctl, con puertos y estado")
+    p.set_defaults(func=cmd_ps)
+
+    p = sub.add_parser("clone", help="copiar un proyecto con sus datos, en otro puerto")
+    p.add_argument("origen")
+    p.add_argument("nuevo")
+    p.add_argument("--port", type=int, help="puerto de app del clon")
+    p.add_argument("--sftp-port", type=int)
+    p.add_argument("--php", help="probar con otra version de PHP, ej: 8.4")
+    p.add_argument("--no-up", action="store_true",
+                   help="crear sin levantar (para editarla antes)")
+    p.add_argument("--force", action="store_true",
+                   help="clonar aunque no se pueda dumpear la base")
+    p.set_defaults(func=cmd_clone)
+
+    p = sub.add_parser("limits", help="cambiar RAM/CPU en caliente")
+    p.add_argument("proyecto")
+    p.add_argument("--memory", help="ej: 2G")
+    p.add_argument("--db-memory", help="ej: 1G (solo con --save)")
+    p.add_argument("--swap", help="ej: 3G (default: 2x memoria)")
+    p.add_argument("--cpus", type=float, help="ej: 1.5")
+    p.add_argument("--save", action="store_true",
+                   help="persistir en el .env (si no, es temporal)")
+    p.set_defaults(func=cmd_limits)
+
+    p = sub.add_parser("upgrade", help="re-aplicar el compose del template")
+    p.add_argument("proyecto")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="aplicar directamente (sin esto solo muestra el diff)")
+    p.add_argument("--php", metavar="VER",
+                   help="migrar a otra version de PHP (8.3, 8.4, 8.5...)")
+    p.add_argument("--runtime", metavar="RUNTIME",
+                   choices=["php", "nextjs", "tomcat"],
+                   help="cambiar de runtime (php <-> nextjs <-> tomcat)")
+    p.set_defaults(func=cmd_upgrade)
+
+    p = sub.add_parser("info", help="detalle de un proyecto")
+    p.add_argument("proyecto")
+    p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("creds", help="re-revelar credenciales")
+    p.add_argument("proyecto")
+    p.set_defaults(func=cmd_creds)
+
+    p = sub.add_parser("logs", help="logs de un proyecto")
+    p.add_argument("proyecto")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("--service", choices=["app", "db"])
+    p.set_defaults(func=cmd_logs)
+
+    p = sub.add_parser("shell", help="shell en un contenedor")
+    p.add_argument("proyecto")
+    p.add_argument("--service", default="app", choices=["app", "db"])
+    p.add_argument("--bash", action="store_true")
+    p.set_defaults(func=cmd_shell)
+
+    p = sub.add_parser("psql", help="psql conectada al proyecto")
+    p.add_argument("proyecto")
+    p.add_argument("-U", "--user", default=None)
+    p.add_argument("-d", "--db", default=None)
+    p.set_defaults(func=cmd_psql)
+
+    p = sub.add_parser("restart", help="reiniciar")
+    p.add_argument("proyecto")
+    p.set_defaults(func=cmd_restart)
+
+    p = sub.add_parser("rotate", help="cambiar una credencial")
+    p.add_argument("proyecto")
+    p.add_argument("que", choices=["sftp", "db", "mig", "ro"])
+    p.set_defaults(func=cmd_rotate)
+
+    b = sub.add_parser("build", help="construir las imagenes base (una vez)")
+    b.add_argument("--runtime",
+                   choices=["php", "mysql", "nextjs", "tomcat"],
+                   help="php+mysql = stack MariaDB; el resto, postgres")
+    b.add_argument("--stack", default=None)
+    b.add_argument("--php", default=None)
+    b.add_argument("--force", action="store_true",
+                   help="reconstruir aunque la imagen no haya cambiado")
+    b.set_defaults(func=cmd_build)
+
+    # `db` es el unico verbo que tiene SUBCOMANDOS, y eso rompe el
+    # dispatcher: `appctl acme db dump` se reordena a `appctl db acme dump`
+    # (el proyecto queda entre el verbo y el subcomando), no a
+    # `appctl db dump acme`. Por eso el proyecto es un ARGUMENTO DE `db`,
+    # no de cada subparser, y los subcomandos no lo piden.
+    p = sub.add_parser("db", help="la base de un proyecto: dump/restore/list/expose")
+    p.add_argument("proyecto")
+    dsub = p.add_subparsers(dest="dbcmd", required=True)
+
+    q = dsub.add_parser("dump", help="sacar un dump de la base")
+    q.add_argument("-o", "--output", help="ruta (por defecto <proyecto>/backups/)")
+    q.add_argument("--timeout", type=int, default=900)
+    q.set_defaults(func=cmd_db_dump)
+
+    q = dsub.add_parser("restore", help="restaurar un dump (PISA la base)")
+    q.add_argument("archivo")
+    q.add_argument("--yes", action="store_true", help="confirmar: pisa la base")
+    q.add_argument("--clean", action="store_true",
+                   help="borrar antes los objetos del dump (por defecto NO)")
+    q.add_argument("--timeout", type=int, default=900)
+    q.set_defaults(func=cmd_db_restore)
+
+    q = dsub.add_parser("expose", help="publicar la DB en un puerto del host")
+    q.add_argument("puerto", type=int)
+    q.set_defaults(func=cmd_db_expose)
+
+    q = dsub.add_parser("unexpose", help="cerrar la DB (vuelve al estado de siempre)")
+    q.add_argument("--puerto", type=int,
+                   help="el puerto a comprobar que quedo cerrado")
+    q.set_defaults(func=cmd_db_unexpose)
+
+    q = dsub.add_parser("grant", help="dar acceso a un usuario externo")
+    q.add_argument("usuario")
+    q.add_argument("--cidr", default="10.0.0.0/8",
+                   help="de donde se permite entrar (default 10.0.0.0/8)")
+    q.add_argument("--rol", default="readonly",
+                   choices=["readonly", "write", "migrate"], help="readonly default")
+    q.add_argument("--schema", default="public")
+    q.add_argument("--password", help="si no, la pide o la lee de stdin")
+    q.set_defaults(func=cmd_db_grant)
+
+    q = dsub.add_parser("revoke", help="sacar el acceso de un usuario")
+    q.add_argument("usuario")
+    q.add_argument("--yes", action="store_true")
+    q.set_defaults(func=cmd_db_revoke)
+
+    q = dsub.add_parser("users", help="los usuarios de la base")
+    q.set_defaults(func=cmd_db_users)
+
+    q = dsub.add_parser("list", help="los backups del proyecto")
+    q.add_argument("--limit", type=int, default=20)
+    q.set_defaults(func=cmd_db_list)
+
+    q = dsub.add_parser("rm", help="borrar un backup")
+    q.add_argument("archivo")
+    q.add_argument("--yes", action="store_true")
+    q.set_defaults(func=cmd_db_rm)
+
+    p = sub.add_parser("destroy", help="destruir un proyecto")
+    p.add_argument("proyecto")
+    p.add_argument("--keep-data", action="store_true")
+    p.add_argument("--yes", "-y", action="store_true")
+    p.set_defaults(func=cmd_destroy)
+
+    if not sys.argv[1:]:
+        ap.print_help()
+        return 0
+
+    # --- sintaxis corta ----------------------------------------------------
+    #   appctl acme php psql sftp        -> create acme php psql sftp
+    #   appctl acme info                 -> info acme
+    #   appctl acme rotate sftp          -> rotate acme sftp
+    #
+    # El orden importa: `rotate` y `destroy` son subcomandos de un proyecto,
+    # pero `psql` y `shell` podrian confundirse con un componente si alguien
+    # los escribiera despues del nombre. Se resuelve mirando la posicion:
+    # el subcomando va SIEMPRE en argv[2] cuando hay proyecto.
+    VERBS = {"info", "creds", "ps", "logs", "shell", "psql", "restart",
+             "rotate", "destroy", "upgrade", "limits", "clone", "db"}
+    # Los verbos van TAMBIEN en GLOBALS: `appctl info acme` (con el verbo
+    # primero) tiene que funcionar igual que `appctl acme info`. Si un verbo
+    # queda solo en VERBS, `appctl info acme` cae al branch de create y dice
+    # "componentes desconocidos: info" -- un error que no tiene nada que ver
+    # con lo que el usuario escribio.
+    GLOBALS = {"create", "list", "ps", "doctor", "build", "help", "-h",
+               "--help", "--version", "-V",
+               "info", "creds", "logs", "shell", "psql", "restart",
+               "rotate", "destroy", "upgrade", "limits", "clone", "db"}
+
+    a = sys.argv[1:]
+    if a[0] not in GLOBALS:
+        if len(a) >= 2 and a[1] in VERBS:
+            # appctl <proj> <verb> ...  ->  <verb> <proj> ...
+            proj, verb, rest = a[0], a[1], a[2:]
+            sys.argv = [sys.argv[0], verb, proj, *rest]
+        else:
+            # appctl <proj> <componentes...>  ->  create <proj> <componentes...>
+            sys.argv = [sys.argv[0], "create", *a]
+
+    args = ap.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        die("interrumpido")
+    except portsmod.PortError as e:
+        die(str(e))
+    except FileExistsError as e:
+        # mkdir de render_project: hay una carrera cuando el directorio
+        # reaparece entre el chequeo y el mkdir (dos creates simultaneos del
+        # mismo nombre, o un proceso anterior que lo dejo a medias). El
+        # traceback de pathlib no le dice al admin que hacer.
+        dest = Path(str(e.filename or e))
+        die(f"ya existe {dest}\n"
+            f"  si es un proyecto real:  appctl {dest.name} info\n"
+            f"  si quedo a medias:        rm -rf {dest}")
+    except FileNotFoundError as e:
+        # logs/shell/restart corrian con cwd=<dir del proyecto>. Si el
+        # proyecto no existe, subprocess tira FileNotFoundError con un
+        # PosixPath en filename. Sin esto el usuario se come un traceback de
+        # 30 lineas de subprocess por un simple typo.
+        tgt = str(e.filename or e)
+        # "PosixPath('/srv/appctl/acme')" -> "acme"
+        m = re.search(r"PosixPath\('([^']+)'\)", tgt) or re.search(r"'([^']+)'", tgt)
+        path = m.group(1) if m else tgt
+        name = Path(path).name if path else tgt
+        die(f"no existe el proyecto {name!r} en {path}")
+    except RuntimeError as e:
+        # placeholders sin sustituir, templates rotos: es un bug del CLI,
+        # no del pedido del usuario. Decirlo asi y no con un traceback.
+        die(f"bug interno de appctl: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
