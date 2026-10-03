@@ -173,7 +173,7 @@ appctl nextjs-project nextjs psql sftp --app-port 3001
 
 **Options:** `--app-port N` (default: first free from 8001) · `--sftp-port N`
 (default: 2221) · `--host NAME` (default: `$APPCTL_HOST`) ·
-`--env .env.example` (seed to preload from) · `--dry-run` · `--yes`
+`--dry-run` · `--yes`
 
 **Invariants checked before creating anything:**
 
@@ -409,6 +409,7 @@ appctl/
 │   ├── test_init_sql.py       # runs the inits and validates the SQL they produce
 │   ├── test_root_pw.py        # parses mariadb's log line
 │   ├── test_security.py       # the compose doesn't publish the database
+│   ├── test_readme.py         # every README claim, checked against the code
 │   └── check_names.py         # AST: undefined calls, duplicate defs
 └── docs/                      # (private, not in this repo)
 ```
@@ -418,6 +419,16 @@ when the volume is created; if it fails there, there's no retry and the project
 ends up with a database missing its three users, permanently. The test runs the
 init for real with `psql`/`mariadb` swapped for a binary that does `cat`, and
 looks at the SQL that comes out. No database required.
+
+`tests/test_readme.py` is what keeps this README from lying. It pulls out every
+checkable claim (the stacks, the flags, the subcommands, the versions, the
+default paths, the networks) and compares it against the files. It exists
+because this README was wrong: it said there were 8 stacks when there were 4,
+and listed two lib/ modules that were never written, and documented an environment-file flag
+the parser never defined. None of that shows up by reading the
+document. It shows up by running the test.
+
+
 
 ---
 

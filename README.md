@@ -180,7 +180,7 @@ appctl nextjs-proyecto nextjs psql sftp --app-port 3001
 
 **Opciones:** `--app-port N` (default: primer libre desde 8001) · `--sftp-port N`
 (default: 2221) · `--host NAME` (default: `$APPCTL_HOST`) ·
-`--env .env.example` (semilla para precargar) · `--dry-run` · `--yes`
+`--dry-run` · `--yes`
 
 **Invariantes que valida antes de crear:**
 
@@ -413,6 +413,7 @@ appctl/
 │   ├── test_init_sql.py       # ejecuta los init y valida el SQL que producen
 │   ├── test_root_pw.py        # parsea la línea del log de mariadb
 │   ├── test_security.py       # el compose no publica la DB
+│   ├── test_readme.py         # cada claim del README contra el codigo
 │   └── check_names.py         # AST: llamadas sin definir, defs duplicadas
 └── docs/                      # (privado, no en este repo)
 ```
@@ -423,13 +424,15 @@ base sin los tres usuarios para siempre. El test corre el init de verdad con
 `psql`/`mariadb` sustituidos por un binario que hace `cat`, y mira el SQL que
 llega. Sin base de datos de por medio.
 
+`tests/test_readme.py` es el que evita que este README mienta. Extrae cada
+afirmación verificable (los stacks, los flags, los subcomandos, las versiones,
+los paths por defecto, las redes) y la contrasta contra los archivos. Existió
+porque este README mentía: decía que había 8 stacks y había 4, y listaba dos módulos de lib/ que nunca se escribieron, y documentaba un flag de precarga de
+environment que el parser nunca 정의. Nada de eso se ve leyendo el documento; se ve
+corriendo el test.
 
-## Estado
 
-Funcional y verificado end-to-end en PostgreSQL y MariaDB:
-
-| | |
-|---|---|
+---|---|
 | `create` | 9/9 checks: contenedores healthy, DB responde, roles creados, password exigida, DB inalcanzable desde el host y desde otro contenedor |
 | `clone` | datos, índices y credenciales nuevas; el clon es independiente del origen |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, datos intactos |
