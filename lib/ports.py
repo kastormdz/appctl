@@ -148,6 +148,16 @@ class Registry:
                 return json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
             return {"projects": {}, "ports": {}}
+        except PermissionError:
+            # Un 'sudo appctl create' deja el registro como root:root 0600. Aca
+            # reventaba con un PermissionError crudo en medio de un Traceback, que
+            # no dice que archivo es ni como se arregla. Lo que importa es que el
+            # error sea accionable: el comando de chown va en el mensaje.
+            raise PortError(
+                f"no puedo leer {self.path}\n"
+                "        el archivo es de otro usuario (si se creo con sudo, es\n"
+                "        root:root).\n"
+                "        sudo chown $(id -un):$(id -gn) " + self.path) from None
 
     def _write(self, data: dict) -> None:
         tmp = self.path + ".tmp"

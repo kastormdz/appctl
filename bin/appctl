@@ -30,13 +30,43 @@ import gen as sec
 import smoke as smokemod
 from summary import render_create, render_rotate, render_list, render_info
 
-# Defaults deliberadamente genericos (/srv/appctl): un repo publico no debe
-# dictar la topologia del que lo instala. Donde van las cosas se decide con
-# APPCTL_PROJECTS y APPCTL_HOME; el unico requisito real es que el directorio
-# de proyectos este en el MISMO filesystem que el root de Docker, para que un
-# restore cierre.
-APPCTL_HOME = Path(os.environ.get("APPCTL_HOME", "/srv/appctl/.appctl"))
-PROJECTS_DIR = Path(os.environ.get("APPCTL_PROJECTS", "/srv/appctl"))
+# Donde van los proyectos. Se define con APPCTL_PROJECTS; si no esta, se usa
+# el default de abajo.
+#
+# El default tiene que existir en la maquina donde corre appctl. Cuando se
+# cpio el binario a otro servidor sin crear el directorio, la app decia 'no hay
+# proyectos' mirando un /srv/appctl que no existia, mientras los proyectos
+# estaban en otro lado: el mismo sintoma que un registro ilegible, y la misma
+# confussion.
+#
+# Un repo publico no dicta la topologia del que lo instala, asi que el default
+# es /srv/appctl (Linux estandar). Para usar otro:
+#   export APPCTL_PROJECTS=/ruta/donde/estan
+# o un archivo en /etc/default/appctl.
+APPCTL_DEFAULT_PROJECTS = "/srv/appctl"
+
+
+def _proyectos_dir() -> Path:
+    v = os.environ.get("APPCTL_PROJECTS")
+    if v:
+        return Path(v)
+    # /etc/default/appctl: el lugar estandar para defaults de un servicio en
+    # Linux. Lo leemos aca porque el usuario abre una shell nueva y no va a
+    # exportar nada.
+    conf = Path("/etc/default/appctl")
+    if conf.is_file():
+        try:
+            for linea in conf.read_text().split("\n"):
+                linea = linea.strip()
+                if linea.startswith("APPCTL_PROJECTS="):
+                    return Path(linea.split("=", 1)[1].strip().strip("'\""))
+        except OSError:
+            pass
+    return Path(APPCTL_DEFAULT_PROJECTS)
+
+
+PROJECTS_DIR = _proyectos_dir()
+APPCTL_HOME = Path(os.environ.get("APPCTL_HOME", str(PROJECTS_DIR / ".appctl")))
 STACKS_DIR = Path(__file__).resolve().parent.parent / "stacks"
 # El host NO tiene default: cada instalacion define APPCTL_HOST. Hardcodear
 # el dominio de una despliegue daba un help que moria en otro lado, y en un
@@ -144,6 +174,23 @@ def cmd_create(args) -> int:
     components = set(args.componentes)
     validate_components(components)
     project = args.proyecto
+
+    # Correr create con sudo deja TODO el proyecto como root:root 0700. Despues
+    # el usuario normal no puede ni entrar al directorio ni leer el registro de
+    # puertos, y `appctl list` reporta que no hay proyectos: el bug se descubre
+    # cuando ya esta todo mal.
+    #
+    # appctl NO necesita sudo: con estar en el grupo docker alcanza para
+    # docker, y create no toca archivos que el contenedor creo todavia. Solo
+    # destroy necesita sudo, y ese caso lo avisa por su cuenta.
+    if os.geteuid() == 0 and not os.environ.get("APPCTL_ALLOW_ROOT"):
+        die("no corras create con sudo.\n"
+            "        el proyecto queda como root:root y despues no lo podes ni\n"
+            "        listar. para arreglar uno ya creado:\n"
+            f"          sudo chown -R $(id -un):$(id -gn) {PROJECTS_DIR}/*\n"
+            "        si de verdad queres seguir como root, ponle\n"
+            "        APPCTL_ALLOW_ROOT=1. no hace falta sudo: alcanza con estar\n"
+            "        en el grupo docker.")
 
     try:
         portsmod.valid_project(project)
@@ -1433,9 +1480,28 @@ def cmd_ps(args) -> int:
         print(f"no existe {PROJECTS_DIR}")
         return 0
 
+    # Un proyecto con sudo queda como root:root 0700: el glob no lo encuentra y
+    # el listado decia 'no hay proyectos' cuando habia dos puertos registrados y
+    # un stack andando. Mentir sobre el estado del servidor es peor que no
+    # listar: hay que decir que no se puede leer.
+    sin_permiso = [d for d in PROJECTS_DIR.iterdir()
+                   if d.is_dir() and not d.name.startswith(".")
+                   and not os.access(d, os.R_OK | os.X_OK)]
     proyectos = sorted(p.parent.name for p in PROJECTS_DIR.glob("*/state.json")
                        if (p.parent / "compose.yaml").exists())
     if not proyectos:
+        if sin_permiso:
+            print(f"no hay proyectos visibles, pero {len(sin_permiso)} "
+                  f"existen y no los puedo leer:")
+            for d in sorted(sin_permiso)[:6]:
+                print(f"  {d.name}")
+            print()
+            print("están como root. Se crean así con 'sudo appctl', y el")
+            print("usuario normal no entra al directorio ni lee el registro.")
+            print(f"  sudo chown -R $(id -un):$(id -gn) {PROJECTS_DIR}/*")
+            print()
+            print("appctl no necesita sudo: con estar en el grupo docker alcanza.")
+            return 1
         print("no hay proyectos")
         return 0
 
@@ -1505,6 +1571,15 @@ def _compose_ps_rows(txt) -> list[dict]:
 
 
 def cmd_psql(args) -> int:
+    # Un proyecto con sudo deja el .env como root 0600. load_env reventaba con
+    # un Traceback feo y sin decir por que; lo que tiene que pasar es un
+    # mensaje que nombre el archivo y el comando para arreglarlo.
+    envf = build_dir(args.proyecto) / ".env"
+    if not os.access(envf, os.R_OK):
+        die(f"no puedo leer {envf}\n"
+            "        el archivo es de otro usuario (si lo creaste con sudo, es\n"
+            "        root:root).\n"
+            f"        sudo chown $(id -un):$(id -gn) {envf}")
     env = load_env(args.proyecto)
     user = args.user or env.get("DB_USER", "postgres")
     db = args.db or env.get("DB_NAME")
@@ -2217,11 +2292,7 @@ def cmd_doctor(args) -> int:
         ("docker", ["docker", "--version"]),
         ("compose", ["docker", "compose", "version"]),
         ("ss", None),
-        # el label tiene que seguir al path configurado: con un default
-        # fijo (df /data) mostraba '/data' aunque APPCTL_PROJECTS fuera otro,
-        # y el que lo leeAsuma que el disco es ese.
-        ("df {0}".format(PROJECTS_DIR.parent),
-         ["df", "-hP", str(PROJECTS_DIR.parent)]),
+        ("df /data", ["df", "-h", str(PROJECTS_DIR.parent)]),
     ]:
         if cmd is None:
             continue

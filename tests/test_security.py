@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import shutil
 import tempfile
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
@@ -86,6 +87,73 @@ def main() -> int:
              "safe.sql", "--yes"], env=env, check=True,
             capture_output=True, text=True)
         check(not safe.exists(), "db rm borra un backup válido")
+
+    # --- un proyecto que este usuario no puede leer ---
+    # Bug real: 'sudo appctl create' deja el directorio 0700 root:root. El
+    # listado decia 'no hay proyectos' con dos puertos registrados y un stack
+    # andando, porque exists() sobre un directorio ajeno devuelve False sin
+    # fallar. Decir que no hay es peor que no listar: hay que decir que no se
+    # puede leer, y como se arregla.
+    print("=== proyectos que no puedo leer ===")
+    if os.geteuid() != 0:
+        site = Path(tempfile.mkdtemp())
+        raiz = site / "proyectos"
+        ajeno = raiz / "ajeno"
+        ajeno.mkdir(parents=True)
+        (ajeno / "state.json").write_text(
+            '{"project": "ajeno", "stack": "php-postgres-sftp"}\n')
+        os.chmod(ajeno, 0o000)
+        try:
+            r = subprocess.run(
+                [sys.executable, str(ROOT / "bin/appctl"), "list"],
+                env=dict(os.environ, APPCTL_PROJECTS=str(raiz),
+                         APPCTL_HOME=str(site / "home")),
+                capture_output=True, text=True)
+            out = r.stdout + r.stderr
+            check("no dice 'no hay proyectos' cuando hay uno ilegible"
+                  not in out,
+                  "el listado reporta ausencia donde hay un proyecto que no "
+                  "puede leer: " + out[:200])
+            check("ajeno" in out and "leer" in out,
+                  "no nombra el proyecto ilegible ni dice que no puede "
+                  "leerlo: " + out[:300])
+            check("chown" in out,
+                  "no da el comando para arreglarlo: " + out[:300])
+        finally:
+            os.chmod(ajeno, 0o700)
+            shutil.rmtree(site, ignore_errors=True)
+    else:
+        print("  (omitido: corre como root y root lee todo)")
+
+    # --- create con sudo se niega antes de crear nada ---
+    print("=== create con sudo ===")
+    if os.geteuid() == 0:
+        site = Path(tempfile.mkdtemp())
+        raiz = site / "proyectos"
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "bin/appctl"), "nuevo", "php", "psql",
+             "sftp"],
+            env=dict(os.environ, APPCTL_PROJECTS=str(raiz),
+                     APPCTL_HOME=str(site / "home")),
+            capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        check(r.returncode != 0 and "sudo" in out.lower(),
+              "create con root no se niega: " + out[:250])
+        check("root" in out.lower(),
+              "el aviso no dice por que queda como root: " + out[:250])
+        check(not (raiz / "nuevo").exists(),
+              "creo el directorio del proyecto pese a avisar")
+        r2 = subprocess.run(
+            [sys.executable, str(ROOT / "bin/appctl"), "nuevo", "php", "psql",
+             "sftp", "--dry-run"],
+            env=dict(os.environ, APPCTL_PROJECTS=str(raiz),
+                     APPCTL_HOME=str(site / "home"), APPCTL_ALLOW_ROOT="1"),
+            capture_output=True, text=True)
+        check("no corras create con sudo" not in (r2.stdout + r2.stderr),
+              "APPCTL_ALLOW_ROOT=1 no deja pasar")
+        shutil.rmtree(site, ignore_errors=True)
+    else:
+        print("  (omitido: no corre como root)")
 
     print("todo bien")
     return 0

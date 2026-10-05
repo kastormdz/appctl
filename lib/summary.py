@@ -5,6 +5,7 @@ preguntarte nada, y vos no deberias tener que editar el texto antes de
 mandarlo. Por eso el resumen va en texto plano, con los labels alineados y
 sin color (o con poco: que se lea bien pegado en un mail o en un ticket).
 """
+import os
 import json
 import subprocess
 from pathlib import Path
@@ -146,15 +147,48 @@ def render_rotate(project: str, what: str, creds: list[tuple[str, str]],
 
 def render_list(proj_dir: str) -> str:
     d = Path(proj_dir)
+    # Directorio inexistente es una configuracion mal puesta, no "no hay
+    # proyectos". Decir 'no hay proyectos en /srv/appctl' cuando ese path no
+    # existe hizo perder tiempo: los proyectos estaban en otro lado.
+    if not d.exists():
+        return ("\n  el directorio de proyectos no existe: " + str(d) +
+                "\n\n"
+                "  no es que no haya proyectos: appctl esta mirando un path que\n"
+                "  no existe. Cada instalacion tiene el suyo.\n\n"
+                "    export APPCTL_PROJECTS=/ruta/donde/estan\n"
+                "  o, para que sea permanente y no haya que exportar cada vez:\n"
+                "    echo 'APPCTL_PROJECTS=/ruta/donde/estan' | sudo tee /etc/default/appctl\n")
     rows = []
+    sin_permiso = []
     for pdir in sorted(d.iterdir()) if d.is_dir() else []:
         if not pdir.is_dir() or pdir.name.startswith("."):
             continue
         sf = pdir / "state.json"
+        # Un directorio 0700 de otro usuario: exists() devuelve False sin
+        # fallar, y el listado terminaba diciendo 'no hay proyectos' con dos
+        # puertos registrados y un stack andando. Decir que no hay es peor
+        # que no listar: hay que decir que no se puede leer.
+        if not os.access(pdir, os.R_OK | os.X_OK):
+            sin_permiso.append(pdir.name)
+            continue
         if not sf.exists():
             continue
-        st = json.loads(sf.read_text())
+        try:
+            st = json.loads(sf.read_text())
+        except (OSError, ValueError):
+            sin_permiso.append(pdir.name)
+            continue
         rows.append(st)
+    if not rows and sin_permiso:
+        L = ["", f"  no hay proyectos visibles, pero {len(sin_permiso)} existen",
+             "  y este usuario no los puede leer:", ""]
+        for n in sorted(sin_permiso)[:8]:
+            L.append(f"    {n}")
+        L += ["", "  estan como root. Se crean asi con 'sudo appctl', y despues",
+              "  el usuario normal no entra al directorio ni lee el registro.", "",
+              f"    sudo chown -R $(id -un):$(id -gn) {d}/*", "",
+              "  appctl no necesita sudo: con estar en el grupo docker alcanza."]
+        return "\n".join(L) + "\n"
     if not rows:
         return "\n  no hay proyectos en " + str(d) + "\n"
     L = ["", f"  {'PROYECTO':<20} {'STACK':<26} {'APP':<7} {'SFTP':<7} {'DB':<10}", "  " + "-" * 74]

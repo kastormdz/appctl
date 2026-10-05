@@ -100,7 +100,10 @@ export APPCTL_PROJECTS=/tmp/appctl-probando
 
 ## Layout en el host
 
-Todo cuelga de un directorio configurable, con un subdirectorio por cliente:
+Todo cuelga de un directorio configurable, con un subdirectorio por cliente.
+Se define con `APPCTL_PROJECTS`, y si no está en el entorno se lee de
+`/etc/default/appctl` (el lugar estándar de defaults en Linux, así no hay que
+exportar nada en cada shell):
 
 ```
 $APPCTL_PROJECTS/<proyecto>/          # uno por cliente
@@ -122,7 +125,7 @@ clientes.
 
 | Variable | Default | Para qué |
 |---|---|---|
-| `APPCTL_PROJECTS` | `/srv/appctl` | raíz de los proyectos |
+| `APPCTL_PROJECTS` | `/srv/appctl` | raíz de los proyectos (también se lee de `/etc/default/appctl`) |
 | `APPCTL_HOME` | `/srv/appctl/.appctl` | registro de puertos y versiones |
 | `APPCTL_HOST` | `localhost` | el host que sale en el resumen |
 | `HTTPS_PROXY` | — | hace falta si la red no llega a los repos |
