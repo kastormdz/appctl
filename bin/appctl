@@ -2217,7 +2217,11 @@ def cmd_doctor(args) -> int:
         ("docker", ["docker", "--version"]),
         ("compose", ["docker", "compose", "version"]),
         ("ss", None),
-        ("df /data", ["df", "-h", str(PROJECTS_DIR.parent)]),
+        # el label tiene que seguir al path configurado: con un default
+        # fijo (df /data) mostraba '/data' aunque APPCTL_PROJECTS fuera otro,
+        # y el que lo leeAsuma que el disco es ese.
+        ("df {0}".format(PROJECTS_DIR.parent),
+         ["df", "-hP", str(PROJECTS_DIR.parent)]),
     ]:
         if cmd is None:
             continue

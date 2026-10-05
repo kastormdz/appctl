@@ -39,6 +39,7 @@ Un Linux con Docker y Compose v2, y un usuario que pueda hablar con el daemon:
 | Compose | v2.40.3 (probado) |
 | RAM | ~1 GB por cliente (su app + su base) |
 | sudo | sin password, o un wrapper |
+| `sshpass` | opcional: sin él el check de SFTP se saltea |
 
 Cada cliente lleva **su propia base en su propio contenedor**. No hay una base
 compartida entre todos. Es lo que hace que el aislamiento sea real y no un
@@ -52,6 +53,50 @@ de esto. Los stacks sirven HTTP en un puerto del host y el que los publica
 decide el certificado.
 
 ---
+
+## Instalación
+
+Sin dependencias de Python: es stdlib y nada más. No hay `pip install`, ni
+`requirements.txt`, ni setup.py.
+
+Del host necesita: `docker` con Compose v2, `ss` (viene con iproute2), `sudo`
+sin password para `destroy`, y `sshpass` — este último solo para que el check
+de SFTP pueda automatizar el login. Sin `sshpass` anda todo, el check de SFTP
+simplemente se saltea y `doctor` te avisa.
+
+```bash
+git clone https://github.com/kastormdz/appctl.git
+cd appctl
+./bin/appctl doctor
+```
+
+`doctor` te dice si el host tiene lo que hace falta. Si tira OK, andás.
+
+**El CLI busca `lib/` y `stacks/` relativos a sí mismo**, así que funciona
+desde el clon y no desde donde lo hayas copiado. Eso significa que el camino es
+instalarlo donde lo clonaste:
+
+```bash
+sudo ln -s /ruta/donde/clonaste/appctl/bin/appctl /usr/local/bin/appctl
+```
+
+El symlink resuelve bien: `Path(__file__).resolve()` sigue el enlace hasta el
+archivo real, así que `lib/` y `stacks/` se encuentran igual.
+
+**Copiar solo el binario no funciona.** Si hacés `cp bin/appctl /usr/local/bin/`
+te va a fallar con un `ImportError` sobre `ports`, sin explicación: el binario
+buscó `/usr/local/lib` y ahí no está.
+
+Si preferís que sea un symlink en otro lado o un wrapper, andá. Lo que no
+funciona es el binario suelto.
+
+Para probar sin tocar el sistema, `APPCTL_PROJECTS` a un directorio temporal y
+listo:
+
+```bash
+export APPCTL_PROJECTS=/tmp/appctl-probando
+./bin/appctl acme php psql sftp
+```
 
 ## Layout en el host
 

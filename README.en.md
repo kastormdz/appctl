@@ -38,6 +38,7 @@ Linux with Docker and Compose v2, and a user that can talk to the daemon:
 | Compose | v2.40.3 (tested) |
 | RAM | ~1 GB per client (its app plus its database) |
 | sudo | passwordless, or a wrapper |
+| `sshpass` | optional: without it the SFTP check gets skipped |
 
 Every client gets **its own database in its own container**. There's no shared
 database. That's what makes the isolation real instead of a `GRANT` that merely
@@ -52,6 +53,51 @@ this. The stacks serve HTTP on a host port and whoever publishes them decides th
 certificate.
 
 ---
+
+## Installation
+
+No Python dependencies: it's stdlib and nothing else. No `pip install`, no
+`requirements.txt`, no setup.py.
+
+From the host it needs `docker` with Compose v2, `ss` (ships with iproute2),
+`sudo` without a password for `destroy`, and `sshpass`. That last one is only
+for automating the SFTP login in the check. Without `sshpass` everything still
+works, the SFTP check just gets skipped, and `doctor` says so.
+
+```bash
+git clone https://github.com/kastormdz/appctl.git
+cd appctl
+./bin/appctl doctor
+```
+
+`doctor` tells you whether the host has what it takes. If it says OK, you're
+good.
+
+**The CLI looks for `lib/` and `stacks/` relative to itself**, so it works from
+the clone and not from wherever you copied it to. In practice that means
+installing it where you cloned it:
+
+```bash
+sudo ln -s /where/you/cloned/appctl/bin/appctl /usr/local/bin/appctl
+```
+
+The symlink resolves fine: `Path(__file__).resolve()` follows the link through
+to the real file, so `lib/` and `stacks/` are found either way.
+
+**Copying just the binary doesn't work.** `cp bin/appctl /usr/local/bin/` gets
+you an `ImportError` about `ports`, with no explanation: the binary looked for
+`/usr/local/lib` and it isn't there.
+
+If you'd rather have the symlink somewhere else, or a wrapper, go for it. What
+doesn't work is the lone binary.
+
+To try it without touching the system, point `APPCTL_PROJECTS` at a temporary
+directory:
+
+```bash
+export APPCTL_PROJECTS=/tmp/appctl-testing
+./bin/appctl acme php psql sftp
+```
 
 ## Layout on the host
 
