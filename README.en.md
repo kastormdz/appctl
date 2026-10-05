@@ -101,7 +101,10 @@ export APPCTL_PROJECTS=/tmp/appctl-testing
 
 ## Layout on the host
 
-Everything hangs off one configurable directory, with a subdirectory per client:
+Everything hangs off one configurable directory, with a subdirectory per
+client. It's set with `APPCTL_PROJECTS`, and if that isn't in the environment
+it's read from `/etc/default/appctl` (the standard place for defaults on Linux,
+so nobody has to export anything in every shell):
 
 ```
 $APPCTL_PROJECTS/<project>/          # one per client
@@ -122,7 +125,7 @@ The port registry sits separately in `$APPCTL_HOME` (default
 
 | Variable | Default | What it's for |
 |---|---|---|
-| `APPCTL_PROJECTS` | `/srv/appctl` | projects root |
+| `APPCTL_PROJECTS` | `/srv/appctl` | projects root (also read from `/etc/default/appctl`) |
 | `APPCTL_HOME` | `/srv/appctl/.appctl` | port registry and versions |
 | `APPCTL_HOST` | `localhost` | the host printed in the summary |
 | `HTTPS_PROXY` | — | needed when the network can't reach the repos |
