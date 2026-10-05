@@ -454,7 +454,7 @@ appctl/
 │   ├── gen.py                 # renderiza el compose y el .env
 │   ├── ports.py               # registry de puertos + flock
 │   ├── dbtool.py              # dump / restore / expose / grant
-│   ├── smoke.py               # los 9 checks
+│   ├── smoke.py               # los 10 checks
 │   └── summary.py             # el resumen para el developer
 ├── stacks/                    # 4 stacks, uno por directorio
 ├── tests/
@@ -472,6 +472,13 @@ base sin los tres usuarios para siempre. El test corre el init de verdad con
 `psql`/`mariadb` sustituidos por un binario que hace `cat`, y mira el SQL que
 llega. Sin base de datos de por medio.
 
+`create` corre 10 checks. El último es "la base se puede usar": hace una
+consulta de verdad con la password del rol de la app. Antes eran 9 y el healthcheck
+era un `pg_isready`, que contesta aunque el motor no pueda abrir sus propios
+datos. Con el volumen de la base en 700, postgres reiniciaba en loop
+(`could not open file "global/pg_filenode.map"`) y todo parecía andando: los
+backups fallaban y nada lo delata.
+
 `tests/test_readme.py` es el que evita que este README mienta. Extrae cada
 afirmación verificable (los stacks, los flags, los subcomandos, las versiones,
 los paths por defecto, las redes) y la contrasta contra los archivos. Existió
@@ -481,7 +488,7 @@ corriendo el test.
 
 
 ---|---|
-| `create` | 9/9 checks: contenedores healthy, DB responde, roles creados, password exigida, DB inalcanzable desde el host y desde otro contenedor |
+| `create` | 10/10 checks: contenedores healthy, DB responde, roles creados, password exigida, DB inalcanzable desde el host y desde otro contenedor |
 | `clone` | datos, índices y credenciales nuevas; el clon es independiente del origen |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, datos intactos |
 | `db dump/restore` | Postgres y MariaDB |

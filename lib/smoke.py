@@ -856,6 +856,57 @@ def mysql_not_reachable_from_host(project_dir: str, port: int = 3306) -> Check:
                  f"puerto {port} cerrado ({combined.splitlines()[-1][:80] if combined else 'sin salida'})")
 
 
+def db_es_utilizable(project_dir: str, cfg: dict) -> Check:
+    """La base se puede USAR, no solo responder.
+
+    El healthcheck es un pg_isready, que contesta aunque el motor no pueda
+    leer sus propios datos. Con el volumen de la base del owner equivocado
+    (el uid del usuario de appctl en vez del del postgres) el contenedor queda
+    healthy, los otros checks dan verde, y despues:
+
+      pg_dump: could not open file "global/pg_filenode.map": Permission denied
+
+    O sea: el proyecto parece andando y los backups no funcionan. Este check
+    hace lo que un admin haria antes de confiar: una consulta de verdad, con
+    la password del rol de la app.
+    """
+    db_kind = (cfg or {}).get("db_kind", "postgres")
+    env = (cfg or {}).get("env") or {}
+    user = env.get("DB_USER", "")
+    pw = env.get("DB_PASSWORD", "")
+    nombre = env.get("DB_NAME", "")
+    if not (user and pw and nombre):
+        return Check("la base se puede usar", False,
+                     "no tengo las credenciales del rol de la app para "
+                     "probarla (falta DB_USER/DB_PASSWORD/DB_NAME)")
+    if db_kind == "mysql":
+        cmd = ("MYSQL_PWD=%s mariadb --protocol=socket -u%s -N -B "
+               "-e 'select 1'" % (shlex.quote(pw), shlex.quote(user)))
+        punta = "MYSQL_PWD=%s mariadb -h 127.0.0.1 -u%s -N -B -e 'select 1'" % (
+            shlex.quote(pw), shlex.quote(user))
+    else:
+        # por TCP y no por socket: con pg_hba en scram el socket tambien pide
+        # password, y el -h evita depender del path del socket unix.
+        cmd = ("PGPASSWORD=%s psql -h 127.0.0.1 -U %s -d %s -tAc 'select 1'"
+               % (shlex.quote(pw), shlex.quote(user), shlex.quote(nombre)))
+        punta = cmd
+    rc, out = _compose_input(project_dir, "db", "sh", "-c", cmd,
+                             timeout=30, stdin="")
+    if rc != 0 and db_kind == "mysql" and "Access denied" in (out or ""):
+        # mysql por socket necesita el plugin del server; por TCP no.
+        rc, out = _compose_input(project_dir, "db", "sh", "-c", punta,
+                                 timeout=30, stdin="")
+    if rc != 0:
+        return Check("la base se puede usar", False,
+                     "no pude consultar la base con el rol de la app:\n        "
+                     + (out or "").strip()[:220] +
+                     "\n        lo mas comun: el volumen de la base es del "
+                     "usuario equivocado y el motor no puede leer sus datos. "
+                     "los backups fallan aunque todo aparezca healthy.")
+    return Check("la base se puede usar", True,
+                 "responde consultas con el rol de la app, no solo un ping")
+
+
 def all_checks(project_dir: str, cfg: dict, host: str) -> list[Check]:
     """Suite completa, en el orden en que conviene fallar."""
     checks: list[Check] = []
@@ -872,6 +923,7 @@ def all_checks(project_dir: str, cfg: dict, host: str) -> list[Check]:
     # existe. Este lo verifica por nombre.
     checks.append(db_roles_exist(project_dir, cfg))
     checks.append(db_demanda_password(project_dir, cfg))
+    checks.append(db_es_utilizable(project_dir, cfg))
 
     db_port = int(cfg.get("db_port", 5432))
     if (cfg.get("db_kind") or "postgres") == "mysql":

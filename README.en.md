@@ -451,7 +451,7 @@ appctl/
 │   ├── gen.py                 # renders the compose and the .env
 │   ├── ports.py               # port registry + flock
 │   ├── dbtool.py              # dump / restore / expose / grant
-│   ├── smoke.py               # the 9 checks
+│   ├── smoke.py               # the 10 checks
 │   └── summary.py             # the summary for the developer
 ├── stacks/                    # 4 stacks, one per directory
 ├── tests/
@@ -468,6 +468,13 @@ when the volume is created; if it fails there, there's no retry and the project
 ends up with a database missing its three users, permanently. The test runs the
 init for real with `psql`/`mariadb` swapped for a binary that does `cat`, and
 looks at the SQL that comes out. No database required.
+
+`create` runs 10 checks. The last one is "the database can be used": it runs a
+real query with the app role's password. There were 9 before, and the healthcheck
+was a `pg_isready`, which answers even when the engine can't open its own data.
+With the database volume at 700, postgres restarted in a loop
+(`could not open file "global/pg_filenode.map"`) and everything looked fine: the
+backups failed and nothing gave it away.
 
 `tests/test_readme.py` is what keeps this README from lying. It pulls out every
 checkable claim (the stacks, the flags, the subcommands, the versions, the
@@ -487,7 +494,7 @@ Working and verified end to end on PostgreSQL and MariaDB:
 
 | | |
 |---|---|
-| `create` | 9/9 checks: containers healthy, DB answers, roles created, password required, DB unreachable from the host and from another container |
+| `create` | 10/10 checks: containers healthy, DB answers, roles created, password required, DB unreachable from the host and from another container |
 | `clone` | data, indexes and new credentials; the clone is independent of the source |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, data intact |
 | `db dump/restore` | Postgres and MariaDB |

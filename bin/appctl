@@ -426,6 +426,35 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
                 "cron", "logs", "build"):
         (pdir / sub).mkdir(parents=True, exist_ok=True)
 
+    # ./db/data se monta sobre /var/lib/postgresql/data (o /var/lib/mysql), y el
+    # directorio del proyecto es 700 para que las credenciales no se lean.
+    #
+    # El motor de la base NO puede escribir en un padre en 700. Con postgres
+    # (uid 70) eso pasa:
+    #
+    #   mkdir: can't create directory '/var/lib/postgresql/data/pgdata'
+    #   FATAL: could not open file "global/pg_filenode.map": Permission denied
+    #
+    # El contenedor queda healthy igual (el healthcheck es un pg_isready, que
+    # contesta antes de que el motor pueda abrir sus datos) y los checks dan
+    # verde, pero db dump, db restore y db users no funcionan: los backups
+    # salen fallidos y nada lo delata.
+    #
+    # No se hace chown a proposito: en Linux solo root puede cambiar el owner
+    # de un directorio a otro uid, ni aunque sea tuyo, y appctl justamente
+    # pide que no se corra con sudo.
+    #
+    # El entrypoint del motor oficial resuelve solo: corre como root al
+    # principio y hace 'mkdir -p $PGDATA' mas 'find $PGDATA ! -user postgres
+    # -exec chown postgres' (postgres:18-alpine, linea 58). Lo unico que
+    # necesita es que el padre sea escribible, asi que este directorio queda
+    # en 755. El 700 sigue para el resto del proyecto, que es donde estan las
+    # credenciales.
+    try:
+        os.chmod(pdir / "db" / "data", 0o755)
+    except OSError:
+        pass
+
     # NOTA: la imagen NO se copia al proyecto. Se construye una vez con
     # `appctl build` y la comparten todos los proyectos con el mismo PHP.
     # Copiarla aca multiplicaba el build por cliente.
