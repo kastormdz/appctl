@@ -43,6 +43,26 @@ def main() -> int:
     check("ON_ERROR_STOP=1" in appctl._restore_cmd("postgres"),
           "clone detiene el restore PostgreSQL ante errores")
 
+    # Los dumps nuevos son gzip; restore sigue aceptando los dumps planos
+    # anteriores para no dejar backups existentes inutilizables.
+    with tempfile.TemporaryDirectory(prefix="appctl-gzip-") as td:
+        gz = Path(td) / "backup.dump.gz"
+        gz.write_bytes(__import__("gzip").compress(b"backup-v1\n"))
+        check(dbtool._dump_bytes(gz) == b"backup-v1\n",
+              "restore descomprime backups gzip")
+        plain = Path(td) / "backup.sql"
+        plain.write_bytes(b"legacy\n")
+        check(dbtool._dump_bytes(plain) == b"legacy\n",
+              "restore conserva compatibilidad con backups planos")
+        streamed = Path(td) / "stream.dump.gz"
+        rc, stderr, raw_bytes = dbtool._stream_gzip(
+            [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 1000000)"],
+            streamed, timeout=30)
+        check(rc == 0 and not stderr and raw_bytes == 1000000,
+              "dump comprime sin cargar todo el stream en memoria")
+        check(dbtool._dump_bytes(streamed) == b"x" * 1000000,
+              "el gzip del dump se puede restaurar")
+
     with tempfile.TemporaryDirectory(prefix="appctl-render-") as td:
         base = Path(td)
         projects = base / "projects"

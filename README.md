@@ -391,17 +391,18 @@ cualquier cosa que pueda enrutar al host.
 ### Backups, export e import
 
 ```bash
-appctl <p> db dump                 # a <p>/backups/, con fecha y sha256
-appctl <p> db dump -o /tmp/x.sql   # a donde le digas
+appctl <p> db dump                 # a <p>/backups/, con fecha, gzip y sha256
+appctl <p> db dump -o /tmp/x.dump.gz   # a donde le digas
 appctl <p> db list                 # qué backups hay
 appctl <p> db restore <archivo> --yes
 appctl <p> db rm <archivo> --yes   # borrar uno (no se puede deshacer)
 ```
 
-El dump sale **de adentro del contenedor**: no hace falta `psql` en el host, y la
-base no necesita ser accesible. Corre en los dos motores con el mismo comando.
-Cada dump deja un archivo con la fecha en el nombre y un `.json` al lado con el
-motor y el sha256.
+El dump sale **de adentro del contenedor**, se guarda comprimido con gzip y lleva
+`.dump.gz`: no hace falta `psql` en el host, y la base no necesita ser accesible.
+Corre en los dos motores con el mismo comando. Cada dump deja un archivo gzip
+con la fecha en el nombre y un `.json` al lado con el motor, el tamaño comprimido
+y el sha256.
 
 `restore` **pisa la base**, así que avisá que está a punto de pasar y guarda el
 estado anterior con el comando exacto para volver atrás.
@@ -483,15 +484,15 @@ el mismo servidor, sí.
 El proyecto va antes del subcomando:
 
 ```bash
-appctl db <proyecto> dump [-o ruta]           # exporta la base
-appctl db <proyecto> restore <archivo> --yes # importa; PISA la base
-appctl db <proyecto> list                    # backups que hay
-appctl db <proyecto> rm <archivo> -y         # borra un backup
-appctl db <proyecto> expose <puerto>         # publica (default 127.0.0.1)
-appctl db <proyecto> unexpose                # cierra
-appctl db <proyecto> grant <usuario>         # alta de usuario externo
-appctl db <proyecto> revoke <usuario> --yes  # le saca el acceso
-appctl db <proyecto> users                   # usuarios de la base y sus permisos
+appctl <proyecto> db dump [-o ruta]           # exporta la base en gzip
+appctl <proyecto> db restore <archivo> --yes # importa; PISA la base
+appctl <proyecto> db list                    # backups que hay
+appctl <proyecto> db rm <archivo> -y         # borra un backup
+appctl <proyecto> db expose <puerto>         # publica (default 127.0.0.1)
+appctl <proyecto> db unexpose                # cierra
+appctl <proyecto> db grant <usuario>         # alta de usuario externo
+appctl <proyecto> db revoke <usuario> --yes  # le saca el acceso
+appctl <proyecto> db users                   # usuarios de la base y sus permisos
 ```
 
 ---

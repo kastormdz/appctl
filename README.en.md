@@ -391,17 +391,18 @@ from anything that can route to the host.
 ### Backups, export and import
 
 ```bash
-appctl <p> db dump                 # to <p>/backups/, dated, with a sha256
-appctl <p> db dump -o /tmp/x.sql   # anywhere you like
+appctl <p> db dump                 # to <p>/backups/, dated, gzip and sha256
+appctl <p> db dump -o /tmp/x.dump.gz   # anywhere you like
 appctl <p> db list                 # which backups exist
 appctl <p> db restore <file> --yes
 appctl <p> db rm <file> --yes      # delete one (no undo)
 ```
 
-The dump comes from inside the container: you don't need `psql` on the host, and
-the database doesn't need to be reachable. It works on both engines with the same
-command. Every dump leaves one dated file plus a `.json` next to it with the
-engine and the sha256.
+The dump comes from inside the container, is stored gzip-compressed, and uses a
+`.dump.gz` suffix: you don't need `psql` on the host, and the database doesn't
+need to be reachable. It works on both engines with the same command. Every dump
+leaves a dated gzip file plus a `.json` next to it with the engine, compressed size
+and sha256.
 
 `restore` **overwrites the database**, so it warns you first and saves the previous
 state with the exact command to get back to it.
@@ -483,15 +484,15 @@ isolation. On a MySQL with several databases on one server, it isn't.
 The project comes before the subcommand:
 
 ```bash
-appctl db <project> dump [-o path]           # export the database
-appctl db <project> restore <file> --yes     # import; OVERWRITES the database
-appctl db <project> list                     # backups that exist
-appctl db <project> rm <file> -y             # delete a backup
-appctl db <project> expose <port>            # publish (default 127.0.0.1)
-appctl db <project> unexpose                 # close it
-appctl db <project> grant <user>             # add an external user
-appctl db <project> revoke <user> --yes      # take the access away
-appctl db <project> users                    # database users and their rights
+appctl <project> db dump [-o path]           # export the database as gzip
+appctl <project> db restore <file> --yes     # import; OVERWRITES the database
+appctl <project> db list                     # backups that exist
+appctl <project> db rm <file> -y             # delete a backup
+appctl <project> db expose <port>            # publish (default 127.0.0.1)
+appctl <project> db unexpose                 # close it
+appctl <project> db grant <user>             # add an external user
+appctl <project> db revoke <user> --yes      # take the access away
+appctl <project> db users                    # database users and their rights
 ```
 
 ---

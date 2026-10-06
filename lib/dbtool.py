@@ -24,10 +24,12 @@ que no incluye el volumen", que es peor que no tener backup.
 from __future__ import annotations
 
 import datetime as _dt
+import gzip
 import ipaddress
 import json
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 
@@ -76,6 +78,49 @@ def _stamp() -> str:
     return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
+def _stream_gzip(cmd: list[str], dest: Path, *, timeout: int) -> tuple[int, bytes, int]:
+    """Ejecuta el dump y lo comprime sin cargarlo entero en RAM."""
+    import selectors
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise DbError(f"no existe el comando: {cmd[0]}") from exc
+
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ, "out")
+    selector.register(proc.stderr, selectors.EVENT_READ, "err")
+    stderr = bytearray()
+    total = 0
+    started = time.monotonic()
+    try:
+        with gzip.open(dest, "wb", compresslevel=6) as compressed:
+            while selector.get_map():
+                if time.monotonic() - started > timeout:
+                    proc.kill()
+                    raise DbError(
+                        f"el comando tardo mas de {timeout}s y se corto; "
+                        "si la base es muy grande, subilo con --timeout")
+                for key, _ in selector.select(timeout=1):
+                    chunk = key.fileobj.read(1 << 20)
+                    if chunk:
+                        if key.data == "out":
+                            compressed.write(chunk)
+                            total += len(chunk)
+                        else:
+                            stderr.extend(chunk)
+                    else:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+        rc = proc.wait(timeout=5)
+    finally:
+        selector.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    return rc, bytes(stderr), total
+
+
 # --- dump ------------------------------------------------------------------
 
 def dump(project_dir: str | Path, stack: str, *, out: str | None = None,
@@ -88,9 +133,10 @@ def dump(project_dir: str | Path, stack: str, *, out: str | None = None,
 
     if out:
         dest = Path(out)
+        if dest.suffix != ".gz":
+            dest = dest.with_name(dest.name + ".gz")
     else:
-        ext = ".dump" if kind == "postgres" else ".sql"
-        dest = backups / f"{project_dir.name}-{_stamp()}{ext}"
+        dest = backups / f"{project_dir.name}-{_stamp()}.dump.gz"
 
     # El dump se escribe a STDOUT y se guarda en el host: el contenedor no
     # necesita tener acceso al disco del proyecto, y asi el archivo queda
@@ -116,20 +162,20 @@ def dump(project_dir: str | Path, stack: str, *, out: str | None = None,
                "--single-transaction", "--routines", "--triggers",
                "--events", "--databases", _db_name(project_dir, stack)]
 
-    # postgres -Fc es binario (compressed custom format): va en BYTES o el
-    # archivo sale corrupto. mariadb-dump es SQL plano: texto alcanza y deja
-    # el error legible.
-    r = _run(cmd, timeout=timeout, text=(kind == "mysql"))
-    if r.returncode != 0:
-        err = _as_text(r.stderr)
-        raise DbError(f"el dump fallo (codigo {r.returncode}):\n{err.strip()[:600]}")
-
-    data = r.stdout if isinstance(r.stdout, (bytes, bytearray)) else r.stdout.encode()
-    dest.write_bytes(data)
-    if dest.stat().st_size == 0:
+    # El stream va directo al gzip: una base grande no se copia entera a la
+    # RAM del host antes de comprimirse.
+    rc, stderr, raw_bytes = _stream_gzip(cmd, dest, timeout=timeout)
+    if rc != 0:
+        err = _as_text(stderr)
+        raise DbError(f"el dump fallo (codigo {rc}):\n{err.strip()[:600]}")
+    if raw_bytes == 0:
         raise DbError(
             f"el dump salio vacio (0 bytes). No es un backup: "
             f"la base esta vacia o el usuario no tiene permiso de lectura.")
+
+    # Todos los dumps quedan gzip, tambien el custom de PostgreSQL (-Fc ya
+    # comprime internamente, pero gzip mantiene un formato uniforme para
+    # rotacion, transporte y almacenamiento).
 
     dest.chmod(0o600)
     _write_meta(dest, kind, project_dir.name, stack)
@@ -267,6 +313,21 @@ def _sha256(p: Path) -> str:
 
 # --- restore ---------------------------------------------------------------
 
+def _dump_bytes(src: Path) -> bytes:
+    """Lee un dump viejo plano o el formato gzip actual.
+
+    Detecta gzip por magic bytes, no por el nombre: asi se pueden restaurar
+    backups anteriores (.dump/.sql) y tambien archivos gzip renombrados.
+    """
+    raw = src.read_bytes()
+    if raw[:2] == b"\x1f\x8b":
+        try:
+            return gzip.decompress(raw)
+        except OSError as exc:
+            raise DbError(f"el backup gzip esta corrupto: {src}") from exc
+    return raw
+
+
 def restore(project_dir: str | Path, stack: str, dump_path: str | Path,
             *, timeout: int = 900, keep_backup: bool = True,
             clean: bool = False) -> Path | None:
@@ -322,7 +383,7 @@ def restore(project_dir: str | Path, stack: str, dump_path: str | Path,
         r = subprocess.run(["docker", "exec", "-i",
                             *_pw_flag(project_dir, stack),
                             f"{project_dir.name}_db", *inner],
-                           input=src.read_bytes(), capture_output=True,
+                           input=_dump_bytes(src), capture_output=True,
                            timeout=timeout)
     else:
         db = _db_name(project_dir, stack)
@@ -333,7 +394,7 @@ def restore(project_dir: str | Path, stack: str, dump_path: str | Path,
                             "-e",
                             f"MYSQL_PWD={_db_password(project_dir, stack)}",
                             f"{project_dir.name}_db", *inner],
-                           input=src.read_bytes(), capture_output=True,
+                           input=_dump_bytes(src), capture_output=True,
                            timeout=timeout)
 
     if r.returncode != 0:
