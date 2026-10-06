@@ -175,6 +175,73 @@ def main() -> int:
     else:
         print("  (omitido: no corre como root)")
 
+    # --- comandos globales usados con un proyecto ---
+    # Bug real: `appctl acme doctor` caia al default (create), tomaba "doctor"
+    # por un componente y respondia "componentes desconocidos: doctor". El
+    # comando existe: lo que sobra es el nombre del proyecto.
+    print("=== comandos globales con un proyecto ===")
+    site = Path(tempfile.mkdtemp())
+    raiz = site / "proyectos"
+    for verbo in ("doctor", "build", "list", "ps", "create"):
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "bin/appctl"), "acme", verbo],
+            env=dict(os.environ, APPCTL_PROJECTS=str(raiz),
+                     APPCTL_HOME=str(site / "home")),
+            capture_output=True, text=True)
+        out = r.stdout + r.stderr
+        check(r.returncode != 0,
+              f"`appctl acme {verbo}` no falla: " + out[:200])
+        check("componentes desconocidos" not in out,
+              f"`appctl acme {verbo}` sigue diciendo 'componentes "
+              f"desconocidos': manda a buscar el problema donde no esta")
+        check("global" in out and verbo in out,
+              f"`appctl acme {verbo}` no explica que el comando es global: "
+              + out[:200])
+    check(not (raiz / "acme").exists(),
+          "un comando mal usado creo el proyecto igual")
+    shutil.rmtree(site, ignore_errors=True)
+
+    # --- dry-run no deja residuo ---
+    # Bug real: el render y la reserva de puertos corrian ANTES del `if
+    # dry_run`, asi que un --dry-run dejaba el proyecto en disco CON el .env
+    # y las credenciales, el puerto reservado, y el create de verdad despues
+    # fallaba con "ya existe el proyecto". El README decia "sin tocar nada".
+    print("=== dry-run sin residuo ===")
+    site = Path(tempfile.mkdtemp())
+    raiz = site / "proyectos"
+    raiz.mkdir()
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "bin/appctl"), "acme", "php", "psql",
+         "sftp", "--dry-run"],
+        env=dict(os.environ, APPCTL_PROJECTS=str(raiz),
+                 APPCTL_HOME=str(site / "home")),
+        capture_output=True, text=True)
+    check(r.returncode == 0, "el dry-run falla: " + (r.stdout + r.stderr)[:200])
+    pdir = raiz / "acme"
+    check(not pdir.exists(),
+          "el dry-run creo el directorio del proyecto en disco")
+    check(not (pdir / ".env").exists(),
+          "el dry-run escribio el .env con las credenciales")
+    reg = site / "home" / "registry.json"
+    if reg.exists():
+        reservados = json.loads(reg.read_text()).get("ports") or {}
+        check(not reservados,
+              f"el dry-run reservo puertos en el registry: {reservados}")
+    else:
+        check(True, "el dry-run no creo el registry")
+    # y la prueba de que el dano era real: el dry-run siguiente tiene que
+    # poder correr igual (antes decia "ya existe el proyecto")
+    r2 = subprocess.run(
+        [sys.executable, str(ROOT / "bin/appctl"), "acme", "php", "psql",
+         "sftp", "--dry-run"],
+        env=dict(os.environ, APPCTL_PROJECTS=str(raiz),
+                 APPCTL_HOME=str(site / "home")),
+        capture_output=True, text=True)
+    check("ya existe" not in (r2.stdout + r2.stderr),
+          "un segundo dry-run dice 'ya existe el proyecto': el primero dejo "
+          "residuo")
+    shutil.rmtree(site, ignore_errors=True)
+
     print("todo bien")
     return 0
 

@@ -322,7 +322,15 @@ def cmd_create(args) -> int:
 
         # ---- escribir el proyecto ----------------------------------------
         pdir = build_dir(project)
-        render_project(pdir, stack_dir, stack, project, components, tags,
+        # En dry-run se renderiza en un temporal y no se toca el registry:
+        # el render real dejaba el proyecto creado en disco CON el .env y las
+        # credenciales, y el puerto reservado. El `create` de verdad despues
+        # fallaba con "ya existe el proyecto", y "sin tocar nada" no era
+        # cierto. El temporal se borra al salir.
+        destino = pdir
+        if args.dry_run:
+            destino = Path(tempfile.mkdtemp(prefix="appctl-dry-run-"))
+        render_project(destino, stack_dir, stack, project, components, tags,
                        names, pw, app_port, sftp_port, host=args.host,
                        pg_major=pg_major, api_key=sec.token(24),
                        want_cron="cron" in components,
@@ -330,14 +338,18 @@ def cmd_create(args) -> int:
                        db_memory=args.db_memory or "")
 
         # ---- reservar en el registry -------------------------------------
-        reg.reserve(data, project, app_port, sftp_port or 0)
+        if not args.dry_run:
+            reg.reserve(data, project, app_port, sftp_port or 0)
 
     if args.dry_run:
-        print(f"\n[dry-run] {project} generado en {pdir}, sin levantar")
+        print(f"\n[dry-run] {project}: se crearia en {pdir}")
         print(f"  stack: {stack}")
         print(f"  app:   {args.host}:{app_port}")
         if sftp_port:
             print(f"  sftp:  sftp://{names['SFTP_USER']}@{args.host}:{sftp_port}")
+        print("  no se escribio nada: ni el directorio, ni el .env, "
+              "ni la reserva de puertos")
+        shutil.rmtree(destino, ignore_errors=True)
         return 0
 
     # ---- verificar imagen (NO compilar) ----------------------------------
@@ -2640,9 +2652,25 @@ def main() -> int:
     # pero `psql` y `shell` podrian confundirse con un componente si alguien
     # los escribiera despues del nombre. Se resuelve mirando la posicion:
     # el subcomando va SIEMPRE en argv[2] cuando hay proyecto.
-    VERBS = {"info", "creds", "ps", "logs", "shell", "psql", "restart",
+    # `ps` NO va aca: el subparser no toma proyecto (lista todos los stacks
+    # de una). Estaba en VERBS, asi que `appctl acme ps` se reescribia a
+    # `appctl ps acme` y moria con un "unrecognized arguments: acme" crudo
+    # de argparse. Va en SIN_PROYECTO, que da el mensaje util.
+    VERBS = {"info", "creds", "logs", "shell", "psql", "restart",
              "rotate", "destroy", "upgrade", "limits", "clone", "db",
              "set-host"}
+    # Comandos que EXISTEN pero no toman proyecto. Sin esto, `appctl acme
+    # doctor` cae al default (create), toma "doctor" por un componente y
+    # responde "componentes desconocidos: doctor", que manda a buscar el
+    # problema en el nombre del componente en vez de en el argumento de mas.
+    # Los que aceptan las dos formas y los flags de ayuda NO van aca.
+    SIN_PROYECTO = {
+        "doctor": "appctl doctor",
+        "build": "appctl build",
+        "list": "appctl list",
+        "ps": "appctl ps",
+        "create": "appctl create <proyecto> <componentes...>",
+    }
     # Los verbos van TAMBIEN en GLOBALS: `appctl info acme` (con el verbo
     # primero) tiene que funcionar igual que `appctl acme info`. Si un verbo
     # queda solo en VERBS, `appctl info acme` cae al branch de create y dice
@@ -2660,6 +2688,13 @@ def main() -> int:
             # appctl <proj> <verb> ...  ->  <verb> <proj> ...
             proj, verb, rest = a[0], a[1], a[2:]
             sys.argv = [sys.argv[0], verb, proj, *rest]
+        elif len(a) >= 2 and a[1] in SIN_PROYECTO:
+            # `appctl acme doctor` cae al default (create) y el error decia
+            # "componentes desconocidos: doctor": manda a buscar el problema
+            # donde no esta. El comando existe, lo que sobra es el proyecto.
+            die(f"'{a[1]}' no se usa con un proyecto: es un comando global.\n"
+                f"        correlo sin el nombre del proyecto:\n"
+                f"          {SIN_PROYECTO[a[1]]}")
         else:
             # appctl <proj> <componentes...>  ->  create <proj> <componentes...>
             sys.argv = [sys.argv[0], "create", *a]
