@@ -105,7 +105,7 @@ define con `APPCTL_PROJECTS`, y si no está en el entorno se lee de
 $APPCTL_PROJECTS/<proyecto>/          # uno por cliente
 ├── compose.yaml
 ├── .env                              # 0600
-├── nginx/site.conf
+├── nginx/site.conf                   # NO se carga hoy: ver Endurecimiento
 ├── db/init/                          # scripts de initdb
 ├── db/data/                          # volumen de la base
 ├── sftp/home/upload/                 # el código del cliente
@@ -519,6 +519,85 @@ un cliente necesita una extensión que no compila ahí (GD con librerías del
 sistema, por ejemplo), se cae a bookworm y se acepta el costo.
 
 En Tomcat, los tags con `jre` en el nombre no existen: solo están los `jdk`.
+
+---
+
+## Endurecimiento de PHP y nginx
+
+Los stacks de PHP salen con esto puesto de fábrica. No hay que tocar nada por
+proyecto: va horneado en la imagen.
+
+### Sesión y cookies
+
+| Directiva | Valor | Qué corta |
+|---|---|---|
+| `session.use_strict_mode` | `1` | un id de sesión inventado por el cliente (session fixation) |
+| `session.use_only_cookies` | `1` | que la sesión viaje por la URL |
+| `session.cookie_httponly` | `1` | que JavaScript lea la cookie (robo por XSS) |
+| `session.cookie_secure` | `1` | que la cookie viaje por HTTP sin TLS |
+| `session.cookie_samesite` | `Lax` | el envío de la cookie en pedidos cross-site |
+
+`cookie_secure=1` convive con el TLS terminado en el proxy de adelante: el que
+decide si manda la cookie es el navegador, y ve HTTPS aunque el backend hable
+HTTP.
+
+**Si la app se usa por HTTP plano** (sin nada que termine TLS), esa cookie no
+viaja y el login no queda logueado nunca. Se ve como "la app no guarda la
+sesión", y no es la app. Se arregla por proyecto:
+
+```bash
+echo 'APPCTL_SESSION_COOKIE_SECURE=0' >> $APPCTL_PROJECTS/acme/.env
+appctl acme upgrade --yes
+```
+
+### Wrappers remotos
+
+| Directiva | Valor | Qué corta |
+|---|---|---|
+| `allow_url_fopen` | `Off` | `file_get_contents('http://...')`: la vía clásica de RFI y SSRF |
+| `allow_url_include` | `Off` | que un `include` traiga código de una URL |
+| `cgi.fix_pathinfo` | `0` | que `/upload/foto.jpg/x.php` ejecute el `.jpg` |
+
+Composer, Guzzle y `wp_remote_get` usan la extensión `curl` (está en la
+imagen), no `fopen`: no se rompen. Si igual necesitás `fopen` sobre URLs:
+
+```bash
+echo 'APPCTL_ALLOW_URL_FOPEN=On' >> $APPCTL_PROJECTS/acme/.env
+appctl acme upgrade --yes
+```
+
+### Listado de directorios, y el `.htaccess` que no se lee
+
+**nginx ignora los `.htaccess` por completo.** Las directivas de Apache —el
+`Options -Indexes`, un `Deny from all`, un `RewriteRule`— no se leen en este
+stack. Son archivos que no hacen nada. Si la app depende de un `.htaccess` para
+algo, ese algo no está pasando, y conviene saberlo antes de confiar en él.
+
+El listado de directorios igual está cerrado, porque nginx **no lista por
+defecto** (Apache sí, y por eso necesita `Options -Indexes`). Un pedido a un
+directorio sin `index` responde `403`. El vhost deja el `autoindex off`
+explícito y agrega las cabeceras:
+
+| Directiva | Valor |
+|---|---|
+| `autoindex` | `off` |
+| `X-Content-Type-Options` | `nosniff` |
+| `X-Frame-Options` | `SAMEORIGIN` |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` |
+
+HSTS no va acá: el TLS lo termina el proxy de adelante, y un
+`Strict-Transport-Security` emitido por un backend que habla HTTP no llega al
+navegador. Lo tiene que emitir el proxy.
+
+Los `.htaccess`, los `.env` y todo lo que empieza con punto tampoco se sirven:
+el vhost los niega.
+
+### Dónde vive esta config
+
+El vhost de nginx está **horneado en la imagen** (`image/nginx.conf`). Cambiarlo
+es `appctl build` y después `appctl <proyecto> upgrade`. El `nginx/site.conf`
+que el proyecto tiene en su directorio **hoy no se carga**: nginx no incluye
+`conf.d/`, así que editarlo no tiene efecto. Está anotado como pendiente.
 
 ---
 

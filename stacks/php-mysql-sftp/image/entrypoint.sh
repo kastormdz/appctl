@@ -319,6 +319,41 @@ chown "${SFTP_UID}:${SFTP_GID}" "${WEBROOT}" 2>/dev/null || true
 # raiz), no el modo del directorio.
 chmod 755 "${WEBROOT}" 2>/dev/null || true
 log "listo: app=app sftp=${SFTP_USER} webroot=${WEBROOT}"
+# --- php.ini en runtime ---------------------------------------------------
+# Los defaults de endurecimiento van horneados en la imagen
+# (/usr/local/etc/php/conf.d/zz-appctl.ini). Aca se escribe SOLO un override,
+# para el proyecto que necesita algo distinto del default. Existe porque hay
+# un default que no aplica siempre:
+#
+#   APPCTL_SESSION_COOKIE_SECURE=0
+#       La app se usa por HTTP plano (sin TLS adelante). Con cookie_secure=1
+#       el navegador no manda la cookie de sesion y el login no queda
+#       logueado: se ve como "la app no guarda la sesion".
+#   APPCTL_ALLOW_URL_FOPEN=On
+#       La app hace file_get_contents() de una URL y no se puede pasar a curl.
+#
+# El archivo se ordena DESPUES de zz-appctl.ini (`r` > `a`), que es lo que
+# hace que el override gane.
+RUNTIME_INI=/usr/local/etc/php/conf.d/zz-runtime.ini
+rm -f "${RUNTIME_INI}"
+if [ -n "${APPCTL_SESSION_COOKIE_SECURE:-}" ]; then
+    case "${APPCTL_SESSION_COOKIE_SECURE}" in
+        0|[Oo]ff|false) printf 'session.cookie_secure = 0\n' >> "${RUNTIME_INI}" ;;
+        *)              printf 'session.cookie_secure = 1\n' >> "${RUNTIME_INI}" ;;
+    esac
+fi
+if [ -n "${APPCTL_ALLOW_URL_FOPEN:-}" ]; then
+    case "${APPCTL_ALLOW_URL_FOPEN}" in
+        [Oo]n|1|true) printf 'allow_url_fopen = On\n' >> "${RUNTIME_INI}" ;;
+        *)            printf 'allow_url_fopen = Off\n' >> "${RUNTIME_INI}" ;;
+    esac
+fi
+if [ -s "${RUNTIME_INI}" ]; then
+    log "php.ini runtime: $(tr '\n' ' ' < "${RUNTIME_INI}")"
+else
+    rm -f "${RUNTIME_INI}"
+fi
+
 # si algo de lo anterior fallo, supervisor no debe arrancar: es mejor un
 # exit 1 con el log claro que un restart loop sin diagnostico.
 exec /usr/bin/supervisord -c /etc/supervisord.conf

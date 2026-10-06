@@ -46,6 +46,13 @@ __CRON__
       DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD}
       DB_READONLY_USER: ${DB_READONLY_USER}
       DB_READONLY_PASSWORD: ${DB_READONLY_PASSWORD}
+      # Overrides de endurecimiento de PHP. Vacios = los defaults de la
+      # imagen (session.cookie_secure=1, allow_url_fopen=Off). Se define en el
+      # .env del proyecto; el entrypoint escribe el php.ini de runtime.
+      #   APPCTL_SESSION_COOKIE_SECURE=0   app servida por HTTP plano
+      #   APPCTL_ALLOW_URL_FOPEN=On        app que hace file_get_contents()
+      APPCTL_SESSION_COOKIE_SECURE: ${APPCTL_SESSION_COOKIE_SECURE:-}
+      APPCTL_ALLOW_URL_FOPEN: ${APPCTL_ALLOW_URL_FOPEN:-}
     volumes:
       # chroot del SFTP = webroot. UN solo bind mount para las dos cosas:
       # el cliente sube a /upload (en el host: sftp/home/upload) y nginx+fpm
