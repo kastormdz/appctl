@@ -33,8 +33,8 @@ Un Linux con Docker y Compose v2, y un usuario que pueda hablar con el daemon:
 
 | | |
 |---|---|
-| Docker | 29.8.2 (probado) |
-| Compose | v2.40.3 (probado) |
+| Docker | 29.8.2  |
+| Compose | v2.40.3  |
 | RAM | ~1 GB por cliente (su app y su base) |
 | sudo | sin password, o un wrapper |
 | `ss` | viene con iproute2 |
