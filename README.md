@@ -375,16 +375,55 @@ la base quedó abierta a medio entorno. Para una red, `--cidr` explícito.
 `appctl <p> db unexpose` cierra. Publicar el puerto **no** hace que la base
 deje de estar en su red interna: es una publicación del host, no un permiso.
 
-### Backups
+### Backups, export e import
 
 ```bash
-appctl <p> db dump                 # a un archivo, ambos motores
-appctl <p> db restore <archivo>
+appctl <p> db dump                 # a <p>/backups/, con fecha y sha256
+appctl <p> db dump -o /tmp/x.sql   # a donde le digas
+appctl <p> db list                 # qué backups hay
+appctl <p> db restore <archivo> --yes
+appctl <p> db rm <archivo> --yes   # borrar uno (no se puede deshacer)
 ```
 
-En Postgres el dump va con `--no-owner --no-acl` y **sin `--clean`**: un
-`--clean --if-exists` genera `DROP ROLE` del origen y el restore muere con
-`FATAL: role "x" does not exist` cuando se restaura en un clon.
+El dump sale **del contenedor**: no hace falta `psql` en el host, y la base no
+necesita ser accesible. Un archivo por dump, con la fecha en el nombre, un
+`.json` al lado con el motor y el sha256, y `restore` avisa **qué se va a pisar**
+y dónde quedó el estado anterior.
+
+**`restore` pisa la base.** Sacá un `dump` antes. En Postgres el dump va con
+`--no-owner --no-acl` y **sin `--clean`**: un `--clean --if-exists` genera
+`DROP ROLE` del origen y el restore de un clon muere con
+`FATAL: role "x" does not exist`.
+
+Los backups van a `<proyecto>/backups/`, que no se commitea: `.env` y `*.sql`
+están en `.gitignore`. Un dump tiene datos de clientes.
+
+### La base no se abre sola
+
+```bash
+appctl <p> db expose 5432                     # solo desde 127.0.0.1
+appctl <p> db expose 5432 --cidr 10.20.0.0/16  # abrir a una red
+appctl <p> db unexpose                        # cerrarla
+```
+
+El default es `127.0.0.1`, no una red. Con un `/8` cualquiera, cualquier LAN que
+llegue al puerto entra, y quien llama al comando no tiene por qué saber que la
+base quedó abierta a medio entorno.
+
+### Usuarios de la base
+
+```bash
+appctl <p> db users                   # qué hay y con qué permisos
+appctl <p> db grant <usuario> --rol readonly|write|migrate
+appctl <p> db revoke <usuario>
+```
+
+`grant` crea el usuario con password propia. En MariaDB el usuario de migración
+necesita `WITH GRANT OPTION` sobre la base **y** `CREATE USER` global — MariaDB
+rechaza `GRANT OPTION ON db.*` con 1064 porque no es un privilegio, es una
+opción de `GRANT`. El alcance global no molesta acá porque cada base está en su
+red y no comparte nada con otros clientes; el aislamiento lo da la red. En un
+MySQL con varias bases en el mismo servidor, sí.
 
 ### Un usuario nuevo
 

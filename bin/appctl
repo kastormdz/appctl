@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -68,10 +69,38 @@ def _proyectos_dir() -> Path:
 PROJECTS_DIR = _proyectos_dir()
 APPCTL_HOME = Path(os.environ.get("APPCTL_HOME", str(PROJECTS_DIR / ".appctl")))
 STACKS_DIR = Path(__file__).resolve().parent.parent / "stacks"
-# El host NO tiene default: cada instalacion define APPCTL_HOST. Hardcodear
-# el dominio de una despliegue daba un help que moria en otro lado, y en un
-# repo publico publicaba la topologia del que lo instala.
-DEFAULT_HOST = os.environ.get("APPCTL_HOST", "localhost")
+def _default_host() -> str:
+    """El host que aparece en el resumen y en la URL.
+
+    Orden: APPCTL_HOST del entorno, APPCTL_HOST de /etc/default/appctl, y si
+    no hay ninguno, el nombre de la maquina.
+
+    El fallback NO es 'localhost'. Con 'localhost' el resumen de create le
+    dice al developer 'App: http://localhost:8001', que en su maquina no
+    abre nada, y el error aparece cuando el cliente prueba y no entra. El
+    nombre de la maquina es lo que resuelve igual desde afuera, si hay DNS.
+
+    Hardcodear un dominio de una despliegue en el repo publico publicaba la
+    topologia del que lo instala, por eso se resuelve en runtime.
+    """
+    v = os.environ.get("APPCTL_HOST")
+    if v:
+        return v
+    conf = Path("/etc/default/appctl")
+    if conf.is_file():
+        try:
+            for linea in conf.read_text().split("\n"):
+                linea = linea.strip()
+                if linea.startswith("APPCTL_HOST="):
+                    return linea.split("=", 1)[1].strip().strip("'\"")
+        except OSError:
+            pass
+    # el nombre de la maquina: FQDN si el dominio resuelve, si no el host
+    fqdn = socket.getfqdn()
+    return fqdn if "." in fqdn else socket.gethostname()
+
+
+DEFAULT_HOST = _default_host()
 
 RUNTIMES = {"php", "nextjs", "tomcat"}
 DATABASES = {"psql", "mysql"}
@@ -1451,9 +1480,49 @@ def cmd_upgrade(args) -> int:
     return 0
 
 
+def _host_guardado(proyecto: str, st: dict) -> str:
+    """El host del proyecto, con aviso si quedo en un valor que no sirve.
+
+    El host se guarda en state.json al crear. Si en ese momento APPCTL_HOST no
+    estaba definido, queda 'localhost' congelado: cambiar la variable despues
+    no lo cambia, y el resumen sigue diciendole al developer
+    'http://localhost:8001', que en su maquina no abre nada.
+
+    Por eso se avisa en vez de usar el valor a ciegas.
+    """
+    host = st.get("host") or DEFAULT_HOST
+    if host in ("localhost", "127.0.0.1", "0.0.0.0"):
+        print(f"aviso: el host guardado en este proyecto es '{host}'.", file=sys.stderr)
+        print(f"       el resumen le va a decir al developer una URL que no le\n"
+              f"       abre. Corregilo con:\n"
+              f"         appctl {proyecto} set-host <nombre-del-servidor>", file=sys.stderr)
+    return host
+
+
+def cmd_set_host(args) -> int:
+    """Cambia el host que aparece en el resumen del proyecto.
+
+    El host se congela en state.json cuando se crea. Sirve para cuando se creo
+    sin APPCTL_HOST definido y quedo 'localhost': el developer recibe una URL
+    que no le abre y no sabe por que.
+    """
+    st = load_state(args.proyecto)
+    nuevo = args.host.strip()
+    if not nuevo or "/" in nuevo or ":" in nuevo:
+        die(f"'{nuevo}' no es un nombre de host.\n"
+            "        solo el nombre: sin http://, sin puerto, sin ruta.")
+    st["host"] = nuevo
+    f = build_dir(args.proyecto) / "state.json"
+    f.write_text(json.dumps(st, indent=2) + "\n")
+    print(f"  host de {args.proyecto}: {st.get('host', '?')} -> {nuevo}")
+    print(f"  el resumen ahora dice:  http://{nuevo}:{st['app_port']}")
+    return 0
+
+
 def cmd_info(args) -> int:
     st = load_state(args.proyecto)
     env = load_env(args.proyecto)
+    _host_guardado(args.proyecto, st)
     r = sh("docker compose ps --format '{{.Service}}\t{{.State}}\t{{.Health}}'",
            cwd=build_dir(args.proyecto))
     print(render_info(st, env, r.stdout))
@@ -1463,7 +1532,7 @@ def cmd_info(args) -> int:
 def cmd_creds(args) -> int:
     env = load_env(args.proyecto)
     st = load_state(args.proyecto)
-    print(render_create(st["project"], st["stack"], st["host"],
+    print(render_create(st["project"], st["stack"], _host_guardado(args.proyecto, st),
                         st["app_port"], st["sftp_port"],
                         {k: env[k] for k in
                          ("DB_NAME", "DB_USER", "DB_MIGRATION_USER",
@@ -2446,6 +2515,12 @@ def main() -> int:
     p.add_argument("proyecto")
     p.set_defaults(func=cmd_creds)
 
+    p = sub.add_parser("set-host",
+                       help="cambiar el host del resumen (se congela al crear)")
+    p.add_argument("proyecto")
+    p.add_argument("host", help="solo el nombre, sin http:// ni puerto")
+    p.set_defaults(func=cmd_set_host)
+
     p = sub.add_parser("logs", help="logs de un proyecto")
     p.add_argument("proyecto")
     p.add_argument("-f", "--follow", action="store_true")
@@ -2566,7 +2641,8 @@ def main() -> int:
     # los escribiera despues del nombre. Se resuelve mirando la posicion:
     # el subcomando va SIEMPRE en argv[2] cuando hay proyecto.
     VERBS = {"info", "creds", "ps", "logs", "shell", "psql", "restart",
-             "rotate", "destroy", "upgrade", "limits", "clone", "db"}
+             "rotate", "destroy", "upgrade", "limits", "clone", "db",
+             "set-host"}
     # Los verbos van TAMBIEN en GLOBALS: `appctl info acme` (con el verbo
     # primero) tiene que funcionar igual que `appctl acme info`. Si un verbo
     # queda solo en VERBS, `appctl info acme` cae al branch de create y dice
@@ -2575,7 +2651,8 @@ def main() -> int:
     GLOBALS = {"create", "list", "ps", "doctor", "build", "help", "-h",
                "--help", "--version", "-V",
                "info", "creds", "logs", "shell", "psql", "restart",
-               "rotate", "destroy", "upgrade", "limits", "clone", "db"}
+               "rotate", "destroy", "upgrade", "limits", "clone", "db",
+               "set-host"}
 
     a = sys.argv[1:]
     if a[0] not in GLOBALS:

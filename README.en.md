@@ -372,16 +372,56 @@ explicit.
 `appctl <p> db unexpose` closes it. Publishing the port doesn't take the database
 off its internal network: that's a host publication, not a permission.
 
-### Backups
+### Backups, export and import
 
 ```bash
-appctl <p> db dump                 # to a file, both engines
-appctl <p> db restore <file>
+appctl <p> db dump                 # to <p>/backups/, dated, with a sha256
+appctl <p> db dump -o /tmp/x.sql   # anywhere you like
+appctl <p> db list                 # which backups exist
+appctl <p> db restore <file> --yes
+appctl <p> db rm <file> --yes     # delete one (no undo)
 ```
 
-On Postgres the dump carries `--no-owner --no-acl` and **no `--clean`**: a
-`--clean --if-exists` emits `DROP ROLE` for the source role, and restoring that
-into a clone dies with `FATAL: role "x" does not exist`.
+The dump comes **from the container**: you don't need `psql` on the host, and
+the database doesn't need to be reachable. One file per dump, the date in the
+name, a `.json` next to it with the engine and the sha256, and `restore` tells
+you **what it's about to overwrite** and where the previous state went.
+
+**`restore` overwrites the database.** Take a `dump` first. On Postgres the dump
+carries `--no-owner --no-acl` and **no `--clean`**: a `--clean --if-exists` emits
+`DROP ROLE` for the source role, and restoring that into a clone dies with
+`FATAL: role "x" does not exist`.
+
+Backups live in `<project>/backups/`, which isn't committed: `.env` and `*.sql`
+are in `.gitignore`. A dump contains client data.
+
+### The database doesn't open itself
+
+```bash
+appctl <p> db expose 5432                     # only from 127.0.0.1
+appctl <p> db expose 5432 --cidr 10.20.0.0/16  # open to a network
+appctl <p> db unexpose                        # close it
+```
+
+The default is `127.0.0.1`, not a network. With just any `/8`, every LAN that
+can reach the port gets in, and whoever ran the command has no way to know the
+database ended up open to half the environment.
+
+### Database users
+
+```bash
+appctl <p> db users                   # what exists and with what permissions
+appctl <p> db grant <user> --rol readonly|write|migrate
+appctl <p> db revoke <user>
+```
+
+`grant` creates the user with its own password. In MariaDB the migration user
+needs `WITH GRANT OPTION` on the database **and** global `CREATE USER` — MariaDB
+rejects `GRANT OPTION ON db.*` with 1064 because it isn't a privilege: it's an
+option of `GRANT`. The global scope is harmless here because every database is on
+its own network and shares nothing with other clients, and the network is what
+provides the isolation. On a MySQL with several databases on one server, it
+isn't.
 
 ### Granting a user
 
