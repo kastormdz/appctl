@@ -87,7 +87,11 @@ def main_una(nombre):
     # ---- 1. los stacks que el README nombra ----
     print("=== stacks ===")
     reales = sorted(d.name for d in (RAIZ / "stacks").iterdir() if d.is_dir())
-    dichos = set(re.findall(r"`([a-z]+-(?:postgres|mysql)-(?:sftp|cron))`", t))
+    # El nombre del stack puede tener mas de un runtime adentro
+    # (nextjs-python-postgres-sftp): el patron acepta segmentos de mas, o el
+    # stack de dos runtimes pasaba sin que nadie verificara que existe.
+    dichos = set(re.findall(
+        r"`([a-z]+(?:-[a-z]+)*-(?:postgres|mysql)-(?:sftp|cron))`", t))
     for s in sorted(dichos):
         check("el stack {0} existe".format(s), s in reales,
               "el README lo nombra y stacks/ no lo tiene")

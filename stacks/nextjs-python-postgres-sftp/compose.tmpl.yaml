@@ -1,4 +1,4 @@
-# Generado por appctl desde stacks/php-postgres-sftp/compose.tmpl.yaml
+# Generado por appctl desde stacks/nextjs-python-postgres-sftp/compose.tmpl.yaml
 # NO EDITAR A MANO: los cambios se pierden en el proximo
 # `appctl <proyecto> upgrade`, que lo re-renderiza desde este template.
 #
@@ -10,14 +10,16 @@ name: appctl-__PROYECTO__
 services:
 
   # ---------------------------------------------------------------- app ----
-  # tomcat + sshd en un mismo contenedor, sin nginx: el TLS y el routing
-  # los hace el HAProxy de afuera. El cliente sube su .war por SFTP.
+  # nginx + Next.js + uvicorn + sshd en un mismo contenedor. DOS runtimes
+  # detras del MISMO nginx y del MISMO puerto:
+  #
+  #   /api/  -> 127.0.0.1:8000   (uvicorn + FastAPI)
+  #   resto  -> 127.0.0.1:3000   (Next standalone)
+  #
+  # Por que juntos y no dos contenedores: el cliente tiene UN proyecto, UN
+  # puerto y UN SFTP. Dos contenedores serian dos puertos que abrir, dos
+  # chroots que mantener y el codigo repartido en dos uploads.
   app:
-    # SIN build:. La imagen se construye UNA vez con `appctl build` y la
-    # comparten todos los proyectos del mismo PHP. Un `build:` aca hace que
-    # cada cliente nuevo compile la imagen entera, que es lo que NO quiero.
-    # Si la imagen no existe, appctl create lo dice y te dice que corras
-    # `appctl build` (no compila solo: fallar a medias es peor).
     image: __APP_IMAGE__
     # La imagen es local (la construye `appctl build` y la comparten todos
     # los proyectos). Sin esto, compose la intenta PULL de un registry que
@@ -37,6 +39,25 @@ services:
     environment:
       PROJECT: __PROYECTO__
 __CRON__
+      # pnpm install y pip install necesitan la red en RUNTIME, no solo en
+      # el build: el cliente sube su codigo y las deps de los DOS runtimes
+      # se instalan en el arranque. El proxy hace falta para que salgan a
+      # internet (el registro de npm y pypi no se alcanzan sin el aca).
+      HTTP_PROXY: "${HTTP_PROXY:-}"
+      HTTPS_PROXY: "${HTTPS_PROXY:-}"
+      http_proxy: "${HTTP_PROXY:-}"
+      https_proxy: "${HTTPS_PROXY:-}"
+      # PERO el healthcheck usa `curl`, que respeta el proxy: sin esto,
+      # curl -qfsS http://127.0.0.1/healthz se lo mandaba AL PROXY de
+      # corporativo en vez de al stub local, y el proxy respondia 403. El
+      # contenedor quedaba unhealthy para siempre con node sano y nginx
+      # proxyando bien: tres horas de diagnostico para descubrir que el
+      # culpable era una variable de entorno que yo mismo puse.
+      NO_PROXY: "localhost,127.0.0.1,::1,db,${PROJECT:-}"
+      no_proxy: "localhost,127.0.0.1,::1,db,${PROJECT:-}"
+      # Puerto de uvicorn DENTRO del contenedor. Lo lee python-launch.sh.
+      # Vive en 127.0.0.1: no se publica al host, sale por nginx en /api.
+      PY_PORT: "8000"
       SFTP_USER: ${SFTP_USER}
       SFTP_PASSWORD: ${SFTP_PASSWORD}
       SFTP_UID: ${SFTP_UID:-1001}
@@ -57,16 +78,23 @@ __CRON__
       # que sincronizar. El chroot debe ser el mismo path que ve
       # ChrootDirectory y root:root 755, o sshd cierra la conexion.
       - ./sftp/home:/srv/sftp
-      # El .war del cliente va a /srv/build, NO a webapps.
-      #
-      # Montar ./build directamente sobre webapps TAPA el directorio de la
-      # imagen, que trae manager, host-manager y docs adentro. Por eso
-      # /manager/html daba 404: no era que faltara el usuario (el
-      # tomcat-users.xml estaba bien), era que el webapp ya no existia.
-      # El entrypoint copia de /srv/build a webapps: el cliente escribe en
-      # un lado, Tomcat sirve el otro.
-      - ./build:/srv/build
+      # /app es donde CORREN los dos runtimes: el entrypoint copia el
+      # codigo del webroot (/srv/sftp/upload) ahi y buildea/instala si hace
+      # falta.
+      #   /app/           -> Next standalone (server.js)
+      #   /app/backend/   -> la API Python (main.py + requirements.txt)
+      - ./build:/app
       # vhost montado, no baked: se edita sin rebuild
+      # SIN site.conf montado. El nginx.conf de la imagen YA hace el proxy a
+    # 127.0.0.1:3000, y montar un conf.d/default.conf encima lo pisa: el
+    # que llegaba era el de PHP (root /var/www/html, index index.php,
+    # try_files =404) y node no recibia NADA. /healthz daba 403, el
+    # healthcheck fallaba y el contenedor quedaba unhealthy para siempre
+    # con el stub escuchando en 3000 y el log mostrando un 200 de otra ruta.
+    #
+    # Node no necesita un server block propio: su conf ya tiene el proxy,
+    # el gzip y los websocket. Un conf.d aparte solo agrega un segundo
+    # server peleando por el :80.
       # host keys del host: si no, cada recreate cambia la huella SSH y el
       # cliente ve un host distinto cada vez
       - /etc/ssh/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro
@@ -74,18 +102,21 @@ __CRON__
       - /etc/ssh/ssh_host_ecdsa_key:/etc/ssh/ssh_host_ecdsa_key:ro
       # logs al stdout del contenedor (docker logs), no a un archivo
       - type: tmpfs
+        target: /var/log/nginx
+      - type: tmpfs
         target: /run
     ports:
-      # Tomcat directo, sin nginx: el puerto del proyecto mapea al 8080
-      # de catalina. El TLS lo hace el HAProxy de afuera.
-      # el unico puerto web del proyecto
-      - "__APP_PORT__:8080"
+      # el unico puerto web del proyecto (Next y la API salen por aca)
+      - "__APP_PORT__:80"
       # sftp del proyecto
       - "__SFTP_PORT__:22"
     networks:
       - egress
       - data
     deploy:
+      # Este stack corre DOS runtimes (node + python) bajo el mismo techo:
+      # si la API es pesada, subir con APP_MEMORY en el .env del proyecto.
+      #
       # Limite = TECHO, no reserva. Docker no commitmenta la memoria: el
       # kernel solo toma lo que el proceso pide. Medido con 4 stacks reales:
       # php 38 MB, next 36 MB, tomcat 102 MB, postgres 29 MB en reposo.
@@ -105,13 +136,18 @@ __CRON__
       resources:
         limits:
           cpus: "${APP_CPUS:-1.0}"
-          memory: ${APP_MEMORY:-1024M}
+          memory: ${APP_MEMORY:-512M}
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/healthz || exit 1"]
+      # LOS DOS runtimes: si uvicorn no arranca (requirements.txt roto,
+      # main.py con un error de sintaxis), un healthcheck que solo mira
+      # Next deja el contenedor en verde con la API caida.
+      # El cliente tiene que responder GET /healthz (Next) y GET /healthz
+      # en su API (que llega como /api/healthz). El stub ya hace las dos.
+      test: ["CMD-SHELL", "curl -qfsS http://127.0.0.1/healthz >/dev/null && curl -qfsS http://127.0.0.1/api/healthz >/dev/null || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 90s
+      start_period: 45s
     security_opt:
       - no-new-privileges:true
     # root por defecto: el entrypoint necesita crear el chroot con
@@ -188,7 +224,8 @@ __DB_PUBLISH__
       start_period: 30s
 networks:
   # con salida a internet: la app llama a una pasarela de pagos, a un SMTP,
-  # a la API de un whatsapp. Sin esto, el cliente no puede cobrar.
+  # a la API de un whatsapp. Sin esto, el cliente no puede cobrar. Y sin
+  # esto, `pip install -r requirements.txt` no baja nada de pypi.
   egress:
     driver: bridge
   # SIN GATEWAY. La guarantee de que la DB no se ve desde afuera, hecha con

@@ -147,17 +147,78 @@ def test_init(nombre, rel, debe_aparecer):
         check("no usa 'GRANT OPTION' (no existe como privilegio)", not malos,
               malos[:2])
 
+def test_compose_env_db():
+    """El servicio db recibe las variables que su init necesita.
+
+    El init corre UNA vez y con `set -u`: si el compose no le pasa DB_USER,
+    el script muere en la primera linea que la usa y la base queda sin los
+    usuarios del proyecto. El create lo reporta como 'faltan 3 de 3', que
+    describe el sintoma y no la causa.
+
+    Leer el init no lo delata: el script esta bien. El bug esta en el
+    COMPOSE, que no le pasa la variable al contenedor. Por eso el test
+    cruza las dos cosas: lo que el init USA contra lo que el db RECIBE.
+    Los stacks de nextjs y tomcat tenian exactamente este bug (heredado de
+    la copia del de PHP, a la que despues se le agrego el env).
+    """
+    print("=== el compose le pasa al db lo que el init usa ===")
+    # variables que ya define el motor o el propio contenedor, no el compose
+    propias = {"POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "PGDATA",
+               "MARIADB_DATABASE", "MARIADB_USER", "MARIADB_PASSWORD",
+               "MARIADB_ROOT_PASSWORD", "PATH", "HOME", "PGPASSWORD",
+               "MYSQL_PWD", "TZ", "PGPORT", "PGHOST", "PGUSER"}
+    for stack in sorted(p.name for p in STACKS.iterdir() if p.is_dir()):
+        inits = list((STACKS / stack / "init").glob("*.sh"))
+        tmpl_f = STACKS / stack / "compose.tmpl.yaml"
+        if not inits or not tmpl_f.is_file():
+            continue
+        tmpl = tmpl_f.read_text()
+        m = re.search(r"^  db:\n(.*?)(?=^  \S|^[a-z_]+:|\Z)", tmpl, re.S | re.M)
+        if not m:
+            check("{0}: el compose tiene un servicio db".format(stack), False,
+                  "no encontre el bloque db: en {0}".format(tmpl_f))
+            continue
+        env_keys = set(re.findall(r"^      ([A-Z][A-Z0-9_]*):", m.group(1), re.M))
+        usadas, definidas = set(), set()
+        for f in inits:
+            t = f.read_text()
+            # los comentarios del init NOMBRAN variables: no son uso
+            t = "\n".join(l for l in t.splitlines()
+                          if not l.strip().startswith("#"))
+            usadas |= set(re.findall(r"\$\{?([A-Z][A-Z0-9_]*)\}?", t))
+            # lo que el script se define solo (HBA=, CONF=, DATA=$(...)) no
+            # tiene por que venir del compose
+            definidas |= set(re.findall(r"(?:^|\s)([A-Z][A-Z0-9_]*)=", t))
+        faltan = sorted(usadas - definidas - env_keys - propias)
+        check("{0}: el db recibe {1} variables de su init".format(
+                  stack, len(usadas & env_keys)),
+              not faltan,
+              "el init las usa y el servicio db no las recibe: {0}. "
+              "el init muere con '...: unbound variable' y la base queda sin "
+              "los roles del proyecto.".format(faltan))
+
+
 def main():
     print("Tests de los init: el SQL que producen tiene que ser valido")
     print("(un init que falla deja la base sin usuarios y no se reintenta)")
     print()
-    test_init("mysql", "stacks/php-mysql-sftp/init/10-users.sh",
-              ["CREATE USER IF NOT EXISTS", "GRANT", "FLUSH PRIVILEGES"])
+    # TODOS los stacks, no solo el de PHP: los de nextjs y tomcat tenian una
+    # COPIA VIEJA del init de postgres (sin la validacion de variables ni el
+    # format()/%I) y creaban 1 de los 3 roles. Una lista escrita a mano no ve
+    # la copia que se quedo atras; esto itera el disco.
+    for stack in sorted(p.name for p in STACKS.iterdir() if p.is_dir()):
+        for f in sorted((STACKS / stack / "init").glob("*.sh")):
+            rel = "stacks/{0}/init/{1}".format(stack, f.name)
+            if "mysql" in stack:
+                test_init(stack, rel, ["CREATE USER IF NOT EXISTS", "GRANT",
+                                       "FLUSH PRIVILEGES"])
+            else:
+                # postgres arma el SQL con format() y lo ejecuta con \gexec:
+                # no hay CREATE ROLE literal.
+                test_init(stack, rel, ["CREATE ROLE %I", "GRANT", "pg_hba"])
+            print()
     print()
-    # postgres arma el SQL con format() y lo ejecuta con \gexec: no hay
-    # CREATE ROLE literal.
-    test_init("postgres", "stacks/php-postgres-sftp/init/10-roles.sh",
-              ["CREATE ROLE %I", "GRANT", "pg_hba"])
+    test_compose_env_db()
     print()
     if FALLOS:
         print("{0} fallo(s): {1}".format(len(FALLOS), ", ".join(FALLOS)))

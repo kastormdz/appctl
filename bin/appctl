@@ -5,7 +5,8 @@
     appctl list                            ver todos
     appctl <proyecto> <subcomando>         ver un proyecto
 
-Componentes: php | nextjs | tomcat | psql | mysql | sftp | cron
+Componentes: php | nextjs | tomcat | python | psql | mysql | sftp | cron
+  (python es un complemento de nextjs: api FastAPI al lado de Next)
 Solo stdlib. Corre en el host, al lado de Docker.
 """
 import argparse
@@ -105,7 +106,13 @@ DEFAULT_HOST = _default_host()
 RUNTIMES = {"php", "nextjs", "tomcat"}
 DATABASES = {"psql", "mysql"}
 SERVICES = {"psql", "mysql", "sftp"}
-ALL_COMPONENTS = RUNTIMES | DATABASES | {"sftp", "cron"}
+# `python` no es un runtime suelto (no hay stack python-postgres-sftp): es
+# el complemento que le agrega una API FastAPI a un stack de Next. Por eso
+# no entra en RUNTIMES — si entrara, `appctl p python psql sftp` pasaria la
+# validacion de "hay un runtime" y moriria mas adelante con un stack
+# inexistente.
+COMPLEMENTOS = {"python"}
+ALL_COMPONENTS = RUNTIMES | DATABASES | {"sftp", "cron"} | COMPLEMENTOS
 
 # Tags resueltos contra Docker Hub en `create` y escritos FIJOS en el compose.
 # Ver README: un contenedor corriendo no se actualiza solo.
@@ -160,8 +167,13 @@ def stack_name(components: set[str]) -> str:
     como bandera: `want_cron` se pasa aparte al render.
     """
     runtime = next((r for r in ("php", "nextjs", "tomcat") if r in components), None)
+    # `python` va pegado al runtime (nextjs-python-postgres-sftp): el nombre
+    # tiene que decir que imagen se construye, y la de este stack trae node
+    # Y python. No se duplica cada directorio de stack: 5 stacks cubren
+    # todas las combinaciones que existen hoy.
+    extra = [c for c in COMPLEMENTOS if c in components]
     db = "postgres" if "psql" in components else ("mysql" if "mysql" in components else None)
-    parts = [runtime]
+    parts = [runtime, *sorted(extra)]
     if db:
         parts.append(db)
     if "sftp" in components:
@@ -185,6 +197,15 @@ def validate_components(components: set[str]) -> None:
         # SFTP. Sin sftp el cliente no tiene por donde subirlo.
         die("cron necesita sftp: el cliente sube el crontab a "
             "/upload/cron/crontab por SFTP")
+    if "python" in components and "nextjs" not in components:
+        die("python es el complemento de nextjs, no un runtime suelto.\n"
+            "  El stack es nextjs-python-postgres-sftp: la API corre al lado\n"
+            "  de Next, detras del mismo nginx y el mismo puerto.\n"
+            "  usalo asi:  appctl <proyecto> nextjs python psql sftp")
+    if "python" in components and "sftp" not in components:
+        die("python necesita sftp: el cliente sube backend/main.py y\n"
+            "  backend/requirements.txt por SFTP, a la misma carpeta que ve\n"
+            "  como /upload.")
 
 
 def php_version_ok(tag: str) -> bool:
@@ -401,7 +422,7 @@ def cmd_create(args) -> int:
     print("[2/3] verificando...")
     is_mysql = "mysql" in components
     cfg = {
-        "project": project, "app_port": app_port,
+        "project": project, "stack": stack, "app_port": app_port,
         "sftp_port": sftp_port, "sftp_user": names["SFTP_USER"],
         "sftp_password": pw["SFTP_PASSWORD"],
         "db_kind": "mysql" if is_mysql else "postgres",
@@ -652,6 +673,9 @@ RUNTIME_IMAGES = {
     "php-postgres-sftp":    ("appctl/php-pg",    "php"),
     "php-mysql-sftp":       ("appctl/php-mysql", "php"),
     "nextjs-postgres-sftp": ("appctl/node-nginx-sftp", "nextjs"),
+    # node Y python en la misma imagen: el stack levanta los dos runtimes
+    # detras del mismo nginx (Next en :3000, uvicorn en :8000).
+    "nextjs-python-postgres-sftp": ("appctl/node-python-sftp", "nextjs"),
     "tomcat-postgres-sftp": ("appctl/tomcat-sftp",     "tomcat"),
 }
 
@@ -2539,6 +2563,7 @@ def main() -> int:
               php      PHP-FPM + nginx + sshd (5 servicios juntos)
               nextjs   Node 22 + Next.js
               tomcat   Tomcat 11 + nginx (4 servicios: nginx aparte)
+              python   API FastAPI + uvicorn al lado de Next (complemento)
               psql     PostgreSQL
               mysql    MariaDB / MySQL
               sftp     SFTP con chroot
@@ -2548,6 +2573,7 @@ def main() -> int:
               appctl acme php psql sftp
               appctl acme php psql sftp --app-port 3001
               appctl acme php mysql
+              appctl acme nextjs python psql sftp
               appctl acme list
               appctl acme rotate sftp
               appctl acme destroy
@@ -2558,7 +2584,7 @@ def main() -> int:
     c = sub.add_parser("create", help="crear un proyecto")
     c.add_argument("proyecto")
     c.add_argument("componentes", nargs="+", metavar="COMPONENT",
-                   help="php nextjs tomcat psql mysql sftp cron")
+                   help="php nextjs tomcat python psql mysql sftp cron")
     c.add_argument("--app-port", type=int)
     c.add_argument("--sftp-port", type=int)
     c.add_argument("--php", help="fijar version, ej: 8.3")
@@ -2625,8 +2651,9 @@ def main() -> int:
     p.add_argument("--php", metavar="VER",
                    help="migrar a otra version de PHP (8.3, 8.4, 8.5...)")
     p.add_argument("--runtime", metavar="RUNTIME",
-                   choices=["php", "nextjs", "tomcat"],
-                   help="cambiar de runtime (php <-> nextjs <-> tomcat)")
+                   choices=["php", "nextjs", "nextjs-python", "tomcat"],
+                   help="cambiar de runtime (php <-> nextjs <-> tomcat; "
+                        "nextjs-python agrega la API FastAPI)")
     p.set_defaults(func=cmd_upgrade)
 
     p = sub.add_parser("info", help="detalle de un proyecto")
@@ -2672,8 +2699,9 @@ def main() -> int:
 
     b = sub.add_parser("build", help="construir las imagenes base (una vez)")
     b.add_argument("--runtime",
-                   choices=["php", "mysql", "nextjs", "tomcat"],
-                   help="php+mysql = stack MariaDB; el resto, postgres")
+                   choices=["php", "mysql", "nextjs", "nextjs-python", "tomcat"],
+                   help="php+mysql = stack MariaDB; nextjs-python = Next + "
+                        "API FastAPI; el resto, postgres")
     b.add_argument("--stack", default=None)
     b.add_argument("--php", default=None)
     b.add_argument("--force", action="store_true",

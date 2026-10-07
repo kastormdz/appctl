@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
-"""Chroot minimalista del SFTP: gate.
+"""Chroot minimalista del SFTP: gate de TODOS los stacks.
 
-QUE VERIFICA: en los ARCHIVOS de los stacks PHP (entrypoint, sshd_config)
-que el chroot que ve el cliente trae solo /upload y /private, nada mas:
-ni andamiaje de binarios, ni /dev (medido: internal-sftp en proceso anda
-sin /dev/null), ni /tmp (no se crea mas; en proyectos viejos se quita solo
-si esta vacio, con rmdir).
+QUE VERIFICA: en los ARCHIVOS de cada stack (entrypoint, sshd_config) que el
+chroot que ve el cliente trae solo /upload y /private, nada mas: ni
+andamiaje de binarios, ni /dev (medido: internal-sftp en proceso anda sin
+/dev/null), ni /tmp (no se crea mas; en proyectos viejos se quita solo si
+esta vacio, con rmdir).
+
+Por que cubre TODOS los stacks y no solo los PHP: el andamiaje se saco
+primero de los PHP y las copias se quedaron atras. El stack de Next y el de
+Tomcat seguian copiando sftp-server, libs, shells y device nodes, con el
+cliente viendo bin/dev/etc/lib/proc/usr al entrar por SFTP. Un gate que
+mira un solo runtime no ve el drift entre runtimes: este itera los stacks
+del disco, no una lista escrita a mano.
 
 QUE NO VERIFICA: el listado real por SFTP ni que el login siga andando
 despues del cambio. Eso se prueba con login SFTP contra un contenedor
 efimero, como manda la regla: lo que pasa adentro del contenedor no lo
 prueba un grep.
-
-Por que existe: el SFTP corre con ForceCommand internal-sftp, EN el
-proceso de sshd, asi que jamas necesito binarios en el chroot. Pero el
-entrypoint copiaba sftp-server + loader + .so + shells + /etc/passwd de la
-epoca del subsystem externo, y el cliente veia bin/, dev/, etc/, lib/,
-proc/ y usr/ al entrar. Se saco el andamiaje y el entrypoint limpia esos
-directorios en proyectos viejos (lista explicita, nunca comodines).
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PHP_STACKS = ("php-postgres-sftp", "php-mysql-sftp")
-# Andamiaje que no puede existir mas en el chroot: ni creado ni limpiado
-# con comodines. upload/private son del cliente y no se tocan jamas.
-ANDAMIAJE = ("bin", "usr", "lib", "etc", "proc", "dev")
+
+# Andamiaje que no puede existir mas en el chroot: ni creado ni limpiado con
+# comodines. upload/private son del cliente y no se tocan jamas. tmp no se
+# crea; lib64 solo lo tiene el stack Debian (tomcat), y se acepta.
+ANDAMIAJE = {"bin", "usr", "lib", "lib64", "etc", "proc", "dev"}
+CLIENTE = {"upload", "private", "tmp"}
 
 
 def check(cond: bool, msg: str) -> None:
@@ -37,82 +40,113 @@ def check(cond: bool, msg: str) -> None:
     print(f"  PASS  {msg}")
 
 
+def stacks_con_sftp() -> list[str]:
+    """Todo stack que tenga entrypoint: si tiene SFTP, ahi esta el chroot."""
+    out = []
+    for d in sorted((ROOT / "stacks").iterdir()):
+        if d.is_dir() and (d / "image" / "entrypoint.sh").is_file():
+            out.append(d.name)
+    if not out:
+        raise AssertionError("no encontre ningun stack con entrypoint")
+    return out
+
+
 def main() -> int:
-    print("Chroot minimalista del SFTP")
-    entrypoints: dict[str, str] = {}
-    sshd: dict[str, str] = {}
-    for stack in PHP_STACKS:
-        base = ROOT / "stacks" / stack
-        entrypoints[stack] = (base / "image" / "entrypoint.sh").read_text()
-        sshd[stack] = (base / "image" / "sshd_config").read_text()
+    print("Chroot minimalista del SFTP (todos los stacks)")
+    stacks = stacks_con_sftp()
+    print(f"  stacks: {', '.join(stacks)}\n")
+    entrypoints = {s: (ROOT / "stacks" / s / "image" / "entrypoint.sh").read_text()
+                   for s in stacks}
+    sshd = {}
+    for s in stacks:
+        f = ROOT / "stacks" / s / "image" / "sshd_config"
+        sshd[s] = f.read_text() if f.is_file() else ""
 
     # ---- 1. subsystem en proceso, nada externo ----
-    print("\n=== sshd_config: SFTP en proceso ===")
-    for stack in PHP_STACKS:
-        conf = sshd[stack]
-        check("Subsystem sftp internal-sftp" in conf,
-              f"{stack}: el subsystem no es internal-sftp")
-        check("sftp-server" not in conf.replace("internal-sftp", ""),
-              f"{stack}: sshd_config todavia nombra el binario externo")
+    print("=== sshd_config: SFTP en proceso ===")
+    for s in stacks:
+        ep = entrypoints[s]
+        # el stack de tomcat escribe su sshd_config en el entrypoint (Debian,
+        # sin archivo aparte); los demas lo traen como archivo.
+        conf = sshd[s] or ep
+        # Los COMENTARIOS tienen que poder explicar de que se saco el
+        # andamiaje sin que el gate los lea como configuracion: se miran las
+        # lineas que sshd lee de verdad.
+        conf_codigo = "\n".join(l for l in conf.splitlines()
+                                if not l.strip().startswith("#"))
+        check("Subsystem sftp internal-sftp" in conf_codigo,
+              f"{s}: el subsystem no es internal-sftp")
+        check("sftp-server" not in conf_codigo.replace("internal-sftp", ""),
+              f"{s}: sshd_config todavia nombra el binario externo")
 
     # ---- 2. el entrypoint no mete binarios al chroot ----
     print("\n=== entrypoint: sin andamiaje ===")
-    for stack in PHP_STACKS:
-        ep = entrypoints[stack]
+    for s in stacks:
+        ep = entrypoints[s]
         check("SFTP_BIN" not in ep,
-              f"{stack}: todavia resuelve el binario sftp-server")
+              f"{s}: todavia resuelve el binario sftp-server")
         for d in ("usr", "lib", "bin", "dev"):
             check(f"SFTP_CHROOT}}/{d}\"" not in ep,
-                  f"{stack}: todavia crea {d}/ en el chroot")
+                  f"{s}: todavia crea {d}/ en el chroot")
         check('SFTP_CHROOT}/etc"' not in ep,
-              f"{stack}: todavia crea etc/ en el chroot")
+              f"{s}: todavia crea etc/ en el chroot")
         check("ldd " not in ep,
-              f"{stack}: todavia caza .so para el chroot")
-        check("/usr/lib/ssh/sftp-server" not in ep,
-              f"{stack}: todavia usa el binario externo en el chroot")
+              f"{s}: todavia caza .so para el chroot")
+        check("/usr/lib/ssh/sftp-server" not in ep
+              and "/usr/lib/openssh/sftp-server" not in ep,
+              f"{s}: todavia usa el binario externo en el chroot")
         check('chroot "${SFTP_CHROOT}"' not in ep,
-              f"{stack}: todavia prueba binarios con chroot")
+              f"{s}: todavia prueba binarios con chroot")
 
     # ---- 3. limpieza de proyectos viejos, explicita y acotada ----
     print("\n=== limpieza: lista cerrada, sin comodines ===")
-    for stack in PHP_STACKS:
-        ep = entrypoints[stack]
-        check("for _rm in bin usr lib etc proc dev" in ep,
-              f"{stack}: la limpieza no lista el andamiaje explicito")
+    for s in stacks:
+        ep = entrypoints[s]
+        m = re.search(r"for _rm in ([a-z0-9 ]+); do", ep)
+        if m is None:
+            raise AssertionError(
+                f"{s}: no hay limpieza del andamiaje viejo en el entrypoint")
+        lista = set(m.group(1).split())
+        check(lista <= ANDAMIAJE,
+              f"{s}: la lista de borrado tiene algo que no es andamiaje: "
+              f"{sorted(lista - ANDAMIAJE)}")
+        check(not (lista & CLIENTE),
+              f"{s}: {sorted(lista & CLIENTE)} del cliente cayo en la lista "
+              f"de borrado")
         check("${SFTP_CHROOT:?}" in ep,
-              f"{stack}: el rm de limpieza va sin guardia :?")
-        # upload/private/tmp no se tocan jamas (/dev es andamiaje: se borra).
-        for cliente in ("upload", "private", "tmp"):
-            check(f"_rm in" not in ep or cliente not in
-                  ep.split("for _rm in")[1].split("\n")[0],
-                  f"{stack}: {cliente}/ cayo en la lista de borrado")
+              f"{s}: el rm de limpieza va sin guardia :?")
+        check('rm -rf "${SFTP_CHROOT:?}/${_rm}"' in ep,
+              f"{s}: el rm de limpieza no esta acotado a la variable _rm")
         check('mkdir -p "${SFTP_CHROOT}/dev"' not in ep,
-              f"{stack}: todavia crea /dev (medido que no hace falta)")
+              f"{s}: todavia crea /dev (medido que no hace falta)")
         check('SFTP_CHROOT}/tmp"' not in ep.replace('rmdir "${SFTP_CHROOT}/tmp"', ""),
-              f"{stack}: todavia crea /tmp en el chroot (es pasajero, fuera)")
+              f"{s}: todavia crea /tmp en el chroot (es pasajero, fuera)")
         check('rmdir "${SFTP_CHROOT}/tmp"' in ep,
-              f"{stack}: no quita el /tmp viejo vacio (solo rmdir, nunca rm -rf)")
+              f"{s}: no quita el /tmp viejo vacio (solo rmdir, nunca rm -rf)")
         check('SFTP_CHROOT}/proc' not in ep,
-              f"{stack}: todavia crea proc/ en el chroot")
+              f"{s}: todavia crea proc/ en el chroot")
 
     # ---- 4. lo que sostiene el login sigue intacto ----
     print("\n=== el login no se rompe ===")
-    for stack in PHP_STACKS:
-        ep = entrypoints[stack]
+    for s in stacks:
+        ep = entrypoints[s]
         check("ForceCommand internal-sftp -d /upload" in ep,
-              f"{stack}: falta el ForceCommand que para al cliente en /upload")
-        check("Subsystem sftp internal-sftp" in ep,
-              f"{stack}: no verifica el subsystem en proceso")
-        check("mknod" not in ep,
-              f"{stack}: todavia crea device nodes (medidos innecesarios)")
+              f"{s}: falta el ForceCommand que para al cliente en /upload")
+        check("mknod" not in ep.replace("# ", ""),
+              f"{s}: todavia crea device nodes (medidos innecesarios)")
         check('rm -rf "${SFTP_CHROOT}/upload"' not in ep,
-              f"{stack}: volvio el rm -rf sobre upload")
+              f"{s}: volvio el rm -rf sobre upload")
+        check("PRIVATEDIR" in ep,
+              f"{s}: no crea el directorio privado del cliente")
 
-    # ---- 5. paridad entre stacks ----
-    print("\n=== los dos stacks PHP, sin drift ===")
-    a, b = PHP_STACKS
-    check(sshd[a] == sshd[b],
-          "sshd_config difiere entre los dos stacks PHP")
+    # ---- 5. los sshd_config de archivo, sin drift ----
+    print("\n=== sshd_config: sin drift entre stacks con archivo ===")
+    con_archivo = {s: sshd[s] for s in stacks if sshd[s]}
+    if con_archivo:
+        base = sorted(con_archivo)[0]
+        for s, conf in con_archivo.items():
+            check(conf == con_archivo[base],
+                  f"{s}: sshd_config difiere de {base}")
 
     print("\ntodo bien")
     return 0
@@ -124,3 +158,4 @@ if __name__ == "__main__":
     except AssertionError as exc:
         print(f"\nFALLA: {exc}")
         sys.exit(1)
+

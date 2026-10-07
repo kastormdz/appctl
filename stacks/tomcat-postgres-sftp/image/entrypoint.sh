@@ -2,8 +2,9 @@
 # Tomcat directo, sin nginx: catalina.sh + sshd, dos procesos, sin supervisor.
 #
 # El contenedor corre como root (la oficial de tomcat viene asi). El root
-# es lo que permite armar el chroot de sshd con mknod y hacer chown del
-# webapps, que son operaciones que un usuario sin privilegios no puede.
+# es lo que permite armar el chroot de sshd (root:root 755) y hacer chown
+# del webapps, que son operaciones que un usuario sin privilegios no puede.
+# El chroot NO lleva binarios: el SFTP corre en el proceso de sshd.
 # El aislamiento real es la red (internal: true).
 set -euo pipefail
 
@@ -24,12 +25,13 @@ log() { echo "[entrypoint] $*"; }
 # El bind mount de webapps trae el owner del host. Catalina necesita poder
 # escribir ahi para explotar los .war, y con `set -e` un chown que falla
 # por eso mata el entrypoint (restart loop).
-mkdir -p "${WEBROOT}" "${WEBAPPS}" "${SFTP_CHROOT}/dev" "${SFTP_CHROOT}/tmp" \
+# El chroot se crea VACIO (mkdir simple): /dev y /tmp eran de la epoca del
+# subsystem externo, y el cliente los veia al entrar.
+mkdir -p "${WEBROOT}" "${SFTP_CHROOT}" "${WEBAPPS}" \
          /var/run/sshd /usr/local/tomcat/appctl
 TOMCAT_UID=$(id -u tomcat 2>/dev/null || echo 1000)
 chown -R "${TOMCAT_UID}:${TOMCAT_UID}" "${WEBAPPS}" 2>/dev/null || true
 chmod 755 "${WEBAPPS}" 2>/dev/null || true
-chmod 1777 "${SFTP_CHROOT}/tmp"
 chown root:root "${SFTP_CHROOT}"
 chmod 755 "${SFTP_CHROOT}"
 
@@ -63,13 +65,14 @@ HostKey /etc/ssh/ssh_host_rsa_key
 HostKey /etc/ssh/ssh_host_ecdsa_key
 HostKey /etc/ssh/ssh_host_ed25519_key
 
-# El subsystem. Sin esta linea sshd no sabe que binario responderle al
-# cliente y contesta "subsystem request failed on channel 0" aunque el
-# binario este en el chroot y funcione.
-Subsystem sftp /usr/lib/openssh/sftp-server -f AUTH -l INFO
+# El subsystem, EN PROCESO (internal-sftp). El comentario viejo decia lo
+# contrario ("internal-sftp es un wrapper y no existe dentro del chroot"),
+# y era la razon de todo el andamiaje de binarios. Es al reves: al correr
+# DENTRO del sshd no necesita ningun binario en el chroot, y sin la linea
+# el cliente recibe "subsystem request failed on channel 0".
+Subsystem sftp internal-sftp
 
-# internal-sftp es un WRAPPER de sshd, no un binario, y no existe dentro
-# del chroot. Por eso el Subsystem de arriba apunta al binario real.
+# -d /upload: el cliente entra directo a su carpeta, con /private al lado.
 ForceCommand internal-sftp -d /upload
 PermitTTY no
 X11Forwarding no
@@ -90,56 +93,36 @@ LoginGraceTime 30
 ChrootDirectory ${SFTP_CHROOT}
 EOF
 
-# --- internal-sftp + libs + devices + passwd en el chroot ---------------
-# Debian: loader en /lib64/ld-linux-x86-64.so.2 y libs en
-# /usr/lib/x86_64-linux-gnu. NO es el path de Alpine.
-SFTP_BIN=""
-for c in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server; do
-    [ -x "$c" ] && { SFTP_BIN="$c"; break; }
+# --- chroot minimalista: solo lo que el cliente debe ver -------------------
+# El SFTP corre con ForceCommand internal-sftp, EN el proceso de sshd: no
+# necesita NINGUN binario adentro. El entrypoint copiaba sftp-server +
+# loader + .so + shells + /etc/passwd + device nodes de la epoca del
+# subsystem externo, y el cliente veia bin/, dev/, etc/, lib/, lib64/,
+# proc/ y usr/ al entrar. Lo visible queda: /upload y /private, nada mas.
+# Limpieza de proyectos viejos: SOLO el andamiaje, con lista explicita y
+# guardia :? (nunca comodines, nunca las dirs del cliente: eran root:root y
+# el cliente jamas pudo escribir ahi, asi que no hay datos que perder).
+for _rm in bin usr lib lib64 etc proc dev; do
+    if [ -e "${SFTP_CHROOT}/${_rm}" ]; then
+        rm -rf "${SFTP_CHROOT:?}/${_rm}" 2>/dev/null || true
+        log "chroot: ${_rm}/ de andamiaje eliminado"
+    fi
 done
-if [ -z "${SFTP_BIN}" ]; then
-    log "ERROR: no encontre sftp-server en el sistema"
-    exit 1
-fi
-mkdir -p "${SFTP_CHROOT}$(dirname "${SFTP_BIN}")" \
-         "${SFTP_CHROOT}/usr/lib/x86_64-linux-gnu" \
-         "${SFTP_CHROOT}/lib64" "${SFTP_CHROOT}/lib" \
-         "${SFTP_CHROOT}/usr/bin" "${SFTP_CHROOT}/etc"
-cp -a "${SFTP_BIN}" "${SFTP_CHROOT}${SFTP_BIN}"
-chmod 755 "${SFTP_CHROOT}${SFTP_BIN}"
-ldd "${SFTP_BIN}" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u | while read -r lib; do
-    [ -f "${lib}" ] || continue
-    mkdir -p "${SFTP_CHROOT}$(dirname "${lib}")"
-    cp -aL "${lib}" "${SFTP_CHROOT}${lib}" 2>/dev/null || true
-done
-for b in /bin/sh /bin/ls /bin/cat /bin/mkdir /bin/rm; do
-    [ -f "${b}" ] || continue
-    mkdir -p "${SFTP_CHROOT}$(dirname "${b}")"
-    cp -aL "${b}" "${SFTP_CHROOT}${b}" 2>/dev/null || true
-    ldd "${b}" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u | while read -r lib; do
-        [ -f "${lib}" ] || continue
-        mkdir -p "${SFTP_CHROOT}$(dirname "${lib}")"
-        cp -aL "${lib}" "${SFTP_CHROOT}${lib}" 2>/dev/null || true
-    done
-done
-# device nodes: sin /dev/null, internal-sftp aborta con "Couldn't open
-# /dev/null" y el cliente ve "subsystem request failed".
-for spec in "null c 1 3 666" "zero c 1 5 666" "random c 1 8 666" "urandom c 1 9 666"; do
-    set -- ${spec}
-    [ -e "${SFTP_CHROOT}/dev/$1" ] || mknod -m "$5" "${SFTP_CHROOT}/dev/$1" "$2" "$3" "$4" 2>/dev/null || true
-done
-# /etc/passwd: sin esto, "No user found for uid 0"
-grep -E "^(root|${SFTP_USER}):" /etc/passwd > "${SFTP_CHROOT}/etc/passwd" 2>/dev/null || true
-grep -E "^(root|app):" /etc/group > "${SFTP_CHROOT}/etc/group" 2>/dev/null || true
-OUT=$(chroot "${SFTP_CHROOT}" "${SFTP_BIN}" 2>&1 | head -1 || true)
-case "${OUT}" in
-    usage:*|"")
-        # Una sola vez por arranque: si el entrypoint corre en loop, este
-        # mensaje se repite y tapa el error real de catalina.
-        log "internal-sftp OK en el chroot" ;;
-    *)
-        log "ERROR: internal-sftp no arranca: ${OUT}"; exit 1 ;;
-esac
+# /tmp ya no se crea (era pasajero); el de un proyecto viejo se quita solo
+# si esta vacio: rmdir, nunca rm -rf.
+rmdir "${SFTP_CHROOT}/tmp" 2>/dev/null || true
+log "sftp en proceso (internal-sftp): sin binarios en el chroot"
+
+# --- directorio privado: SFTP si, web no ----------------------------------
+# Hermano de /upload dentro del chroot: el cliente lo ve por SFTP como
+# /private y Tomcat no lo sirve (webapps es otro path). mkdir -p y NUNCA
+# rm -rf: el borrado pegaria en el disco real del host por el bind mount.
+PRIVATEDIR="${SFTP_CHROOT}/private"
+mkdir -p "${PRIVATEDIR}"
+chown "${SFTP_UID}:${SFTP_GID}" "${PRIVATEDIR}" 2>/dev/null || true
+chmod 700 "${PRIVATEDIR}" 2>/dev/null || true
+log "private: uid=${SFTP_UID} 700 (solo SFTP, la web no lo ve)"
+
 [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1 || true
 
 # --- credenciales para la app Java ---------------------------------------

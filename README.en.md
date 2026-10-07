@@ -156,13 +156,14 @@ Each stack is a directory under `stacks/`, with its `compose.tmpl.yaml` and its
 own image (Dockerfile, entrypoint, nginx) where needed. Adding one means copying
 a directory and adjusting the placeholders.
 
-There are **4**, and each brings up **two containers**: `app` and `db`.
+There are **5**, and each brings up **two containers**: `app` and `db`.
 
 | Stack | App | Database | Notes |
 |---|---|---|---|
 | `php-postgres-sftp` | PHP 8.5 + nginx + sshd | PostgreSQL 18 | the default |
 | `php-mysql-sftp` | PHP 8.5 + nginx + sshd | MariaDB 11.8 | |
 | `nextjs-postgres-sftp` | Node 22 + Next.js | PostgreSQL 18 | multi-stage build, `.next` |
+| `nextjs-python-postgres-sftp` | Node 22 + Next.js + Python API (FastAPI) | PostgreSQL 18 | two runtimes in one container: `/api` → uvicorn, the rest → Next |
 | `tomcat-postgres-sftp` | Tomcat 11 + JDK 25 | PostgreSQL 18 | the external proxy talks straight to Tomcat |
 
 SFTP is not a separate container: it's an `sshd` inside the app container, with
@@ -173,6 +174,47 @@ Missing are the `mysql` variants for Next.js and Tomcat, plus a stack with `cron
 for queue workers. The CLI already accepts those names; what doesn't exist yet is
 the directory. They aren't built by design: each one gets added when someone
 actually asks for it, so the repo doesn't carry stacks nobody has tested.
+
+### Next.js + Python API
+
+`python` isn't a standalone runtime: it's a modifier on `nextjs`. The stack has a
+**single image** with Node and Python, a single nginx and a single port:
+
+```text
+/        -> Next standalone   (127.0.0.1:3000)
+/api/    -> uvicorn + FastAPI (127.0.0.1:8000)
+```
+
+```bash
+appctl acme nextjs python psql sftp
+```
+
+Why together and not two stacks: the client has **one** project, **one** port and
+**one** SFTP. Two containers would mean two ports to open, two chroots to
+maintain, and the code split across two uploads. With `python` next to `nextjs`
+the developer uploads everything over the same session:
+
+```text
+/upload/              the Next app (package.json, app/, etc)
+/upload/backend/      the API (main.py + requirements.txt)
+```
+
+| Detail | How it works |
+|---|---|
+| API startup | `uvicorn main:app` (or `app.main:app` if you use an `app/` package), with the image's venv |
+| dependencies | `backend/requirements.txt`, installed when the container starts |
+| database | the project's own, via the `db` host — there is no second database |
+| prefix | `/api` is **stripped** when proxying: your `/items` is served at `/api/items` |
+| `/healthz` | the client must answer it (in Next and in the API): otherwise the container reports `unhealthy` |
+
+Dependencies go into a venv (`/opt/venv`) rather than the system Python because
+Alpine marks its own as *externally managed* (PEP 668), where a plain `pip
+install` fails. `fastapi` and `uvicorn` ship preinstalled so the verification stub
+works **with no network** on a fresh `create`.
+
+The healthcheck hits `/healthz` **and** `/api/healthz`. A check that only looks at
+Next leaves the container green with the API down — exactly the kind of green that
+is worth nothing.
 
 ### Tomcat
 
@@ -210,6 +252,7 @@ makes more sense.
 |---|---|
 | `php` | PHP-FPM 8.5 + nginx + sshd, code volume |
 | `nextjs` | Node 22 + Next.js build, app volume |
+| `python` | FastAPI + uvicorn API next to Next (modifier: `nextjs` only) |
 | `tomcat` | Tomcat 11 + JDK 25, the external proxy talks straight to it |
 | `psql` / `mysql` | PostgreSQL 18 / MariaDB 11.8, private network |
 | `sftp` | sshd with chroot, dedicated port, volume shared with the app |
@@ -222,10 +265,18 @@ or WordPress end up needing a worker, and without this the first "I need to run 
 cron" becomes a support ticket. It requires `sftp`, which is how the client
 uploads the file.
 
+`python` is the symmetric exception: it isn't a standalone runtime either (there
+is no Python-only stack with a database and SFTP), but it **does** change the
+image — the `nextjs-python-postgres-sftp` stack ships Node and Python. That's why
+it goes into the stack name and not into the list of runtimes: `appctl p python
+psql sftp` is rejected with a message telling you what to use, instead of failing
+later on a stack that doesn't exist.
+
 ```bash
 appctl acme php psql sftp
 appctl acme php mysql
 appctl acme nextjs psql sftp --app-port 3001
+appctl acme nextjs python psql sftp
 appctl acme php psql sftp cron --app-memory 2G
 ```
 
@@ -309,7 +360,15 @@ at two in the morning is a ticket we'd rather not have.
 
 ## The summary the developer gets
 
-`create` prints a plain-text summary once, meant to be forwarded without editing:
+`create` prints a plain-text summary once, meant to be forwarded without editing.
+On the `nextjs-python` stack the summary adds the API block (URL under `/api/`,
+where the backend goes, and what it must answer):
+
+```text
+API Python  (FastAPI + uvicorn, detras de nginx)
+  URL        http://apps.example.com:8001/api/
+  Codigo     $APPCTL_PROJECTS/acme/sftp/home/upload/backend   (sube por SFTP)
+```
 
 ```text
 acme  (php-postgres-sftp)
@@ -603,12 +662,14 @@ doesn't include `conf.d/`, so editing it has no effect. Noted as pending.
 ### Private directory (SFTP only)
 
 Each project has a `sftp/home/private/` next to `upload/`: the client sees it
-over SFTP as `/private` and keeps there whatever must not go out over the web.
-nginx roots at `/upload`, so it never serves it; on top of that an explicit
-`location` denies it and `disable_symlinks on` stops the
-`upload/link -> ../private` symlink trick. It belongs to the SFTP user, mode
-700: neither nginx nor php-fpm gets in. From PHP it is reachable over the
-filesystem at `/srv/sftp/private`, if permissions allow.
+over SFTP as `/private` and keeps there whatever must not go out over the web. On
+the PHP stacks nginx roots at `/upload`, so it never serves it; on top of that an
+explicit `location` denies it and `disable_symlinks on` stops the
+`upload/link -> ../private` symlink trick. On `nextjs-python` nginx is a pure
+proxy (no root), and the `deny` stays anyway as defence in depth: the day someone
+adds a server block with a root, the barrier is already there. It belongs to the
+SFTP user, mode 700: neither nginx nor php-fpm gets in. From PHP it is reachable
+over the filesystem at `/srv/sftp/private`, if permissions allow.
 
 Over SFTP the client only sees `/upload` and `/private`, nothing else. SFTP runs with `ForceCommand
 internal-sftp` inside sshd itself, so the chroot carries no binaries: no
@@ -628,7 +689,8 @@ a bug where every restart wiped the client's `upload`.
 
 After bringing the stack up, `create` runs ten checks and reports **all of them**,
 not just the first failure: when something's broken at three in the morning, you
-want the whole list in one go.
+want the whole list in one go. On the `nextjs-python` stack it's **eleven**: the
+API is verified separately (see point 9).
 
 1. The `db` and `app` containers are `healthy`.
 2. The project's three roles exist.
@@ -641,9 +703,13 @@ want the whole list in one go.
    real IP. The name `db` resolves to a different database and would give a false
    pass.
 8. The app answers what it should, depending on the stack's runtime.
-9. The SFTP login works: it gets in, lists, and **writes** a file. A read-only SFTP
-   is no use for uploading code, and a successful `ls` doesn't detect it.
-10. The compose state has no drift.
+9. The API answers on `/api/` (`nextjs-python` only). It's a separate check because
+   nginx serves two runtimes on the same port: a 200 on `/` comes from Next, so it
+   proves nothing about Python. With uvicorn down, `/` still returns 200 and the
+   project would look healthy with the API dead.
+10. The SFTP login works: it gets in, lists, and **writes** a file. A read-only SFTP
+    is no use for uploading code, and a successful `ls` doesn't detect it.
+11. The compose state has no drift.
 
 Points 6 and 7 are the ones that matter. A port not appearing in `compose.yaml`
 isn't a guarantee: it's an absence of configuration, and anyone can edit the
@@ -690,15 +756,19 @@ appctl/
 │   ├── gen.py                 # renders the compose and the .env
 │   ├── ports.py               # port registry + flock
 │   ├── dbtool.py              # dump / restore / expose / grant
-│   ├── smoke.py               # the ten checks
+│   ├── smoke.py               # the checks (11 on nextjs-python)
 │   └── summary.py             # the summary for the developer
-├── stacks/                    # 4 stacks, one per directory
+├── stacks/                    # 5 stacks, one per directory
 └── tests/
     ├── test_init_sql.py       # runs the inits and validates the SQL they produce
     ├── test_root_pw.py        # parses the password line out of the mariadb log
     ├── test_security.py       # the compose doesn't publish the database
-    ├── test_readme.py         # every claim in this README against the code
-    └── check_names.py         # AST: undefined calls, duplicate defs
+    ├── test_php_hardening.py  # cookies, headers, and the .htaccess nobody reads
+    ├── test_private_sftp.py   # the private dir: 700, deny, and no rm -rf
+    ├── test_sftp_chroot.py    # the chroot carries upload and private only
+    ├── test_nextjs_python.py  # the two-runtime stack: nginx, uvicorn, chroot
+    ├── test_readme.py         # every README claim against the code
+    └── check_names.py         # AST: undefined calls, duplicated defs
 ```
 
 Two of these tests exist because the software was lying to you:

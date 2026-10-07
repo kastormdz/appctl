@@ -764,6 +764,47 @@ def app_serves(project_dir: str, app_port: int, project: str,
     return Check("app responde", True, body.splitlines()[0] if body else "")
 
 
+def app_serves_python(project_dir: str, app_port: int, cfg: dict | None = None,
+                      expect_stub: bool = True) -> Check:
+    """La API Python responde detras de nginx (/api -> 127.0.0.1:8000).
+
+    Por que es un check APARTE y no parte de app_serves: nginx sirve DOS
+    runtimes en el mismo puerto. Un 200 en / no prueba NADA de python, / lo
+    contesta Next. Si el que se murio es uvicorn (requirements.txt que no
+    instalo, main.py con un error de sintaxis, una dep que falta), / sigue
+    dando 200 y el proyecto se reporta sano con la API tirada.
+
+    expect_stub True (create): se exige la marca del stub ("app: python
+    ok"), porque en un proyecto recien creado ese backend ES el stub.
+    expect_stub False (upgrade): el cliente ya pudo subir su API, asi que
+    un HTTP 200 alcanza (uvicorn sano con una ruta que no existe da 404, no
+    200; y nginx mal ruteado da 502).
+    """
+    try:
+        p = subprocess.run(
+            ["curl", "-q", "-fsS", "--max-time", "10",
+             f"http://127.0.0.1:{app_port}/api/"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return Check("API python responde", False, f"no se pudo pedir: {e}")
+    body = p.stdout
+    if p.returncode != 0:
+        return Check("API python responde (nginx -> uvicorn)", False,
+                     f"curl fallo: {p.stderr.strip()[:200]}")
+    if "app: python ok" not in body:
+        if not expect_stub:
+            primera = body.splitlines()[0][:120] if body else "(vacio)"
+            return Check("API python responde (codigo del cliente, HTTP 200)",
+                         True, f"no es el stub, es la API real: {primera!r}")
+        return Check("API python responde", False,
+                     f"responde pero no es el stub esperado: {body[:200]!r}")
+    py = body.split("python: ")[1].splitlines()[0] if "python: " in body else ""
+    fa = body.split("fastapi: ")[1].splitlines()[0] if "fastapi: " in body else ""
+    return Check("API python responde (nginx -> uvicorn -> fastapi)", True,
+                 f"python {py}, fastapi {fa}")
+
+
 def sftp_login(project_dir: str, host: str, port: int, user: str, password: str) -> Check:
     """El cliente TIENE que poder entrar por SFTP con la password del summary.
     Es el check que mas se rompe: chroot mal, usuario sin shell valido,
@@ -952,6 +993,12 @@ def all_checks(project_dir: str, cfg: dict, host: str,
     checks.append(db_not_reachable_from_other_container(project_dir, cfg))
     checks.append(app_serves(project_dir, cfg["app_port"], project, cfg,
                              expect_stub=expect_stub))
+    # El stack nextjs-python tiene DOS runtimes en el mismo puerto: / lo
+    # contesta Next y /api la API. Sin este check, una API caida pasaba
+    # desapercibida con el resto en verde.
+    if "python" in (cfg.get("stack") or ""):
+        checks.append(app_serves_python(
+            project_dir, cfg["app_port"], cfg, expect_stub=expect_stub))
     checks.append(sftp_login(
         project_dir, host, cfg["sftp_port"],
         cfg["sftp_user"], cfg["sftp_password"],

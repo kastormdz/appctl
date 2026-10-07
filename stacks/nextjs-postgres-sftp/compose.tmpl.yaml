@@ -164,6 +164,21 @@ __DB_PUBLISH__
       POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD}
       POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
       PGDATA: /var/lib/postgresql/data/pgdata
+      # El init/10-roles.sh necesita estos para crear los tres roles del
+      # proyecto (app / migracion / readonly). Con set -u, que faltara uno
+      # daba 'DB_USER: unbound variable' en la linea 16 y el script SEGUIA:
+      # los tres roles nunca se creaban y el error de postgres de verdad
+      # era 'role "postgres" does not exist', que no senala el problema.
+      # El proyecto quedaba 'creado' con una sola base y sin los roles.
+      # Este stack los tenia SIN pasar al contenedor db (se heredo de la
+      # copia de nextjs): el create daba 'faltan 3 de 3' en el check de
+      # roles. Va aca, en el servicio db, no solo en el de la app.
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_MIGRATION_USER: ${DB_MIGRATION_USER}
+      DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD}
+      DB_READONLY_USER: ${DB_READONLY_USER}
+      DB_READONLY_PASSWORD: ${DB_READONLY_PASSWORD}
     volumes:
       - ./db/data:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro

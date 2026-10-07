@@ -42,6 +42,20 @@ def render_create(project: str, stack: str, host: str, app_port: int,
     L.append(f"  Codigo     {pdir}/sftp/home/upload   (sube por SFTP)")
     L.append("")
 
+    # nextjs-python: el stack corre DOS runtimes. El developer tiene que
+    # saber por donde entra cada uno sin preguntar nada.
+    if "python" in stack:
+        L.append(f"{BOLD}API Python{RESET}  {DIM}(FastAPI + uvicorn, detras de nginx){RESET}")
+        L.append(f"  URL        http://{host}:{app_port}/api/")
+        L.append(f"  Codigo     {pdir}/sftp/home/upload/backend   (sube por SFTP)")
+        L.append(f"  {DIM}Se arranca con uvicorn: main:app desde ese directorio{RESET}")
+        L.append(f"  {DIM}(o app.main:app si usas un paquete app/). El prefijo{RESET}")
+        L.append(f"  {DIM}/api se SACA al reenviar: tu /items se ve en /api/items.{RESET}")
+        L.append(f"  {DIM}Las deps van en backend/requirements.txt y se instalan{RESET}")
+        L.append(f"  {DIM}al arrancar el contenedor. Tu API tiene que responder{RESET}")
+        L.append(f"  {DIM}GET /healthz (200) o el contenedor figura unhealthy.{RESET}")
+        L.append("")
+
     # Tomcat: el manager usa la MISMA credencial que el SFTP.
     if stack.startswith("tomcat"):
         L.append(f"{BOLD}Tomcat manager{RESET}  {DIM}(misma credencial que el SFTP){RESET}")
