@@ -310,6 +310,33 @@ def main() -> int:
           "la ayuda de limits no documenta --service con ejemplos")
     shutil.rmtree(site, ignore_errors=True)
 
+    # --- info muestra memoria/CPU por servicio ---
+    # render_info gano un 4to parametro opcional (limits). Sin el, el
+    # resumen sale como antes; con el, agrega la seccion Limites con lo
+    # vivo de docker (incluye cambios en caliente sin --save).
+    print("=== info con limites ===")
+    sys.path.insert(0, str(ROOT / "lib"))
+    import summary as summod  # noqa: E402
+    check(summod.fmt_limites("536870912", "1000000000") == "512M / 1.00 cpu",
+          "fmt_limites no formatea 512M/1cpu")
+    check(summod.fmt_limites("805306368", "500000000") == "768M / 0.50 cpu",
+          "fmt_limites no formatea 768M/0.5cpu")
+    check(summod.fmt_limites("0", "0") == "sin limite",
+          "fmt_limites no dice sin limite en 0/0")
+    check(summod.fmt_limites("basura", None) == "sin limite",
+          "fmt_limites no aguanta basura")
+    st = {"project": "acme", "stack": "php-postgres-sftp", "host": "h",
+          "app_port": 8001, "components": ["php"], "tags": {}}
+    sin = summod.render_info(st, {}, "")
+    check("Limites" not in sin,
+          "render_info sin limits mete seccion Limites (rompe compatibilidad)")
+    con = summod.render_info(st, {}, "", {"app": "768M / 1.00 cpu",
+                                          "db": None})
+    check("Limites" in con and "768M / 1.00 cpu" in con,
+          "render_info con limits no muestra la seccion")
+    check("db   -" in con,
+          "render_info no muestra '-' cuando el contenedor no existe")
+
     print("todo bien")
     return 0
 

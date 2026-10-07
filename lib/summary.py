@@ -201,7 +201,28 @@ def render_list(proj_dir: str) -> str:
     return "\n".join(L)
 
 
-def render_info(st: dict, env: dict, ps_out: str) -> str:
+def fmt_limites(mem_bytes, nano_cpus) -> str:
+    """'512M / 1.00 cpu' a partir de lo que dice docker.
+
+    En docker 0 es sin techo, asi que 0 se muestra como tal y no como 0M,
+    que se leeria como "no tiene nada".
+    """
+    try:
+        m = int(mem_bytes)
+    except (TypeError, ValueError):
+        m = 0
+    try:
+        c = int(nano_cpus)
+    except (TypeError, ValueError):
+        c = 0
+    if m <= 0 and c <= 0:
+        return "sin limite"
+    sm = f"{m//1024//1024}M" if m > 0 else "-"
+    sc = f"{c/1e9:.2f} cpu" if c > 0 else "-"
+    return f"{sm} / {sc}"
+
+
+def render_info(st: dict, env: dict, ps_out: str, limits=None) -> str:
     L = ["", f"  {BOLD}{st['project']}{RESET}  {DIM}creado {st.get('created','?')}{RESET}", ""]
     L.append(f"  Stack      {st['stack']}")
     L.append(f"  Host       {st['host']}")
@@ -219,5 +240,10 @@ def render_info(st: dict, env: dict, ps_out: str) -> str:
         L.append(f"  {BOLD}Servicios{RESET}")
         for line in ps_out.strip().splitlines():
             L.append(f"    {line}")
+    if limits:
+        L.append("")
+        L.append(f"  {BOLD}Limites{RESET}  {DIM}(lo aplicado ahora, en caliente incluido){RESET}")
+        for svc in ("app", "db"):
+            L.append(f"    {svc:<4} {limits.get(svc) or '-'}")
     L.append("")
     return "\n".join(L)

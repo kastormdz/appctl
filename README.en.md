@@ -461,7 +461,7 @@ isolation. On a MySQL with several databases on one server, it isn't.
 | `appctl list` | table of projects: name, stack, ports, database |
 | `appctl ps` | the appctl stacks with their ports and state |
 | `appctl doctor` | host state: Docker, registry, proxy, `sudo -n`, `sshpass` |
-| `appctl <project> info` | project detail, its images and its services |
+| `appctl <project> info` | project detail, its images, its services and its RAM/CPU limits |
 | `appctl <project> set-host <name>` | fixes the host in the summary |
 
 ### Operating a project

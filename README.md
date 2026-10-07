@@ -461,7 +461,7 @@ el mismo servidor, sí.
 | `appctl list` | tabla de proyectos: nombre, stack, puertos y base |
 | `appctl ps` | los stacks de appctl con sus puertos y estado |
 | `appctl doctor` | estado del host: Docker, registry, proxy, `sudo -n`, `sshpass` |
-| `appctl <proyecto> info` | detalle del proyecto, sus imágenes y sus servicios |
+| `appctl <proyecto> info` | detalle del proyecto, sus imágenes, sus servicios y sus límites de RAM/CPU |
 | `appctl <proyecto> set-host <nombre>` | corrige el host del resumen |
 
 ### Operar un proyecto

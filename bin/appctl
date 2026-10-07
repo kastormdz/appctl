@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ports as portsmod
 import gen as sec
 import smoke as smokemod
-from summary import render_create, render_rotate, render_list, render_info
+from summary import render_create, render_rotate, render_list, render_info, fmt_limites
 
 # Donde van los proyectos. Se define con APPCTL_PROJECTS; si no esta, se usa
 # el default de abajo.
@@ -1600,13 +1600,31 @@ def cmd_set_host(args) -> int:
     return 0
 
 
+def _limites_vivos(project: str) -> dict:
+    """Memoria/CPU reales de cada contenedor, leidas de docker.
+
+    Es lo aplicado AHORA, incluyendo cambios en caliente sin --save.
+    Si el contenedor no existe, None y el resumen muestra '-'.
+    """
+    out: dict = {}
+    for svc in ("app", "db"):
+        r = sh(f"docker inspect --format '{{{{.HostConfig.Memory}}}} "
+               f"{{{{.HostConfig.NanoCpus}}}}' {project}_{svc}", timeout=30)
+        parts = (r.stdout or "").split()
+        if len(parts) < 2:
+            out[svc] = None
+        else:
+            out[svc] = fmt_limites(parts[0], parts[1])
+    return out
+
+
 def cmd_info(args) -> int:
     st = load_state(args.proyecto)
     env = load_env(args.proyecto)
     _host_guardado(args.proyecto, st)
     r = sh("docker compose ps --format '{{.Service}}\t{{.State}}\t{{.Health}}'",
            cwd=build_dir(args.proyecto))
-    print(render_info(st, env, r.stdout))
+    print(render_info(st, env, r.stdout, _limites_vivos(args.proyecto)))
     return 0
 
 
