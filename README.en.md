@@ -476,7 +476,7 @@ isolation. On a MySQL with several databases on one server, it isn't.
 | `appctl <project> restart` | restarts the services |
 | `appctl <project> rotate <sftp\|db\|mig\|ro>` | changes one credential |
 | `appctl <project> limits [--service app\|db] [--memory M] [--db-memory M] [--cpus N] [--save]` | adjusts RAM and CPU live, per service or both |
-| `appctl <project> upgrade [-y] [--php VER] [--runtime R]` | re-applies the compose from the template |
+| `appctl <project> upgrade [-y] [--php VER] [--runtime R]` | re-applies the compose from the template (accepts real code already uploaded: asks for HTTP 200, not the stub) |
 | `appctl clone <source> <target> [--port N] [--php VER]` | copies a project with its data |
 | `appctl <project> destroy [--keep-data] [--yes]` | destroys the project |
 

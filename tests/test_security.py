@@ -337,6 +337,47 @@ def main() -> int:
     check("db   -" in con,
           "render_info no muestra '-' cuando el contenedor no existe")
 
+    # --- upgrade no exige el stub, create si ---
+    # El check 'app responde' pedia el marcador del stub siempre: en upgrade
+    # eso revertia solo a todo proyecto con codigo real subido (pap-test
+    # devolvia HTTP 200 con su app y el upgrade se deshacia). Ahora upgrade
+    # pasa expect_stub=False. Se prueba la logica con curl simulado: sin red.
+    print("=== upgrade acepta codigo real ===")
+    import inspect
+    import smoke as smokemod  # noqa: E402
+    check(inspect.signature(smokemod.app_serves).parameters[
+        "expect_stub"].default is True,
+        "app_serves no trae expect_stub=True por default (create se relaja)")
+    check(inspect.signature(smokemod.all_checks).parameters[
+        "expect_stub"].default is True,
+        "all_checks no propaga expect_stub")
+    src_upgrade = (ROOT / "bin" / "appctl").read_text()
+    check("expect_stub=False" in src_upgrade,
+          "upgrade no pasa expect_stub=False (sigue exigiendo el stub)")
+    from unittest import mock
+
+    real = "<html>mi app de verdad</html>\n"
+    stub = "app: ok\nphp: 8.5.11\n"
+    with mock.patch.object(smokemod.subprocess, "run") as m:
+        m.return_value = mock.Mock(returncode=0, stdout=real, stderr="")
+        ciego = smokemod.app_serves("x", 8001, "acme", {"db_kind": "postgres"})
+        check(not ciego.ok,
+              "create acepta una app real como stub (el check se volvio ciego)")
+        abierto = smokemod.app_serves("x", 8001, "acme",
+                                      {"db_kind": "postgres"},
+                                      expect_stub=False)
+        check(abierto.ok,
+              "upgrade rechaza una app real con HTTP 200 (vuelve el rollback)")
+        m.return_value = mock.Mock(returncode=0, stdout=stub, stderr="")
+        check(smokemod.app_serves("x", 8001, "acme",
+                                  {"db_kind": "postgres"},
+                                  expect_stub=False).ok,
+              "upgrade rechaza el stub (rompe lo que andaba)")
+        m.return_value = mock.Mock(returncode=7, stdout="", stderr="refused")
+        check(not smokemod.app_serves("x", 8001, "acme", {},
+                                      expect_stub=False).ok,
+              "upgrade acepta una app caida (el check no chequea nada)")
+
     print("todo bien")
     return 0
 

@@ -1540,7 +1540,10 @@ def cmd_upgrade(args) -> int:
         "env": env,
     }
 
-    checks = smokemod.all_checks(str(pdir), cfg, st["host"])
+    # en upgrade el codigo del cliente ya puede estar subido: no se exige
+    # el stub, alcanza con que la app responda HTTP 200 (ver expect_stub).
+    checks = smokemod.all_checks(str(pdir), cfg, st["host"],
+                                 expect_stub=False)
     fallos = [c for c in checks if not c.ok]
     for c in checks:
         print(f"  {'PASS' if c.ok else 'FAIL'}  {c.name}")

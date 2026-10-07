@@ -706,9 +706,19 @@ def _container_ip(container: str) -> str:
     return (r.stdout or "").strip()
 
 def app_serves(project_dir: str, app_port: int, project: str,
-                cfg: dict | None = None) -> Check:
+                cfg: dict | None = None,
+                expect_stub: bool = True) -> Check:
     """nginx responde y php ejecuta. Un 502 significa que nginx no habla con
-    php-fpm: el socket mal montado o el pool con otro usuario."""
+    php-fpm: el socket mal montado o el pool con otro usuario.
+
+    expect_stub True (create): exige el marcador "app: ok" del stub, porque
+    en un proyecto recien creado el index.php ES el stub y otra cosa
+    significa stack equivocado o render roto.
+    expect_stub False (upgrade): el cliente ya pudo subir su codigo, asi que
+    un HTTP 200 alcanza: con nginx+php-fpm sanos, un fatal de PHP da 500 y
+    un vhost roto da 502/404, no 200. Exigir el stub en upgrade dejaba
+    clavado a todo proyecto con codigo real (medido: pap-test con su app
+    subida devolvia 200 y el upgrade se revertia solo)."""
     try:
         p = subprocess.run(
             ["curl", "-q", "-fsS", "--max-time", "10",
@@ -722,6 +732,10 @@ def app_serves(project_dir: str, app_port: int, project: str,
         return Check("app responde", False,
                      f"curl fallo: {p.stderr.strip()[:200]}")
     if "app: ok" not in body:
+        if not expect_stub:
+            primera = body.splitlines()[0][:120] if body else "(vacio)"
+            return Check("app responde (codigo del cliente, HTTP 200)", True,
+                         f"no es el stub, es la app real: {primera!r}")
         return Check("app responde", False,
                      f"responde pero no es el stub esperado: {body[:200]!r}")
     # El NOMBRE del check sale del STACK, no de lo que diga la pagina. Antes
@@ -907,8 +921,12 @@ def db_es_utilizable(project_dir: str, cfg: dict) -> Check:
                  "responde consultas con el rol de la app, no solo un ping")
 
 
-def all_checks(project_dir: str, cfg: dict, host: str) -> list[Check]:
-    """Suite completa, en el orden en que conviene fallar."""
+def all_checks(project_dir: str, cfg: dict, host: str,
+               expect_stub: bool = True) -> list[Check]:
+    """Suite completa, en el orden en que conviene fallar.
+
+    expect_stub True: create (el index.php tiene que ser el stub).
+    expect_stub False: upgrade (el cliente ya pudo subir su codigo)."""
     checks: list[Check] = []
     project = cfg["project"]
 
@@ -932,7 +950,8 @@ def all_checks(project_dir: str, cfg: dict, host: str) -> list[Check]:
         checks.append(db_not_reachable_from_host(
             project_dir, db_port, cfg.get("db_image", "postgres:18-alpine")))
     checks.append(db_not_reachable_from_other_container(project_dir, cfg))
-    checks.append(app_serves(project_dir, cfg["app_port"], project, cfg))
+    checks.append(app_serves(project_dir, cfg["app_port"], project, cfg,
+                             expect_stub=expect_stub))
     checks.append(sftp_login(
         project_dir, host, cfg["sftp_port"],
         cfg["sftp_user"], cfg["sftp_password"],
