@@ -197,6 +197,33 @@ def main_una(nombre):
     for tag in sorted(base_tags):
         check("el tag base {0} esta en el README".format(tag), tag in t,
               "es el tag del compose del stack y el README no lo menciona")
+    # ---- 9. la ayuda del CLI nombra todo lo que existe ----
+    # `-h` es una superficie de documentacion mas: el resumen de `db` nombraba
+    # 4 de los 9 subcomandos, y nadie lo notaba porque el listado de argparse
+    # (que si esta completo) se imprime debajo. Se compara el resumen contra
+    # los subparsers REGISTRADOS en el codigo.
+    print("=== la ayuda del CLI vs lo que existe ===")
+    cli = (RAIZ / "bin" / "appctl").read_text(errors="replace")
+    # El resumen puede estar partido en varias lineas (literales adyacentes):
+    # hay que juntarlos, o el gate solo ve el primer fragmento.
+    # Los literales adyacentes pueden traer parentesis adentro ("users)"), y
+    # cortar en el primer ')' perdia el ultimo fragmento. Se pide: uno o mas
+    # literales seguidos del cierre de la llamada.
+    m = re.search(r'add_parser\("db", help=((?:"[^"]*"\s*)+)\)', cli)
+    resumen = " ".join(re.findall(r'"([^"]*)"', m.group(1))) if m else ""
+    check("el parser db declara su resumen", bool(m))
+    if m:
+        subs = sorted(set(re.findall(r'dsub\.add_parser\("([a-z]+)"', cli)))
+        check("el parser db tiene subcomandos", len(subs) >= 8)
+        for nombre in subs:
+            check("la ayuda de `db` nombra {0}".format(nombre), nombre in resumen,
+                  "el subcomando existe y el resumen de -h no lo dice")
+    # expose: el flag y su default tienen que estar en la ayuda
+    check("expose declara --bind con default 127.0.0.1",
+          'add_argument("--bind", default="127.0.0.1"' in cli)
+    check("expose explica que persiste en state.json",
+          "ANOTADOS en state.json" in cli)
+    check("el epilogo tiene un ejemplo de expose", "db expose 5432" in cli)
     print()
     return 0
 

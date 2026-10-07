@@ -2750,6 +2750,7 @@ def main() -> int:
               appctl acme nextjs python psql sftp
               appctl acme list
               appctl acme rotate sftp
+              appctl acme db expose 5432 --bind 0.0.0.0
               appctl acme destroy
             """))
     ap.add_argument("--version", action="version", version="appctl 0.1.0")
@@ -2818,7 +2819,12 @@ def main() -> int:
                    help="persistir en el .env (si no, es temporal)")
     p.set_defaults(func=cmd_limits)
 
-    p = sub.add_parser("upgrade", help="re-aplicar el compose del template")
+    p = sub.add_parser("upgrade", help="re-aplicar el compose del template",
+                       description=(
+        "Re-renderiza el compose desde el template y aplica el diff.\n"
+        "Sin --yes solo MUESTRA el diff (vista previa: no escribe nada).\n"
+        "Respeta el puerto y el bind publicados de la DB: los lee del state o,\n"
+        "si el proyecto se expuso con una version vieja, del propio compose."))
     p.add_argument("proyecto")
     p.add_argument("-y", "--yes", action="store_true",
                    help="aplicar directamente (sin esto solo muestra el diff)")
@@ -2830,7 +2836,11 @@ def main() -> int:
                         "nextjs-python agrega la API FastAPI)")
     p.set_defaults(func=cmd_upgrade)
 
-    p = sub.add_parser("info", help="detalle de un proyecto")
+    p = sub.add_parser("info", help="detalle de un proyecto",
+                       description=(
+        "Stack, host, puertos, componentes, imagenes y limites.\n"
+        "De la DB dice si esta publicada y DONDE, con la verdad de docker (no\n"
+        "con lo que dice el state), y avisa si los dos no coinciden."))
     p.add_argument("proyecto")
     p.set_defaults(func=cmd_info)
 
@@ -2887,7 +2897,9 @@ def main() -> int:
     # (el proyecto queda entre el verbo y el subcomando), no a
     # `appctl db dump acme`. Por eso el proyecto es un ARGUMENTO DE `db`,
     # no de cada subparser, y los subcomandos no lo piden.
-    p = sub.add_parser("db", help="la base de un proyecto: dump/restore/list/expose")
+    p = sub.add_parser("db", help="la base de un proyecto (dump, restore, "
+                                  "list, rm, expose, unexpose, grant, revoke, "
+                                  "users)")
     p.add_argument("proyecto")
     dsub = p.add_subparsers(dest="dbcmd", required=True)
 
@@ -2904,7 +2916,12 @@ def main() -> int:
     q.add_argument("--timeout", type=int, default=900)
     q.set_defaults(func=cmd_db_restore)
 
-    q = dsub.add_parser("expose", help="publicar la DB en un puerto del host")
+    q = dsub.add_parser("expose", help="publicar la DB en un puerto del host",
+                        description=(
+        "Publica la base en un puerto del HOST (no la saca de su red interna).\n"
+        "El puerto y el bind quedan ANOTADOS en state.json: `info` los muestra y\n"
+        "un `upgrade` no los pierde. Antes de darlo por hecho se prueba que el\n"
+        "puerto responda de verdad; si no responde, se revierte todo."))
     q.add_argument("puerto", type=int)
     # Por defecto SOLO desde este host. Aca va una IP, no una red: medido,
     # docker rechaza un CIDR en ports: ('-p 10.20.0.0/16' -> exit 125). El
@@ -2915,7 +2932,11 @@ def main() -> int:
                         "0.0.0.0 lo abre a toda red que llegue)")
     q.set_defaults(func=cmd_db_expose)
 
-    q = dsub.add_parser("unexpose", help="cerrar la DB (vuelve al estado de siempre)")
+    q = dsub.add_parser("unexpose", help="cerrar la DB (vuelve al estado de siempre)",
+                        description=(
+        "Saca el `ports:` del compose EN USO y borra la anotacion del state.\n"
+        "NO restaura el backup pre-expose: puede ser de antes de un upgrade, y\n"
+        "volver a el seria un downgrade silencioso del stack entero."))
     q.add_argument("--puerto", type=int,
                    help="el puerto a comprobar que quedo cerrado")
     q.set_defaults(func=cmd_db_unexpose)
