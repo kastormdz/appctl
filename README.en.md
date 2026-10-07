@@ -109,6 +109,7 @@ $APPCTL_PROJECTS/<project>/            # one per client
 ├── db/init/                          # initdb scripts
 ├── db/data/                          # database volume
 ├── sftp/home/upload/                 # the client's code
+├── sftp/home/private/                # SFTP only (private: created by the entrypoint)
 ├── backups/                          # dumps (private: created by the first db dump)
 └── state.json
 ```
@@ -598,6 +599,20 @@ The nginx vhost is **baked into the image** (`image/nginx.conf`). Changing it
 means `appctl build` and then `appctl <project> upgrade`. The
 `nginx/site.conf` in each project directory **is not loaded today**: nginx
 doesn't include `conf.d/`, so editing it has no effect. Noted as pending.
+
+### Private directory (SFTP only)
+
+Each project has a `sftp/home/private/` next to `upload/`: the client sees it
+over SFTP as `/private` and keeps there whatever must not go out over the web.
+nginx roots at `/upload`, so it never serves it; on top of that an explicit
+`location` denies it and `disable_symlinks on` stops the
+`upload/link -> ../private` symlink trick. It belongs to the SFTP user, mode
+700: neither nginx nor php-fpm gets in. From PHP it is reachable over the
+filesystem at `/srv/sftp/private`, if permissions allow.
+
+The entrypoint creates it with `mkdir -p` and never `rm -rf`: deleting there
+would hit the host's real disk through the bind mount. That was the cause of
+a bug where every restart wiped the client's `upload`.
 
 ---
 

@@ -59,7 +59,9 @@ chmod 775 "${APP_HOME}/upload" "${WEBROOT}" 2>/dev/null || true
 # que el cliente ve sale de un bind mount del host, no de un symlink:
 # con symlink, el cliente sube a /upload que es ${SFTP_CHROOT}/upload, y
 # ese path no existe en el host.
-rm -rf "${SFTP_CHROOT}/upload"
+# mkdir -p y NUNCA rm -rf: el rm -rf que habia aca borraba el codigo que
+# el cliente habia subido cada vez que el contenedor se recreaba, porque
+# el bind mount hace que el borrado pegue en el disco real del host.
 mkdir -p "${SFTP_CHROOT}/upload"
 # el SFTP user (uid 1001) tiene que poder ESCRIBIR aca: es el unico
 # directorio del chroot donde el cliente sube su codigo. app:app 775 no
@@ -71,6 +73,20 @@ mkdir -p "${SFTP_CHROOT}/upload"
 chown "${SFTP_USER}:app" "${SFTP_CHROOT}/upload" 2>/dev/null || true
 chmod 700 "${SFTP_CHROOT}/upload" 2>/dev/null || true
 log "upload: ${SFTP_USER}:app 700 (solo el usuario SFTP escribe)"
+
+# --- directorio privado: SFTP si, web no ----------------------------------
+# Hermano de /upload dentro del chroot: el cliente lo ve por SFTP como
+# /private, pero el root de nginx es /upload y nunca lo sirve.
+# mkdir -p y NUNCA rm -rf (misma razon que arriba: el borrado pegaria en
+# el disco real del host a traves del bind mount).
+# Numericos, no nombres: el usuario SFTP se crea mas abajo y el chown por
+# nombre fallaria en silencio.
+PRIVATEDIR="${SFTP_CHROOT}/private"
+mkdir -p "${PRIVATEDIR}"
+chown "${SFTP_UID}:${SFTP_GID}" "${PRIVATEDIR}" 2>/dev/null || true
+# 700 y dueño el usuario SFTP: ni nginx ni php-fpm (usuario app) entran.
+chmod 700 "${PRIVATEDIR}" 2>/dev/null || true
+log "private: uid=${SFTP_UID} 700 (solo SFTP, la web no lo ve)"
 
 # --- internal-sftp tiene que existir DENTRO del chroot --------------------
 # "subsystem request failed on channel 0": la auth funciona pero internal-sftp
