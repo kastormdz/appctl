@@ -474,7 +474,7 @@ el mismo servidor, sí.
 | `appctl <proyecto> psql [-U usuario] [-d base]` | `psql` ya conectado, sin pedir password |
 | `appctl <proyecto> restart` | reinicia los servicios |
 | `appctl <proyecto> rotate <sftp\|db\|mig\|ro>` | cambia una credencial |
-| `appctl <proyecto> limits [--memory M] [--cpus N] [--save]` | ajusta RAM y CPU en caliente |
+| `appctl <proyecto> limits [--service app\|db] [--memory M] [--db-memory M] [--cpus N] [--save]` | ajusta RAM y CPU en caliente, por servicio o los dos |
 | `appctl <proyecto> upgrade [-y] [--php VER] [--runtime R]` | re-aplica el compose del template |
 | `appctl clone <origen> <nuevo> [--port N] [--php VER]` | copia un proyecto con sus datos |
 | `appctl <proyecto> destroy [--keep-data] [--yes]` | destruye el proyecto |

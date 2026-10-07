@@ -809,6 +809,70 @@ def cmd_list(args) -> int:
     return 0
 
 
+def _limits_targets(service: str | None) -> list[str]:
+    """A que servicios apunta limits. Puro: sin docker, testeable.
+
+    Sin --service son los dos (es lo de siempre). Con --service, solo ese.
+    """
+    if service in ("app", "db"):
+        return [service]
+    return ["app", "db"]
+
+
+def _limits_plan(service, memory, db_memory, cpus, swap, save):
+    """Valida los flags de limits y devuelve el plan. Puro: sin docker.
+
+    Devuelve (targets, hot, persist): hot es {svc: {"memory","cpus","swap"}}
+    con los valores crudos y persist es {KEY_DEL_ENV: valor}.
+    Levanta ValueError con el mensaje para el admin si no cierra.
+    """
+    targets = _limits_targets(service)
+    if db_memory and service == "app":
+        raise ValueError("--db-memory es de la db y pediste --service app")
+    if memory and db_memory and service == "db":
+        raise ValueError("ambiguo para la db: --memory y --db-memory a la vez")
+    if db_memory and not save:
+        raise ValueError("--db-memory no aplica en caliente: agregale --save "
+                         "o usa --service db --memory para el cambio en caliente")
+    for etiqueta, valor in (("--memory", memory), ("--db-memory", db_memory),
+                            ("--swap", swap)):
+        if valor and not _to_bytes(valor):
+            raise ValueError(f"no entiendo el valor de memoria: {valor}\n"
+                             f"  formatos: 512M, 2G, 1.5G")
+    if cpus is not None and cpus <= 0:
+        raise ValueError(f"no entiendo el valor de cpu: {cpus}\n"
+                         f"  formatos: 1, 1.5, 0.5")
+    hot: dict = {}
+    for svc in targets:
+        h: dict = {}
+        if memory:
+            h["memory"] = memory
+        if cpus is not None:
+            h["cpus"] = cpus
+        if swap:
+            h["swap"] = swap
+        if h:
+            hot[svc] = h
+    persist: dict = {}
+    if save:
+        if "app" in targets:
+            if memory:
+                persist["APP_MEMORY"] = memory
+            if cpus is not None:
+                persist["APP_CPUS"] = str(cpus)
+        if "db" in targets:
+            if db_memory:
+                persist["DB_MEMORY"] = db_memory
+            elif memory and service == "db":
+                persist["DB_MEMORY"] = memory
+            if cpus is not None:
+                persist["DB_CPUS"] = str(cpus)
+    if not hot and not persist:
+        raise ValueError("decime que cambiar: --memory, --cpus, --swap "
+                         "o --db-memory con --save")
+    return targets, hot, persist
+
+
 def cmd_limits(args) -> int:
     """Cambia los limites de CPU/RAM de un proyecto, EN CALIENTE.
 
@@ -830,54 +894,58 @@ def cmd_limits(args) -> int:
     if not (pdir / "compose.yaml").exists():
         die(f"no existe el proyecto {project}")
 
+    # Toda la validacion ANTES de tocar docker: si la combinacion no cierra,
+    # no se aplica nada a ningun contenedor.
+    try:
+        targets, hot, persist = _limits_plan(
+            args.service, args.memory, args.db_memory, args.cpus,
+            args.swap, args.save)
+    except ValueError as e:
+        die(str(e))
+
     cambios = []
-    for svc in ("app", "db"):
+    for svc in targets:
+        h = hot.get(svc)
+        if not h:
+            continue
         cont = f"{project}_{svc}"
         cmd = ["docker", "update"]
-        if args.memory:
-            mem = _to_bytes(args.memory)
-            if not mem:
-                die(f"no entiendo el valor de memoria: {args.memory}\n"
-                    f"  formatos: 512M, 2G, 1.5G")
-            # memory-swap = 2x memory: permite swap, que en un server con
-            # RAM justa es la diferencia entre "se frena" y "muere".
-            swap = _to_bytes(args.swap) if args.swap else mem * 2
+        if h.get("memory"):
+            mem = _to_bytes(h["memory"])
+            swap = _to_bytes(h["swap"]) if h.get("swap") else mem * 2
             cmd += [f"--memory={mem}", f"--memory-swap={swap}"]
-        if args.cpus:
-            cmd += [f"--cpus={args.cpus}"]
-        if len(cmd) == 1:
-            continue
+        if h.get("cpus") is not None:
+            cmd += [f"--cpus={h['cpus']}"]
         r = subprocess.run(cmd + [cont], capture_output=True, text=True)
         if r.returncode != 0:
             die(f"no se pudo actualizar {cont}: "
                 f"{(r.stderr or r.stdout).strip()[:160]}")
         cambios.append(svc)
 
-    if not cambios:
-        die("decime que cambiar: --memory, --cpus o --swap")
-
     # mostrar el estado real, leido de docker (no del compose)
-    print(f"aplicado en caliente a: {', '.join(cambios)}")
-    for svc in cambios:
-        cont = f"{project}_{svc}"
-        r = sh(f"docker inspect --format '{{{{.HostConfig.Memory}}}} "
-               f"{{{{.HostConfig.NanoCpus}}}}' {cont}")
-        mem, nano = r.stdout.split()[:2] if len(r.stdout.split()) >= 2 else ("?", "?")
-        print(f"  {cont:<20} mem={int(mem)//1024//1024}M  "
-              f"cpu={int(nano)/1e9:.2f}")
+    if cambios:
+        print(f"aplicado en caliente a: {', '.join(cambios)}")
+        for svc in cambios:
+            cont = f"{project}_{svc}"
+            r = sh(f"docker inspect --format '{{{{.HostConfig.Memory}}}} "
+                   f"{{{{.HostConfig.NanoCpus}}}}' {cont}")
+            mem, nano = r.stdout.split()[:2] if len(r.stdout.split()) >= 2 else ("?", "?")
+            print(f"  {cont:<20} mem={int(mem)//1024//1024}M  "
+                  f"cpu={int(nano)/1e9:.2f}")
+    else:
+        print("sin cambios en caliente (solo persistencia, abajo)")
 
     if not args.save:
         print("\nATENCION: esto NO se guardo en el compose.")
-        print("  un `appctl %s restart` lo vuelve al valor del compose." % project)
+        print("  un recreate lo vuelve al valor del compose.")
         print("  para que sea permanente: appctl %s limits --save ..." % project)
         return 0
 
-    # --save: al .env, que es lo que el compose lee
+    # --save: al .env, que es lo que el compose lee. Solo las claves del
+    # servicio apuntado: lo demas queda como estaba.
     env_path = pdir / ".env"
     env_ = load_env(project)
-    if args.memory:
-        env_["APP_MEMORY" if cambios == ["app"] else "APP_MEMORY"] = args.memory
-        env_["DB_MEMORY"] = args.db_memory or env_.get("DB_MEMORY", "512M")
+    env_.update(persist)
     txt = env_path.read_text()
     for k in ("APP_MEMORY", "DB_MEMORY", "APP_CPUS", "DB_CPUS"):
         if k in env_:
@@ -889,7 +957,8 @@ def cmd_limits(args) -> int:
     env_path.write_text(txt)
     os.chmod(env_path, 0o600)
     print(f"\nguardado en {env_path.name}")
-    print(f"  proximo restart: los limites quedan {args.memory or '(sin cambio)'}")
+    for k, v in persist.items():
+        print(f"  {k}={v}")
     return 0
 
 
@@ -2498,12 +2567,32 @@ def main() -> int:
                    help="clonar aunque no se pueda dumpear la base")
     p.set_defaults(func=cmd_clone)
 
-    p = sub.add_parser("limits", help="cambiar RAM/CPU en caliente")
+    p = sub.add_parser("limits", help="cambiar RAM/CPU en caliente",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog=textwrap.dedent("""\
+                           ejemplos:
+                             appctl acme limits --memory 2G
+                               # caliente a app Y db (es lo de siempre)
+                             appctl acme limits --service app --memory 2G
+                               # solo app, la db ni se toca
+                             appctl acme limits --service db --memory 1G --save
+                               # db en caliente y queda en el .env
+                             appctl acme limits --memory 2G --db-memory 1G --save
+                               # caliente parejo, persistente distinto
+
+                           sin --save es temporal: se pierde al recrear.
+                           --swap es solo caliente (el compose no lo guarda).
+                           --db-memory exige --save; en caliente se usa --memory
+                           con --service.
+                           """))
     p.add_argument("proyecto")
-    p.add_argument("--memory", help="ej: 2G")
-    p.add_argument("--db-memory", help="ej: 1G (solo con --save)")
-    p.add_argument("--swap", help="ej: 3G (default: 2x memoria)")
-    p.add_argument("--cpus", type=float, help="ej: 1.5")
+    p.add_argument("--service", choices=["app", "db"],
+                   help="a que servicio: app o db (default: los dos)")
+    p.add_argument("--memory", help="ej: 2G (al servicio apuntado, o a los dos)")
+    p.add_argument("--db-memory", help="ej: 1G (solo persistente: exige --save)")
+    p.add_argument("--swap", help="ej: 3G (default: 2x memoria, solo caliente)")
+    p.add_argument("--cpus", type=float,
+                   help="ej: 1.5 (al servicio apuntado, o a los dos)")
     p.add_argument("--save", action="store_true",
                    help="persistir en el .env (si no, es temporal)")
     p.set_defaults(func=cmd_limits)

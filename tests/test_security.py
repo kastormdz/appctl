@@ -242,6 +242,74 @@ def main() -> int:
           "residuo")
     shutil.rmtree(site, ignore_errors=True)
 
+    # --- limits --service: un valor por servicio ---
+    # Antes --memory iba a los dos contenedores siempre; no habia forma de
+    # dejar app en 2G y db en 1G en caliente. El plan vive en _limits_plan
+    # (puro, sin docker) y cmd_limits solo lo ejecuta.
+    print("=== limits por servicio ===")
+    site = Path(tempfile.mkdtemp())
+    check(appctl._limits_targets(None) == ["app", "db"],
+          "sin --service apunta a los dos (lo de siempre)")
+    check(appctl._limits_targets("app") == ["app"],
+          "--service app apunta solo a app")
+    check(appctl._limits_targets("db") == ["db"],
+          "--service db apunta solo a db")
+    t, hot, persist = appctl._limits_plan(None, "2G", None, None, None, False)
+    check(t == ["app", "db"] and set(hot) == {"app", "db"}
+          and hot["app"]["memory"] == "2G" and hot["db"]["memory"] == "2G",
+          "sin --service el mismo valor va a los dos (compatibilidad)")
+    t, hot, persist = appctl._limits_plan("app", "2G", None, None, None, False)
+    check(t == ["app"] and set(hot) == {"app"},
+          "--service app no toca la db")
+    t, hot, persist = appctl._limits_plan("db", "1G", None, 0.5, None, True)
+    check(t == ["db"] and set(hot) == {"db"}
+          and persist.get("DB_MEMORY") == "1G"
+          and persist.get("DB_CPUS") == "0.5"
+          and "APP_MEMORY" not in persist and "APP_CPUS" not in persist,
+          "--service db con --save persiste solo claves DB_*")
+    t, hot, persist = appctl._limits_plan("app", "2G", None, 1.5, None, True)
+    check(persist.get("APP_MEMORY") == "2G"
+          and persist.get("APP_CPUS") == "1.5"
+          and "DB_MEMORY" not in persist and "DB_CPUS" not in persist,
+          "--service app con --save persiste solo claves APP_*")
+    t, hot, persist = appctl._limits_plan(None, "2G", "1G", None, None, True)
+    check(set(hot) == {"app", "db"}
+          and persist.get("APP_MEMORY") == "2G"
+          and persist.get("DB_MEMORY") == "1G",
+          "--memory + --db-memory con --save: caliente parejo, persistente distinto")
+    for args, por_que in (
+            ((None, None, "1G", None, None, False),
+             "--db-memory sin --save se ignoraba en silencio"),
+            (("app", None, "1G", None, None, True),
+             "--db-memory con --service app es contradiccion"),
+            (("db", "2G", "1G", None, None, True),
+             "--memory y --db-memory a la vez para db es ambiguo"),
+            ((None, None, None, None, None, False),
+             "sin nada que cambiar no avisa"),
+            ((None, "ZZZ", None, None, None, False),
+             "un valor de memoria invalido no avisa"),
+            ((None, None, None, 0, None, False),
+             "cpu 0 no avisa")):
+        try:
+            appctl._limits_plan(*args)
+            check(False, f"no falla cuando deberia: {por_que}")
+        except ValueError:
+            check(True, f"falla como debe: {por_que}")
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "bin/appctl"), "acme", "limits",
+         "--service", "foo"],
+        env=dict(os.environ, APPCTL_PROJECTS=str(site / "proyectos"),
+                 APPCTL_HOME=str(site / "home")),
+        capture_output=True, text=True)
+    check(r.returncode != 0,
+          "--service con valor invalido no falla")
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "bin/appctl"), "limits", "--help"],
+        capture_output=True, text=True)
+    check("--service" in r.stdout and "appctl acme limits --service" in r.stdout,
+          "la ayuda de limits no documenta --service con ejemplos")
+    shutil.rmtree(site, ignore_errors=True)
+
     print("todo bien")
     return 0
 
