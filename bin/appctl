@@ -465,7 +465,8 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
                    pg_major: str, api_key: str,
                    want_cron: bool = False,
                    app_memory: str = "", db_memory: str = "",
-                   db_publish: int | None = None) -> None:
+                   db_publish: int | None = None,
+                   db_publish_bind: str = "127.0.0.1") -> None:
     """Escribe el directorio del proyecto. Todo bajo pdir: nada de volumes
     nombrados, para que destroy --keep-data sea borrar una carpeta."""
     # exist_ok=True: el chequeo de "ya existe" ya paso arriba, con mensaje
@@ -540,7 +541,11 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
     # state.json. Si el puerto viviera solo en el compose renderizado, el
     # proximo re-render (upgrade) lo borraria sin decir nada: la base
     # quedaria cerrada y el cliente creyendo que sigue abierta.
-    "__DB_PUBLISH__": _render_publish(db_publish, stack) if db_publish else "",
+    # El BIND tambien viene del state: si el proyecto se publico en 0.0.0.0
+    # (porque un cliente entra desde la red), un render con el default
+    # 127.0.0.1 le corta el acceso. El puerto y el bind viajan juntos.
+    "__DB_PUBLISH__": (_render_publish(db_publish, stack, db_publish_bind)
+                       if db_publish else ""),
     "__APP_IMAGE__": image_tag(stack, tags.get(runtime_of(stack),
                                                  DEFAULT_TAGS[runtime_of(stack)])),
 
@@ -1433,6 +1438,17 @@ def cmd_upgrade(args) -> int:
         components.add("cron")
 
     before = (pdir / "compose.yaml").read_text()
+    # Los proyectos expuestos con la version vieja no tienen la clave en el
+    # state: el puerto esta en el compose. Se respeta y se anota (migracion
+    # en la lectura), asi el proximo render ya no depende del compose.
+    _anotado = False
+    if not st.get("db_published_port"):
+        _ya = _publish_desde_compose(before)
+        if _ya:
+            st["db_published_bind"], st["db_published_port"] = _ya
+            _anotado = True
+            print(f"  la db ya estaba publicada en {_ya[0]}:{_ya[1]}: "
+                  f"queda anotado en el state")
 
     api_key = env.get("API_TOKEN") or st.get("api_key") or sec.token(24)
     names = {k: env[k] for k in
@@ -1449,7 +1465,9 @@ def cmd_upgrade(args) -> int:
                    names, pw, int(st["app_port"]), st.get("sftp_port"),
                    host=st["host"], pg_major=pg_major, api_key=api_key,
                    want_cron="cron" in components,
-                   db_publish=st.get("db_published_port"))
+                   db_publish=st.get("db_published_port"),
+                   db_publish_bind=(st.get("db_published_bind")
+                                    or "127.0.0.1"))
     after = (stage / "compose.yaml").read_text()
 
     if before == after and not forzar:
@@ -1462,6 +1480,12 @@ def cmd_upgrade(args) -> int:
         if _image_exists(img):
             print(f"el compose ya estaba al dia y la imagen esta "
                   f"({img.split(':')[-1]})")
+            if _anotado and args.yes:
+                # Migracion en la lectura: el puerto publicado se descubrio
+                # en el compose y hay que ANOTARLO. Solo con --yes: sin el,
+                # esto es una vista previa y no escribe nada.
+                save_state(project, st)
+                print("  (el state quedo al dia)")
             return 0
         print(f"el compose esta igual pero la IMAGEN cambio:\n"
               f"  en el compose: {img}\n"
@@ -1536,6 +1560,12 @@ def cmd_upgrade(args) -> int:
         if _image_exists(img):
             print(f"el compose ya estaba al dia y la imagen esta "
                   f"({img.split(':')[-1]})")
+            if _anotado and args.yes:
+                # Migracion en la lectura: el puerto publicado se descubrio
+                # en el compose y hay que ANOTARLO. Solo con --yes: sin el,
+                # esto es una vista previa y no escribe nada.
+                save_state(project, st)
+                print("  (el state quedo al dia)")
             return 0
         print(f"el compose esta igual pero la IMAGEN cambio:\n"
               f"  en el compose: {img}\n"
@@ -2247,6 +2277,35 @@ def _add_egress_to_db(compose: str) -> str:
         out.append(l)
         i += 1
     return "".join(out)
+
+
+def _publish_desde_compose(texto: str) -> tuple[str, int] | None:
+    """El (bind, puerto) publicado que YA tiene el compose, o None.
+
+    Existe por los proyectos que se expusieron con la version vieja, que no
+    anotaba nada en state.json: para el render, "no hay clave en el state"
+    NO significa "no esta publicado". Si no se mira el compose, el primer
+    `upgrade` con la version nueva cierra la base de un cliente que la esta
+    usando, sin decir nada. La verdad de lo que esta publicado esta en el
+    compose, asi que se lee de ahi.
+    """
+    lineas = texto.splitlines()
+    en_db = False
+    for i, l in enumerate(lineas):
+        if l == "  db:":
+            en_db = True
+            continue
+        if en_db and l and not l.startswith(" "):
+            break
+        if en_db and l.strip() == "ports:":
+            for sig in lineas[i + 1:]:
+                s = sig.strip()
+                if not s.startswith("- "):
+                    break
+                m = re.match(r'-\s*"?([0-9.]+):(\d+):(\d+)"?', s)
+                if m:
+                    return m.group(1), int(m.group(2))
+    return None
 
 
 def _set_publish(texto: str, port: int | None, stack: str = "php-postgres-sftp",

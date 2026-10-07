@@ -24,6 +24,7 @@ upgrade real. Eso es E2E con docker (create + expose + upgrade + nc).
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import re
 import shutil
 import sys
@@ -189,12 +190,71 @@ def main() -> int:
                       f"{etiqueta}: el db no tiene ports:")
                 check("- egress" not in db,
                       f"{etiqueta}: el db no tiene egress de mas")
+        # el BIND viaja con el puerto: un render que lo ignore cambia 0.0.0.0
+        # por 127.0.0.1 y le corta el acceso al cliente que entra de la red
+        d2 = tmp / "bind"
+        appctl.render_project(d2, stack_dir, "php-postgres-sftp", "t", comps,
+                              {"php": "8.5-fpm-alpine"}, names, pw, 18001, 12201,
+                              host="t.local", pg_major="18", api_key="k",
+                              db_publish=15432, db_publish_bind="0.0.0.0")
+        db2 = bloque_db((d2 / "compose.yaml").read_text(encoding="utf-8"))
+        check('"0.0.0.0:15432:5432"' in db2,
+              "el render respeta el bind del state (0.0.0.0, no el default)")
+        check('"127.0.0.1:15432:5432"' not in db2,
+              "y NO lo pisa con 127.0.0.1")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # ---- 4b. el puerto que YA esta en el compose se respeta (y se anota) ----
+    print("\n=== 4b. compatibilidad: proyectos expuestos con la version vieja ===")
+    con_puerto = (
+        "services:\n"
+        "  app:\n"
+        "    image: x\n"
+        "    ports:\n"
+        "      - \"8001:80\"\n"
+        "      - \"2221:22\"\n"
+        "  db:\n"
+        "    image: postgres\n"
+        "    ports:\n"
+        "      - \"0.0.0.0:5434:5432\"\n"
+        "    networks:\n"
+        "      - data\n"
+        "      - egress\n"
+        "  data:\n"
+        "    driver: bridge\n")
+    sin_puerto = (
+        "services:\n"
+        "  app:\n"
+        "    image: x\n"
+        "    ports:\n"
+        "      - \"8001:80\"\n"
+        "  db:\n"
+        "    image: postgres\n"
+        "    networks:\n"
+        "      - data\n")
+    leido = appctl._publish_desde_compose(con_puerto)
+    check(leido == ("0.0.0.0", 5434),
+          f"lee el puerto publicado del compose (0.0.0.0:5434) -> {leido}")
+    check(appctl._publish_desde_compose(sin_puerto) is None,
+          "sin ports: en el db, no inventa un puerto")
+    check(appctl._publish_desde_compose(sin_puerto) is None,
+          "NO confunde el ports: de la app con el de la db")
+    check(appctl._publish_desde_compose(
+              con_puerto.replace('0.0.0.0:5434', '127.0.0.1:15932'))
+          == ("127.0.0.1", 15932),
+          "lee tambien el bind, no solo el puerto")
+    src_up = inspect.getsource(appctl.cmd_upgrade)
+    check("_publish_desde_compose(before)" in src_up and "db_published_bind" in src_up,
+          "upgrade lo lee del compose y lo ANOTA en el state (no lo cierra)")
+    check("db_publish_bind=" in src_up,
+          "upgrade le pasa el bind al render (no solo el puerto)")
+    check("save_state(project, st)" in src_up and "_anotado" in src_up,
+          "el puerto descubierto en el compose se PERSISTE con --yes")
+
+
     # ---- 5. upgrade: el puerto del state llega al render ----
     print("\n=== 5. upgrade no pierde el puerto ===")
-    import inspect
     src = inspect.getsource(appctl.cmd_upgrade)
     check('db_publish=st.get("db_published_port")' in src,
           "cmd_upgrade pasa el puerto del state al render")
