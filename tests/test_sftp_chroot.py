@@ -2,9 +2,10 @@
 """Chroot minimalista del SFTP: gate.
 
 QUE VERIFICA: en los ARCHIVOS de los stacks PHP (entrypoint, sshd_config)
-que el chroot que ve el cliente trae solo /upload y /private (+ /dev,
-tecnico) y ningun andamiaje de binarios. /tmp no se crea mas: era
-pasajero; en proyectos viejos se quita solo si esta vacio (rmdir).
+que el chroot que ve el cliente trae solo /upload y /private, nada mas:
+ni andamiaje de binarios, ni /dev (medido: internal-sftp en proceso anda
+sin /dev/null), ni /tmp (no se crea mas; en proyectos viejos se quita solo
+si esta vacio, con rmdir).
 
 QUE NO VERIFICA: el listado real por SFTP ni que el login siga andando
 despues del cambio. Eso se prueba con login SFTP contra un contenedor
@@ -26,8 +27,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PHP_STACKS = ("php-postgres-sftp", "php-mysql-sftp")
 # Andamiaje que no puede existir mas en el chroot: ni creado ni limpiado
-# con comodines. upload/private/tmp/dev son del cliente o tecnicos.
-ANDAMIAJE = ("bin", "usr", "lib", "etc", "proc")
+# con comodines. upload/private son del cliente y no se tocan jamas.
+ANDAMIAJE = ("bin", "usr", "lib", "etc", "proc", "dev")
 
 
 def check(cond: bool, msg: str) -> None:
@@ -60,7 +61,7 @@ def main() -> int:
         ep = entrypoints[stack]
         check("SFTP_BIN" not in ep,
               f"{stack}: todavia resuelve el binario sftp-server")
-        for d in ("usr", "lib", "bin"):
+        for d in ("usr", "lib", "bin", "dev"):
             check(f"SFTP_CHROOT}}/{d}\"" not in ep,
                   f"{stack}: todavia crea {d}/ en el chroot")
         check('SFTP_CHROOT}/etc"' not in ep,
@@ -76,16 +77,17 @@ def main() -> int:
     print("\n=== limpieza: lista cerrada, sin comodines ===")
     for stack in PHP_STACKS:
         ep = entrypoints[stack]
-        check("for _rm in bin usr lib etc proc" in ep,
+        check("for _rm in bin usr lib etc proc dev" in ep,
               f"{stack}: la limpieza no lista el andamiaje explicito")
         check("${SFTP_CHROOT:?}" in ep,
               f"{stack}: el rm de limpieza va sin guardia :?")
-        for cliente in ("upload", "private", "tmp", "dev"):
+        # upload/private/tmp no se tocan jamas (/dev es andamiaje: se borra).
+        for cliente in ("upload", "private", "tmp"):
             check(f"_rm in" not in ep or cliente not in
                   ep.split("for _rm in")[1].split("\n")[0],
                   f"{stack}: {cliente}/ cayo en la lista de borrado")
-        check('mkdir -p "${SFTP_CHROOT}/dev"' in ep,
-              f"{stack}: no crea /dev del chroot")
+        check('mkdir -p "${SFTP_CHROOT}/dev"' not in ep,
+              f"{stack}: todavia crea /dev (medido que no hace falta)")
         check('SFTP_CHROOT}/tmp"' not in ep.replace('rmdir "${SFTP_CHROOT}/tmp"', ""),
               f"{stack}: todavia crea /tmp en el chroot (es pasajero, fuera)")
         check('rmdir "${SFTP_CHROOT}/tmp"' in ep,
@@ -101,8 +103,8 @@ def main() -> int:
               f"{stack}: falta el ForceCommand que para al cliente en /upload")
         check("Subsystem sftp internal-sftp" in ep,
               f"{stack}: no verifica el subsystem en proceso")
-        check("mknod" in ep,
-              f"{stack}: no crea los device nodes (/dev/null)")
+        check("mknod" not in ep,
+              f"{stack}: todavia crea device nodes (medidos innecesarios)")
         check('rm -rf "${SFTP_CHROOT}/upload"' not in ep,
               f"{stack}: volvio el rm -rf sobre upload")
 

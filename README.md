@@ -610,8 +610,7 @@ lo niega explícito y `disable_symlinks on`, que frena el truco del symlink
 nginx ni php-fpm entran. Desde PHP se llega por filesystem con la ruta
 `/srv/sftp/private`, si los permisos lo permiten.
 
-Por SFTP el cliente ve solo `/upload` y `/private` (más `/dev`,
-técnico: lo necesita el SFTP en proceso). El SFTP corre con `ForceCommand
+Por SFTP el cliente ve solo `/upload` y `/private`, nada más. El SFTP corre con `ForceCommand
 internal-sftp` dentro del propio sshd, así que el chroot no lleva binarios:
 nada de `bin/`, `etc/`, `lib/` ni `usr/` a la vista. `/tmp` no se crea más
 (era pasajero); en proyectos viejos se quita solo si está vacío — si el

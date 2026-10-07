@@ -9,7 +9,7 @@ HostKey /etc/ssh/ssh_host_ed25519_key
 # El subsystem SFTP, en proceso (internal-sftp): sin esta linea sshd no sabe
 # que responder cuando el cliente pide sftp ("subsystem request failed on
 # channel 0"). Al correr dentro del sshd no necesita ningun binario en el
-# chroot: por eso el chroot solo trae /upload, /private y /dev.
+# chroot: por eso el chroot trae solo /upload y /private, nada mas.
 # -d /upload va en el ForceCommand de abajo: el cliente entra directo al
 # webroot, con /private al lado.
 Subsystem sftp internal-sftp

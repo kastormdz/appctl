@@ -610,8 +610,7 @@ nginx roots at `/upload`, so it never serves it; on top of that an explicit
 700: neither nginx nor php-fpm gets in. From PHP it is reachable over the
 filesystem at `/srv/sftp/private`, if permissions allow.
 
-Over SFTP the client only sees `/upload` and `/private` (plus `/dev`,
-technical: in-process SFTP needs it). SFTP runs with `ForceCommand
+Over SFTP the client only sees `/upload` and `/private`, nothing else. SFTP runs with `ForceCommand
 internal-sftp` inside sshd itself, so the chroot carries no binaries: no
 `bin/`, `etc/`, `lib/` or `usr/` in view. `/tmp` is no longer created (it
 was scratch); on old projects it is removed only if empty — if the client

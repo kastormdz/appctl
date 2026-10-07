@@ -97,32 +97,25 @@ log "private: uid=${SFTP_UID} 700 (solo SFTP, la web no lo ve)"
 # necesita ningun binario dentro del chroot. El andamiaje que habia aca
 # (sftp-server + loader + .so + shells + /etc/passwd) era peso muerto de la
 # epoca del subsystem externo, y encima ensuciaba la vista del cliente con
-# bin/, etc/, lib/, proc/ y usr/. Lo visible queda: /upload y /private
-# (+ /dev, tecnico: internal-sftp aborta sin /dev/null). /tmp no se crea
-# mas; si un proyecto viejo lo tiene vacio, se quita solo (ver abajo).
+# bin/, etc/, lib/, proc/, dev/ y usr/. Lo visible queda: /upload y /private,
+# nada mas. /tmp no se crea mas; si un proyecto viejo lo tiene vacio, se
+# quita solo (ver abajo).
 # Limpieza de proyectos viejos: se borran SOLO esos directorios de
 # andamiaje, con lista explicita y guardia :? (nunca comodines, nunca las
-# dirs del cliente). Eran root:root y el cliente jamas pudo escribir ahi,
-# asi que no hay datos que perder.
-for _rm in bin usr lib etc proc; do
+# dirs del cliente). Eran root:root y el cliente jamas pudo escribir ahi
+# (ni siquiera en /dev: era root:root 755), asi que no hay datos que perder.
+for _rm in bin usr lib etc proc dev; do
     if [ -e "${SFTP_CHROOT}/${_rm}" ]; then
         rm -rf "${SFTP_CHROOT:?}/${_rm}" 2>/dev/null || true
         log "chroot: ${_rm}/ de andamiaje eliminado"
     fi
 done
 rm -f "${SFTP_CHROOT}/etc_passwd_tmp" 2>/dev/null || true
-# --- device nodes minimos (sin tmp) ---------------------------------------
-# Sin /dev/null, internal-sftp aborta ("Couldn't open /dev/null") y el
-# cliente ve "subsystem request failed on channel 0".
-# /tmp NO se crea: es pasajero y no tiene nada que hacer a la vista del
-# cliente. En proyectos viejos se quita solo si esta vacio (rmdir, nunca
-# rm -rf: si el cliente dejo archivos ahi, el directorio se queda).
-mkdir -p "${SFTP_CHROOT}/dev"
+# --- sin /dev: medido que no hace falta ----------------------------------
+# El comentario viejo decia que internal-sftp abortaba sin /dev/null. Era
+# de la epoca del binario externo: con internal-sftp en proceso se probo
+# login + listado + subida sin /dev y todo anda. Menos ruido para el cliente.
 rmdir "${SFTP_CHROOT}/tmp" 2>/dev/null || true
-for dev in "null c 1 3 666" "zero c 1 5 666" "random c 1 8 666" "urandom c 1 9 666"; do
-    set -- ${dev}
-    [ -e "${SFTP_CHROOT}/dev/$1" ] || mknod -m "$5" "${SFTP_CHROOT}/dev/$1" "$2" "$3" "$4" 2>/dev/null || true
-done
 # el subsystem tiene que estar declarado en proceso. Sin la linea
 # "Subsystem sftp internal-sftp", si algun dia se saca el ForceCommand el
 # cliente recibe "subsystem request failed on channel 0".
