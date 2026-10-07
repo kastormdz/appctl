@@ -88,93 +88,44 @@ chown "${SFTP_UID}:${SFTP_GID}" "${PRIVATEDIR}" 2>/dev/null || true
 chmod 700 "${PRIVATEDIR}" 2>/dev/null || true
 log "private: uid=${SFTP_UID} 700 (solo SFTP, la web no lo ve)"
 
-# --- internal-sftp tiene que existir DENTRO del chroot --------------------
-# "subsystem request failed on channel 0": la auth funciona pero internal-sftp
-# no esta. En Alpine el binario esta en /usr/lib/ssh/sftp-server, y el
-# chroot no lo tiene. Hay que ponerlo ahi y las libs que usa.
-SFTP_BIN=$(command -v internal-sftp || true)
-if [ -z "${SFTP_BIN}" ] && [ -x /usr/lib/ssh/sftp-server ]; then
-    SFTP_BIN=/usr/lib/ssh/sftp-server
+# --- chroot minimalista: solo lo que el cliente debe ver -------------------
+# El SFTP corre con ForceCommand internal-sftp, EN el proceso de sshd: no
+# necesita ningun binario dentro del chroot. El andamiaje que habia aca
+# (sftp-server + loader + .so + shells + /etc/passwd) era peso muerto de la
+# epoca del subsystem externo, y encima ensuciaba la vista del cliente con
+# bin/, etc/, lib/, proc/ y usr/. Lo visible queda: /upload y /private
+# (+ /dev, tecnico: internal-sftp aborta sin /dev/null). /tmp no se crea
+# mas; si un proyecto viejo lo tiene vacio, se quita solo (ver abajo).
+# Limpieza de proyectos viejos: se borran SOLO esos directorios de
+# andamiaje, con lista explicita y guardia :? (nunca comodines, nunca las
+# dirs del cliente). Eran root:root y el cliente jamas pudo escribir ahi,
+# asi que no hay datos que perder.
+for _rm in bin usr lib etc proc; do
+    if [ -e "${SFTP_CHROOT}/${_rm}" ]; then
+        rm -rf "${SFTP_CHROOT:?}/${_rm}" 2>/dev/null || true
+        log "chroot: ${_rm}/ de andamiaje eliminado"
+    fi
+done
+rm -f "${SFTP_CHROOT}/etc_passwd_tmp" 2>/dev/null || true
+# --- device nodes minimos (sin tmp) ---------------------------------------
+# Sin /dev/null, internal-sftp aborta ("Couldn't open /dev/null") y el
+# cliente ve "subsystem request failed on channel 0".
+# /tmp NO se crea: es pasajero y no tiene nada que hacer a la vista del
+# cliente. En proyectos viejos se quita solo si esta vacio (rmdir, nunca
+# rm -rf: si el cliente dejo archivos ahi, el directorio se queda).
+mkdir -p "${SFTP_CHROOT}/dev"
+rmdir "${SFTP_CHROOT}/tmp" 2>/dev/null || true
+for dev in "null c 1 3 666" "zero c 1 5 666" "random c 1 8 666" "urandom c 1 9 666"; do
+    set -- ${dev}
+    [ -e "${SFTP_CHROOT}/dev/$1" ] || mknod -m "$5" "${SFTP_CHROOT}/dev/$1" "$2" "$3" "$4" 2>/dev/null || true
+done
+# el subsystem tiene que estar declarado en proceso. Sin la linea
+# "Subsystem sftp internal-sftp", si algun dia se saca el ForceCommand el
+# cliente recibe "subsystem request failed on channel 0".
+if ! grep -q "^Subsystem sftp internal-sftp" /etc/ssh/sshd_config; then
+    log "ERROR: sshd_config no trae 'Subsystem sftp internal-sftp'"
 fi
-if [ -n "${SFTP_BIN}" ]; then
-    mkdir -p "${SFTP_CHROOT}/usr/lib/ssh" "${SFTP_CHROOT}/usr/bin"
-    cp -a "${SFTP_BIN}" "${SFTP_CHROOT}/usr/lib/ssh/sftp-server"
-    chmod 755 "${SFTP_CHROOT}/usr/lib/ssh/sftp-server" 2>/dev/null || true
-    # Musl: el loader y las libs van en /lib. Si falta el loader, el binario
-    # no arranca y el error del cliente es "subsystem request failed".
-    if [ -f /lib/ld-musl-x86_64.so.1 ]; then
-        mkdir -p "${SFTP_CHROOT}/lib"
-        cp -a /lib/ld-musl-x86_64.so.1 "${SFTP_CHROOT}/lib/" 2>/dev/null || true
-    fi
-    # cada .so que pide, a SU path exacto (no a /lib generico: con musl el
-    # loader los busca donde el ELF dice, no donde nosotros los pongamos)
-    ldd "${SFTP_BIN}" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u | while read -r lib; do
-        [ -f "${lib}" ] || continue
-        mkdir -p "${SFTP_CHROOT}$(dirname "${lib}")"
-        cp -aL "${lib}" "${SFTP_CHROOT}${lib}" 2>/dev/null || true
-    done
-    # y el interprete de shells, por si el cliente lo pide
-    for b in /bin/sh /bin/ls /bin/cat /bin/mkdir; do
-        [ -f "${b}" ] || continue
-        mkdir -p "${SFTP_CHROOT}$(dirname "${b}")"
-        cp -aL "${b}" "${SFTP_CHROOT}${b}" 2>/dev/null || true
-        for lib in $(ldd "${b}" 2>/dev/null | grep -oE '/[^ ]+\.so[^ ]*' | sort -u); do
-            [ -f "${lib}" ] || continue
-            mkdir -p "${SFTP_CHROOT}$(dirname "${lib}")"
-            cp -aL "${lib}" "${SFTP_CHROOT}${lib}" 2>/dev/null || true
-        done
-    done
-    # --- device nodes minimos ------------------------------------------
-    # Sin /dev/null, internal-sftp aborta al arrancar con
-    # "Couldn't open /dev/null" y el cliente ve
-    # "subsystem request failed on channel 0". El chroot tiene que traer
-    # los nodes, no solo los archivos.
-    mkdir -p "${SFTP_CHROOT}/dev" "${SFTP_CHROOT}/proc" "${SFTP_CHROOT}/tmp"
-    chmod 1777 "${SFTP_CHROOT}/tmp" 2>/dev/null || true
-    for dev in "null c 1 3 666" "zero c 1 5 666" "random c 1 8 666" "urandom c 1 9 666"; do
-        set -- ${dev}
-        [ -e "${SFTP_CHROOT}/dev/$1" ] || mknod -m "$5" "${SFTP_CHROOT}/dev/$1" "$2" "$3" "$4" 2>/dev/null || true
-    done
-
-    # --- /etc/passwd y /etc/group ---------------------------------------
-    # "No user found for uid 0": el chroot no tiene quien sea el uid con el
-    # que corre el proceso. sshd corre como root y espera poder resolverlo.
-    cp /etc/passwd "${SFTP_CHROOT}/etc_passwd_tmp" 2>/dev/null || true
-    mkdir -p "${SFTP_CHROOT}/etc"
-    cp /etc/passwd "${SFTP_CHROOT}/etc/passwd" 2>/dev/null || true
-    cp /etc/group "${SFTP_CHROOT}/etc/group" 2>/dev/null || true
-    cp /etc/shells "${SFTP_CHROOT}/etc/shells" 2>/dev/null || true
-    rm -f "${SFTP_CHROOT}/etc_passwd_tmp"
-    # solo root y el usuario del proyecto: no el passwd entero del contenedor
-    if [ -f "${SFTP_CHROOT}/etc/passwd" ]; then
-        grep -E "^(root|${APP_USER}|${SFTP_USER}):" /etc/passwd \
-            > "${SFTP_CHROOT}/etc/passwd" 2>/dev/null || true
-        grep -E "^(root|app):" /etc/group \
-            > "${SFTP_CHROOT}/etc/group" 2>/dev/null || true
-    fi
-
-    # prueba de humo: el binario tiene que poder ejecutar DENTRO del chroot
-    # Probar el binario sin args: si responde "usage" arranca, si se queja de
-    # /dev/null, uid, o libs, no. -h NO es un flag valido de sftp-server.
-    OUT=$(chroot "${SFTP_CHROOT}" /usr/lib/ssh/sftp-server 2>&1 | head -1)
-    case "${OUT}" in
-        usage:*|sftp-server\ version*)
-            log "internal-sftp OK en el chroot" ;;
-        "")
-            log "internal-sftp arranca sin error" ;;
-        *)
-            log "ERROR: internal-sftp no arranca: ${OUT}" ;;
-    esac
-
-    # el subsystem tiene que estar declarado. Sin la linea "Subsystem sftp",
-    # el binario puede estar perfecto y el cliente igual recibe
-    # "subsystem request failed on channel 0".
-    if ! grep -q "^Subsystem sftp" /etc/ssh/sshd_config; then
-        log "ERROR: no hay linea 'Subsystem sftp' en sshd_config"
-    fi
-else
-    log "ERROR: no encontre internal-sftp; el SFTP no va a funcionar"
-fi
+log "sftp en proceso (internal-sftp): sin binarios en el chroot"
 
 # --- usuario SFTP ---------------------------------------------------------
 if ! id "${SFTP_USER}" >/dev/null 2>&1; then
@@ -197,10 +148,10 @@ sed -i.bak \
     -e "s|__SFTP_HOME__|${SFTP_CHROOT}|g" \
     /etc/ssh/sshd_config
 
-# ForceCommand internal-sftp NO sirve con ChrootDirectory: "internal-sftp"
-# es un wrapper de sshd, no un binario, y no existe dentro del chroot. El
-# cliente pide el subsystem y sshd responde "subsystem request failed".
-# Hay que apuntar al binario real, con el path DENTRO del chroot.
+# ForceCommand internal-sftp corre EN el proceso de sshd (no es un binario
+# que tenga que existir en el chroot): con ChrootDirectory es LA forma
+# canonica, y por eso el chroot no lleva binarios. -d /upload: el cliente
+# arranca parado en su codigo, pero ve /private y /tmp al lado.
 sed -i "s|^ForceCommand.*|ForceCommand internal-sftp -d /upload|" /etc/ssh/sshd_config
 log "sshd: AllowUsers=${SFTP_USER} ChrootDirectory=${SFTP_CHROOT}"
 

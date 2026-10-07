@@ -44,13 +44,20 @@ def main() -> int:
         nginxs[stack] = (base / "image" / "nginx.conf").read_text()
 
     # ---- 1. el arranque no borra nada del cliente ----
+    # Ojo: el entrypoint SÍ tiene un rm -rf con guardia :? para limpiar el
+    # andamiaje viejo del chroot (bin/usr/lib/etc/proc, lista explicita en
+    # ${_rm}). Lo prohibido es el borrado amplio: upload o el chroot entero.
     print("\n=== el arranque preserva upload ===")
     for stack in PHP_STACKS:
         ep = entrypoints[stack]
         check(re.search(r"rm\s+-rf.*upload", ep) is None,
               f"{stack}: el entrypoint tiene un rm -rf sobre upload")
-        check(re.search(r"rm\s+-rf.*SFTP_CHROOT", ep) is None,
-              f"{stack}: el entrypoint tiene un rm -rf sobre el chroot")
+        check(re.search(r'rm\s+-rf\s+"\$\{SFTP_CHROOT\}"', ep) is None,
+              f"{stack}: el entrypoint tiene un rm -rf sobre el chroot entero")
+        for line in ep.splitlines():
+            if "rm -rf" in line and "SFTP_CHROOT" in line:
+                check("${_rm}" in line and ":?" in line,
+                      f"{stack}: rm -rf fuera de la lista explicita: {line.strip()[:80]}")
         check('mkdir -p "${SFTP_CHROOT}/upload"' in ep,
               f"{stack}: el entrypoint crea upload con mkdir -p")
 

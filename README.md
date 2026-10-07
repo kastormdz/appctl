@@ -610,6 +610,15 @@ lo niega explícito y `disable_symlinks on`, que frena el truco del symlink
 nginx ni php-fpm entran. Desde PHP se llega por filesystem con la ruta
 `/srv/sftp/private`, si los permisos lo permiten.
 
+Por SFTP el cliente ve solo `/upload` y `/private` (más `/dev`,
+técnico: lo necesita el SFTP en proceso). El SFTP corre con `ForceCommand
+internal-sftp` dentro del propio sshd, así que el chroot no lleva binarios:
+nada de `bin/`, `etc/`, `lib/` ni `usr/` a la vista. `/tmp` no se crea más
+(era pasajero); en proyectos viejos se quita solo si está vacío — si el
+cliente dejó archivos ahí, se queda. En proyectos creados
+antes de este cambio, el entrypoint borra esos directorios de andamiaje al
+arrancar (lista explícita, nunca los del cliente).
+
 El entrypoint lo crea con `mkdir -p` y nunca con `rm -rf`: un borrado ahí
 pegaría en el disco real del host a través del bind mount. Esa fue la causa
 de un bug donde cada reinicio pelaba el `upload` del cliente.
