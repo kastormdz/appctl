@@ -478,15 +478,22 @@ are in `.gitignore`. A dump contains client data.
 ### Opening it up
 
 ```bash
-appctl <p> db expose 5432                     # only from 127.0.0.1
-appctl <p> db expose 5432 --cidr 10.20.0.0/16  # open to a network
+appctl <p> db expose 5432                     # publishes on 127.0.0.1 (this host only)
+appctl <p> db expose 5432 --bind 10.20.0.5    # from a specific host IP
 appctl <p> db unexpose                        # close it
 ```
 
-The default is `127.0.0.1`, not a network. With just any `/8`, every LAN that can
-reach the port gets in, and whoever ran the command has no way to know the
-database ended up open to half the environment. Publishing the port doesn't take
-the database off its internal network: that's a host publishing, not a permission.
+The default is `127.0.0.1`, not a network: publishing on `0.0.0.0` puts the
+database within reach of any network that can reach the host, and whoever ran the
+command has no way to know. `--bind` takes an IP, not a network, because docker
+rejects a CIDR in `ports:`; network-wide access is what `db grant --cidr` is for,
+and that is a database permission, not a host publishing. Publishing the port
+doesn't take the database off its internal network.
+
+The port and the bind are recorded in `state.json`: `appctl <p> info` shows them
+and an `upgrade` no longer drops them. They used to live only in the rendered
+`compose.yaml`, so the next re-render wiped them silently and the database went
+back to closed while the client believed it was still open.
 
 ### Database users
 
@@ -548,7 +555,7 @@ appctl <project> db dump [-o path]           # export the database as gzip
 appctl <project> db restore <file> --yes     # import; OVERWRITES the database
 appctl <project> db list                     # backups that exist
 appctl <project> db rm <file> -y             # delete a backup
-appctl <project> db expose <port>            # publish (default 127.0.0.1)
+appctl <project> db expose <port> [--bind IP]  # publish (default 127.0.0.1)
 appctl <project> db unexpose                 # close it
 appctl <project> db grant <user>             # add an external user
 appctl <project> db revoke <user> --yes      # take the access away
@@ -767,6 +774,7 @@ appctl/
     ├── test_private_sftp.py   # the private dir: 700, deny, and no rm -rf
     ├── test_sftp_chroot.py    # the chroot carries upload and private only
     ├── test_nextjs_python.py  # the two-runtime stack: nginx, uvicorn, chroot
+    ├── test_db_publish.py     # the published port: state, info and the bind
     ├── test_readme.py         # every README claim against the code
     └── check_names.py         # AST: undefined calls, duplicated defs
 ```
@@ -797,7 +805,7 @@ Working end to end, verified with both PostgreSQL and MariaDB:
 | `clone` | new data, indexes and credentials; the clone is independent of the source |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, data intact |
 | `db dump` / `restore` | PostgreSQL and MariaDB |
-| `db expose` | publishes the database on a host port, by default only from `127.0.0.1` |
+| `db expose` | publishes the database on a host port, by default only from `127.0.0.1`; the port is recorded and an `upgrade` no longer drops it |
 | `db grant` | adds external users, each with its own password |
 
 All four stacks were verified end to end, including `tomcat-postgres-sftp`.

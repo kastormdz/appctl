@@ -12,6 +12,7 @@ from pathlib import Path
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
+YELLOW = "\033[33m"
 RESET = "\033[0m"
 
 
@@ -236,14 +237,30 @@ def fmt_limites(mem_bytes, nano_cpus) -> str:
     return f"{sm} / {sc}"
 
 
-def render_info(st: dict, env: dict, ps_out: str, limits=None) -> str:
+def render_info(st: dict, env: dict, ps_out: str, limits=None,
+                db_publish: str | None = None) -> str:
     L = ["", f"  {BOLD}{st['project']}{RESET}  {DIM}creado {st.get('created','?')}{RESET}", ""]
     L.append(f"  Stack      {st['stack']}")
     L.append(f"  Host       {st['host']}")
     L.append(f"  App        http://{st['host']}:{st['app_port']}")
     if st.get("sftp_port"):
         L.append(f"  SFTP       {st['host']}:{st['sftp_port']}  user {env.get('SFTP_USER')}")
-    L.append(f"  DB         {(st.get('db') or {}).get('name','-')}  {DIM}(red interna){RESET}")
+    _dbn = (st.get("db") or {}).get("name", "-")
+    _decl = st.get("db_published_port")
+    if db_publish:
+        # Lo que dice docker: la base esta publicada en el host. Se dice
+        # DONDE, porque 0.0.0.0 y 127.0.0.1 no son lo mismo.
+        L.append(f"  DB         {_dbn}  {YELLOW}publicada en {db_publish}{RESET}"
+                 f"  {DIM}(cerrala: appctl {st['project']} db unexpose){RESET}")
+    elif _decl:
+        # El state y el contenedor no coinciden: decirlo, no taparlo. Un
+        # cliente que cree que su base esta abierta y no lo esta pierde mas
+        # tiempo que uno al que le avisan.
+        L.append(f"  DB         {_dbn}  {YELLOW}el state dice publicada en "
+                 f"{_decl} pero el contenedor NO la publica{RESET}"
+                 f"  {DIM}(appctl {st['project']} db expose {_decl}){RESET}")
+    else:
+        L.append(f"  DB         {_dbn}  {DIM}(red interna){RESET}")
     L.append("")
     L.append(f"  {BOLD}Componentes{RESET}   {', '.join(st.get('components', []))}")
     L.append(f"  {BOLD}Imagenes{RESET}")

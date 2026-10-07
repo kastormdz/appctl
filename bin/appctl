@@ -464,7 +464,8 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
                    app_port: int, sftp_port: int | None, host: str,
                    pg_major: str, api_key: str,
                    want_cron: bool = False,
-                   app_memory: str = "", db_memory: str = "") -> None:
+                   app_memory: str = "", db_memory: str = "",
+                   db_publish: int | None = None) -> None:
     """Escribe el directorio del proyecto. Todo bajo pdir: nada de volumes
     nombrados, para que destroy --keep-data sea borrar una carpeta."""
     # exist_ok=True: el chequeo de "ya existe" ya paso arriba, con mensaje
@@ -535,8 +536,11 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
     # La DB NO se publica por defecto: __DB_PUBLISH__ se deja vacio y el
     # servicio db queda sin ports:, con la red data internal:true. Es lo que
     # hace que nadie de afuera la alcance. `appctl <p> db expose <puerto>`
-    # lo rellena despues sobre el compose ya escrito.
-    "__DB_PUBLISH__": "",
+    # lo rellena despues sobre el compose ya escrito... y lo ANOTA en
+    # state.json. Si el puerto viviera solo en el compose renderizado, el
+    # proximo re-render (upgrade) lo borraria sin decir nada: la base
+    # quedaria cerrada y el cliente creyendo que sigue abierta.
+    "__DB_PUBLISH__": _render_publish(db_publish, stack) if db_publish else "",
     "__APP_IMAGE__": image_tag(stack, tags.get(runtime_of(stack),
                                                  DEFAULT_TAGS[runtime_of(stack)])),
 
@@ -554,6 +558,13 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
     }
     for k, v in subs.items():
         tmpl = tmpl.replace(k, v)
+    if db_publish:
+        # Publicar el puerto del db exige que el db salga por una red con
+        # gateway: su unica red (data) es internal:true y docker NO publica
+        # un puerto de ahi (lo deja en null sin decir por que). Es el mismo
+        # paso que da `db expose`: un render que publica sin esto deja un
+        # puerto anunciado que no responde.
+        tmpl = _add_egress_to_db(tmpl)
     # un placeholder sin sustituir = compose invalido. Fallar aca, con el
     # nombre del placeholder, y no 3 minutos despues en el build de docker
     left = re.findall(r"__[A-Z_]+__", tmpl)
@@ -817,6 +828,21 @@ def load_state(project: str) -> dict:
     if not f.exists():
         die(f"no existe el proyecto {project!r} en {build_dir(project)}")
     return json.loads(f.read_text())
+
+
+def save_state(project: str, st: dict) -> None:
+    """Escribe state.json de forma atomica (temporal + replace).
+
+    Un state truncado a la mitad es peor que uno viejo: `list` lo saltea
+    como ilegible y el proyecto desaparece del listado. El rename dentro
+    del mismo directorio es atomico: se ve el estado viejo o el nuevo,
+    nunca medio archivo.
+    """
+    f = build_dir(project) / "state.json"
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(st, indent=2) + "\n")
+    tmp.chmod(0o600)
+    os.replace(tmp, f)
 
 
 def load_env(project: str) -> dict[str, str]:
@@ -1422,7 +1448,8 @@ def cmd_upgrade(args) -> int:
     render_project(stage, stack_dir, stack, project, components, tags,
                    names, pw, int(st["app_port"]), st.get("sftp_port"),
                    host=st["host"], pg_major=pg_major, api_key=api_key,
-                   want_cron="cron" in components)
+                   want_cron="cron" in components,
+                   db_publish=st.get("db_published_port"))
     after = (stage / "compose.yaml").read_text()
 
     if before == after and not forzar:
@@ -1645,13 +1672,32 @@ def _limites_vivos(project: str) -> dict:
     return out
 
 
+def _db_publish_vivo(project: str) -> str | None:
+    """Donde publica el contenedor de la db AHORA, segun docker ("ip:puerto").
+
+    Devuelve la direccion entera y no solo el puerto: si quedo en 0.0.0.0
+    hay que verlo, porque es la diferencia entre "solo desde este host" y
+    "desde cualquier red que llegue". La verdad la tiene docker, no el
+    state: si el state declara un puerto y el contenedor no lo publica, lo
+    usable es lo que dice docker.
+    """
+    r = sh(f"docker port {project}_db", timeout=30)
+    pubs = []
+    for linea in (r.stdout or "").splitlines():
+        # "5432/tcp -> 127.0.0.1:15432"
+        if "->" in linea:
+            pubs.append(linea.split("->", 1)[1].strip())
+    return ", ".join(pubs) or None
+
+
 def cmd_info(args) -> int:
     st = load_state(args.proyecto)
     env = load_env(args.proyecto)
     _host_guardado(args.proyecto, st)
     r = sh("docker compose ps --format '{{.Service}}\t{{.State}}\t{{.Health}}'",
            cwd=build_dir(args.proyecto))
-    print(render_info(st, env, r.stdout, _limites_vivos(args.proyecto)))
+    print(render_info(st, env, r.stdout, _limites_vivos(args.proyecto),
+                      _db_publish_vivo(args.proyecto)))
     return 0
 
 
@@ -1991,7 +2037,8 @@ def _db_paths(args):
 DB_PUBLISH_KEY = "db_host_port"
 
 
-def _render_publish(port: int | None, stack: str = "php-postgres-sftp") -> str:
+def _render_publish(port: int | None, stack: str = "php-postgres-sftp",
+                    bind: str = "127.0.0.1") -> str:
     """El bloque ports: del servicio db. Sin puerto: la nada.
 
     El puerto INTERNO lo decide el stack: hardcodear 5432 hacia que un
@@ -2006,9 +2053,36 @@ def _render_publish(port: int | None, stack: str = "php-postgres-sftp") -> str:
     if not port:
         return ""
     interno = 3306 if "mysql" in stack else 5432
+    # 127.0.0.1 por defecto: la base no se abre a toda red que llegue al
+    # host. Aca va una IP, no una red: medido, docker rechaza un CIDR en
+    # ports: ('-p 10.20.0.0/16:15999:80' -> exit 125). El alcance de red se
+    # controla donde corresponde, en pg_hba (`db grant --cidr`).
     return ("    ports:\n"
-            f'      - "0.0.0.0:{port}:{interno}"')
+            f'      - "{bind}:{port}:{interno}"')
 
+
+
+def _validar_bind(bind: str) -> str:
+    """Valida la direccion del host donde se publica la db.
+
+    Docker acepta una IPv4 (o 0.0.0.0) en la parte izquierda de ports: y
+    **no** una red: medido, `-p 10.20.0.0/16:15999:80` -> exit 125. Una
+    cadena vacia o con espacios bindea cualquier cosa o rompe el compose,
+    asi que se valida antes de escribir el archivo.
+    """
+    import ipaddress as _ip
+
+    v = (bind or "").strip()
+    if not v:
+        return "127.0.0.1"
+    try:
+        _ip.IPv4Address(v)
+    except ValueError:
+        die(f"--bind {bind!r} no es una IPv4 valida (ej: 127.0.0.1, "
+            f"0.0.0.0, 10.20.0.5).\n"
+            f"  docker no acepta una red en ports:; para habilitar una red "
+            f"esta `appctl <p> db grant --cidr <red>`")
+    return v
 
 
 def cmd_db_expose(args) -> int:
@@ -2017,11 +2091,20 @@ def cmd_db_expose(args) -> int:
     No cambia el stack ni la imagen: solo agrega ports: y levanta el
     contenedor de la db. Antes se guarda una copia del compose para poder
     volver atras con `db unexpose`.
+
+    El puerto y el bind quedan ANOTADOS en state.json: si vivieran solo en
+    el compose renderizado, el proximo re-render (upgrade) los borraria sin
+    decir nada y la base volveria a estar cerrada con el cliente creyendo
+    que sigue abierta.
     """
     d, stack = _db_paths(args)
     port = args.puerto
     if not (1024 <= port <= 65535):
         die(f"puerto {port} fuera de rango (1024-65535)")
+    bind = _validar_bind(getattr(args, "bind", "127.0.0.1"))
+    if bind != "127.0.0.1":
+        print(f"  atencion: publicando en {bind} — la base queda al alcance "
+              f"de quien llegue a esa direccion, no solo de este host")
 
     compose = d / "compose.yaml"
     bak = d / "compose.yaml.pre-expose"
@@ -2029,25 +2112,25 @@ def cmd_db_expose(args) -> int:
         shutil.copy2(compose, bak)
 
     texto = _set_publish(compose.read_text(encoding="utf-8"), port, stack,
-                       state=load_state(args.proyecto))
+                         state=load_state(args.proyecto), bind=bind)
     compose.write_text(texto, encoding="utf-8")
 
     # Validar el compose generado ANTES de recrear la base: si el render
     # queda mal, no se debe interrumpir un contenedor sano ni dejar el YAML
-    # inválido escrito en el proyecto.
+    # invalido escrito en el proyecto.
     try:
         _assert_compose_valid(d)
     except SystemExit:
         shutil.copy2(bak, compose)
         raise
-    print(f"  publicando {args.proyecto} db en 0.0.0.0:{port}")
+    print(f"  publicando {args.proyecto} db en {bind}:{port}")
     r = sh("docker compose up -d --force-recreate db", cwd=d)
     if r.returncode != 0:
         # no dejar el compose a medias si el up fallo
         shutil.copy2(bak, compose)
         die(f"docker compose up fallo:\n{r.stderr[:400]}")
 
-    ok, detalle = _verify_expose(args.proyecto, port)
+    ok, detalle = _verify_expose(args.proyecto, port, bind)
     if not ok:
         # revertir el compose: dejar el proyecto como estaba es mejor que
         # dejarlo con un puerto que no abre
@@ -2055,26 +2138,51 @@ def cmd_db_expose(args) -> int:
         sh("docker compose up -d --force-recreate db", cwd=d)
         die(f"expuse: {detalle}\n"
             f"  se volvio a dejar la db cerrada (como estaba antes).")
-    print(f"  el {port} responde desde el host")
+    print(f"  el {port} responde")
+    st = load_state(args.proyecto)
+    st["db_published_port"] = port
+    st["db_published_bind"] = bind
+    save_state(args.proyecto, st)
     return 0
 
 
 def cmd_db_unexpose(args) -> int:
+    """Cerrar la db: saca el ports: del compose ACTUAL y borra la marca.
+
+    No restaura compose.yaml.pre-expose: ese backup puede ser de antes de
+    un upgrade, y restaurarlo seria volver a una imagen vieja (un downgrade
+    silencioso) por el solo hecho de cerrar un puerto. Se saca el bloque
+    del compose que esta en uso, que deja el mismo stack sin exposicion.
+    """
     d, stack = _db_paths(args)
     compose = d / "compose.yaml"
     bak = d / "compose.yaml.pre-expose"
-    if not bak.exists():
-        die(f"{args.proyecto} no tiene db publicada (no hay compose.yaml.pre-expose)")
-    shutil.copy2(bak, compose)
+    st = load_state(args.proyecto)
+    declarado = st.get("db_published_port")
+    if not declarado and not bak.exists():
+        die(f"{args.proyecto} no tiene db publicada (ni state ni "
+            f"compose.yaml.pre-expose)")
+    actual = compose.read_text(encoding="utf-8")
+    texto = _strip_ports(actual)
+    if texto != actual:
+        compose.write_text(texto, encoding="utf-8")
+        _assert_compose_valid(d)
     print(f"  cerrando {args.proyecto} db")
     # tambien --force-recreate: sacar un ports: de un contenedor vivo
     # tampoco se aplica solo.
     r = sh("docker compose up -d --force-recreate db", cwd=d)
     if r.returncode != 0:
         die(f"docker compose up fallo:\n{r.stderr[:400]}")
-    ok = _host_port_closed(int(args.puerto or 0)) if args.puerto else True
-    if args.puerto and not ok:
-        print(f"  aviso: el {args.puerto} sigue respondiendo. Puede ser otro "
+    st.pop("db_published_port", None)
+    st.pop("db_published_bind", None)
+    save_state(args.proyecto, st)
+    # el backup ya no representa "como estaba": el compose actual es el
+    # correcto. Dejarlo confunde al proximo expose, que no lo regeneraria.
+    if bak.exists():
+        bak.unlink()
+    puerto = args.puerto or declarado
+    if puerto and not _host_port_closed(int(puerto)):
+        print(f"  aviso: el {puerto} sigue respondiendo. Puede ser otro "
               f"proceso: appctl ps")
     return 0
 
@@ -2142,7 +2250,7 @@ def _add_egress_to_db(compose: str) -> str:
 
 
 def _set_publish(texto: str, port: int | None, stack: str = "php-postgres-sftp",
-                 state: dict | None = None) -> str:
+                 state: dict | None = None, bind: str = "127.0.0.1") -> str:
     """Poner o sacar el bloque ports: del servicio db.
 
     NO se edita el YAML linea por linea. Editarlo a mano fallo dos veces:
@@ -2164,7 +2272,7 @@ def _set_publish(texto: str, port: int | None, stack: str = "php-postgres-sftp",
 
     tmpl = (STACKS_DIR / stack / "compose.tmpl.yaml").read_text(encoding="utf-8")
     subs = _subs_from_existing(texto, state)
-    subs["__DB_PUBLISH__"] = _render_publish(port, stack)
+    subs["__DB_PUBLISH__"] = _render_publish(port, stack, bind)
     for k, v in subs.items():
         tmpl = tmpl.replace(k, v)
     # El db tiene que estar tambien en egress: su unica red (data) es
@@ -2296,7 +2404,8 @@ def _strip_ports(texto: str) -> str:
     return "".join(out)
 
 
-def _verify_expose(proyecto: str, port: int) -> tuple[bool, str]:
+def _verify_expose(proyecto: str, port: int,
+                   host: str | None = None) -> tuple[bool, str]:
     """Prueba que el puerto responde DE VERDAD. Devuelve (ok, detalle).
 
     Un `docker compose up -d` que sale con 0 no dice que el puerto quedo
@@ -2308,12 +2417,18 @@ def _verify_expose(proyecto: str, port: int) -> tuple[bool, str]:
     un check que no puede hacer fallar nada.
     """
     import time
+    # Probar la direccion donde se publico DE VERDAD: si el bind es una IP
+    # concreta (10.20.0.5), no responde en 127.0.0.1 y el check daria por
+    # fallado un expose que funciona (y lo revertiria).
+    donde = host or "127.0.0.1"
+    if donde in ("0.0.0.0", "::"):
+        donde = "127.0.0.1"
     ultimo = ""
     for intento in range(1, 16):
         r = subprocess.run(
             ["docker", "run", "--rm", "--network", "host",
              "--entrypoint", "sh", "busybox:latest", "-c",
-             f"nc -z -w 2 127.0.0.1 {port}"],
+             f"nc -z -w 2 {donde} {port}"],
             capture_output=True, timeout=60)
         if r.returncode == 0:
             return True, f"responde (intento {intento})"
@@ -2325,7 +2440,7 @@ def _verify_expose(proyecto: str, port: int) -> tuple[bool, str]:
          "{{json .NetworkSettings.Ports}}"],
         capture_output=True, text=True, timeout=30)
     puertos = (insp.stdout or "").strip()
-    return False, (f"el {port} no responde desde el host tras 45s.\n"
+    return False, (f"el {port} no responde en {donde} tras 45s.\n"
                    f"    lo que dice docker del contenedor: {puertos or '(nada)'}\n"
                    f"    appctl {proyecto} logs --service db")
 
@@ -2732,6 +2847,13 @@ def main() -> int:
 
     q = dsub.add_parser("expose", help="publicar la DB en un puerto del host")
     q.add_argument("puerto", type=int)
+    # Por defecto SOLO desde este host. Aca va una IP, no una red: medido,
+    # docker rechaza un CIDR en ports: ('-p 10.20.0.0/16' -> exit 125). El
+    # alcance por red se habilita donde corresponde: `db grant --cidr`.
+    q.add_argument("--bind", default="127.0.0.1", metavar="IP",
+                   help="desde que direccion del host se publica "
+                        "(default 127.0.0.1, o sea solo este host; "
+                        "0.0.0.0 lo abre a toda red que llegue)")
     q.set_defaults(func=cmd_db_expose)
 
     q = dsub.add_parser("unexpose", help="cerrar la DB (vuelve al estado de siempre)")

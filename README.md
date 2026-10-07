@@ -476,15 +476,22 @@ están en `.gitignore`. Un dump tiene datos de clientes.
 ### Exponerla
 
 ```bash
-appctl <p> db expose 5432                     # solo desde 127.0.0.1
-appctl <p> db expose 5432 --cidr 10.20.0.0/16  # abrir a una red
+appctl <p> db expose 5432                     # publica en 127.0.0.1 (solo este host)
+appctl <p> db expose 5432 --bind 10.20.0.5    # desde una IP concreta del host
 appctl <p> db unexpose                        # cerrarla
 ```
 
-El default es `127.0.0.1` y no una red. Con un `/8` cualquiera, cualquier LAN que
-llegue al puerto entra, y quien llama al comando no tiene por qué saber que la
-base quedó abierta a medio entorno. Publicar el puerto no saca la base de su red
-interna: es una publicación del host, no un permiso.
+El default es `127.0.0.1` y no una red: publicar en `0.0.0.0` deja la base al
+alcance de cualquier red que llegue al host, y quien corre el comando no tiene
+por qué saber que quedó abierta a medio entorno. `--bind` acepta una IP y no una
+red, porque docker rechaza un CIDR en `ports:`; el alcance por red se habilita
+con `db grant --cidr`, que es un permiso de la base y no una publicación del host.
+Publicar el puerto no saca la base de su red interna.
+
+El puerto y el bind quedan anotados en `state.json`: `appctl <p> info` los
+muestra y un `upgrade` no los pierde. Antes vivían solo en el `compose.yaml`
+renderizado, así que el próximo re-render los borraba en silencio y la base
+quedaba cerrada con el cliente creyendo que seguía abierta.
 
 ### Usuarios de la base
 
@@ -546,7 +553,7 @@ appctl <proyecto> db dump [-o ruta]           # exporta la base en gzip
 appctl <proyecto> db restore <archivo> --yes # importa; PISA la base
 appctl <proyecto> db list                    # backups que hay
 appctl <proyecto> db rm <archivo> -y         # borra un backup
-appctl <proyecto> db expose <puerto>         # publica (default 127.0.0.1)
+appctl <proyecto> db expose <puerto> [--bind IP]  # publica (default 127.0.0.1)
 appctl <proyecto> db unexpose                # cierra
 appctl <proyecto> db grant <usuario>         # alta de usuario externo
 appctl <proyecto> db revoke <usuario> --yes  # le saca el acceso
@@ -763,6 +770,7 @@ appctl/
     ├── test_private_sftp.py   # el dir privado: 700, deny y sin rm -rf
     ├── test_sftp_chroot.py    # el chroot solo trae upload y private
     ├── test_nextjs_python.py  # el stack de dos runtimes: nginx, uvicorn, chroot
+    ├── test_db_publish.py     # el puerto publicado: state, info y el bind
     ├── test_readme.py         # cada afirmación del README contra el código
     └── check_names.py         # AST: llamadas sin definir, defs duplicadas
 ```
@@ -793,7 +801,7 @@ Funcional y verificado de punta a punta con PostgreSQL y MariaDB:
 | `clone` | datos, índices y credenciales nuevas; el clon es independiente del origen |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, con los datos intactos |
 | `db dump` / `restore` | PostgreSQL y MariaDB |
-| `db expose` | publica la base en un puerto del host; por defecto solo desde `127.0.0.1` |
+| `db expose` | publica la base en un puerto del host, por defecto solo desde `127.0.0.1`; el puerto queda anotado y un `upgrade` no lo pierde |
 | `db grant` | alta de usuarios externos, cada uno con su password |
 
 Los cuatro stacks fueron verificados de punta a punta, incluido
