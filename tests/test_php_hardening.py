@@ -146,6 +146,30 @@ def main() -> int:
           == (ROOT / "stacks" / b / "image" / "nginx.conf").read_text(),
           "nginx.conf identico en los dos stacks PHP")
 
+
+    # ---- las extensiones que el cliente pidio y la imagen NO traia ----
+    # Medido en produccion: intl, gd, zip, bcmath y soap no estaban (ni el
+    # .so). El comentario del Dockerfile afirmaba que intl venia en la base:
+    # falso, y por eso nadie lo noto. Este gate lo mantiene.
+    print("\n=== extensiones PHP ===")
+    for stack in PHP_STACKS:
+        dockerfile = (ROOT / "stacks" / stack / "image" / "Dockerfile").read_text()
+        for ext in ("intl", "zip", "gd", "bcmath", "soap"):
+            assert "docker-php-ext-install -j1 {0}".format(ext) in dockerfile, \
+                "{0}: no instala {1}".format(stack, ext)
+        assert "docker-php-ext-configure gd --with-freetype --with-jpeg" in dockerfile, \
+            "{0}: gd sin --with-freetype/--with-jpeg".format(stack)
+        assert "apk del .ext-build-deps" in dockerfile, \
+            "{0}: deja las libs de build en la imagen".format(stack)
+        # OJO: anclado al COMANDO, no a la palabra: el comentario del
+        # Dockerfile la menciona y el split cortaba ahi.
+        primera = dockerfile.split("apk add --no-cache --virtual")[0]
+        for lib in ("libpng", "libjpeg-turbo", "freetype"):
+            assert re.search(r"(^|\s){0}(\s|\\|$)".format(re.escape(lib)),
+                             primera, re.M), \
+                "{0}: {1} esta dentro del grupo virtual (apk del se lo lleva)".format(stack, lib)
+        assert 'muestra "Zend OPcache" e "intl"' not in dockerfile, \
+            "{0}: sigue el comentario que dice que intl viene en la base".format(stack)
     print("\ntodo bien")
     return 0
 

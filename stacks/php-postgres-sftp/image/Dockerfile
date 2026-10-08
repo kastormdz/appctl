@@ -27,18 +27,32 @@ RUN apk update && apk add --no-cache \
 RUN docker-php-ext-install -j1 pdo_pgsql
 RUN docker-php-ext-install -j1 pgsql
 
-# opcache e intl: los trae la imagen base de php en modo compilado, pero
-# instalarlos asi deja el .ini en el lugar que php-cgi espera.
-
-# opcache e intl: NO se compilan. La imagen oficial php:8.5-fpm-alpine ya
-# los trae compilados (php -m muestra "Zend OPcache" e "intl").
-# docker-php-ext-install opcache falla con "install-modules Error 1" porque
-# intenta recompilar contra los headers de zend que ya estan puestos.
+# opcache: SI viene compilado en la imagen oficial (no tiene .so propio: se
+# consulta con el nombre exacto "Zend OPcache"). intl: NO venia. El comentario
+# que habia aca afirmaba que la base los traia a los dos y era falso, y por eso
+# nadie noto que intl faltaba (medido: extension_loaded('intl') = false).
 #
-# zip: lo dejo fuera. En alpine necesita libzip-dev y la version de
-# php-zip a veces no compila; se agrega solo si un cliente lo pide
-# (Laravel lo usa para excel exports). Para habilitarlo:
-#   apk add libzip-dev && docker-php-ext-install -j1 zip
+# Estas cinco son las que un cliente pide seguido y la imagen no traia:
+#   intl    formateo de fechas/numeros por ICU (Laravel, Symfony, TCPDF)
+#   zip     ZipArchive: exports de Excel (Laravel Excel, zipstream)
+#   gd      imagenes: TCPDF, PhpSpreadsheet, thumbnails
+#   bcmath  decimales exactos: JWK/JWT, barcodes PDF417 de TCPDF
+#   soap    clientes SOAP (legacy)
+# Un solo RUN con las libs de build en un grupo --virtual que se borra al
+# final: en capas separadas los -dev quedan ocupando disco en la imagen.
+# Las libs de RUNTIME van afuera del grupo: `apk del` se lleva las del grupo,
+# y sin libpng/freetype/libjpeg presentes las extensiones no cargan.
+# -j1 una por una: compilar en paralelo tapa el error de la que falla.
+RUN apk add --no-cache libpng libjpeg-turbo freetype libxml2 \
+ && apk add --no-cache --virtual .ext-build-deps \
+      icu-dev libzip-dev libpng-dev libjpeg-turbo-dev freetype-dev libxml2-dev \
+ && docker-php-ext-configure gd --with-freetype --with-jpeg \
+ && docker-php-ext-install -j1 intl \
+ && docker-php-ext-install -j1 zip \
+ && docker-php-ext-install -j1 gd \
+ && docker-php-ext-install -j1 bcmath \
+ && docker-php-ext-install -j1 soap \
+ && apk del .ext-build-deps
 
 COPY php.ini /usr/local/etc/php/conf.d/zz-appctl.ini
 COPY php-fpm.conf /usr/local/etc/php-fpm.d/zz-appctl.conf
