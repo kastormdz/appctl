@@ -158,6 +158,7 @@ def main() -> int:
     print("\n=== 8. el smoke tiene el check de la API ===")
     sys.path.insert(0, str(RAIZ / "lib"))
     import smoke
+    import summary
     check(hasattr(smoke, "app_serves_api"), "smoke.app_serves_api existe")
     src = leer("lib/smoke.py")
     check('if "express" in (cfg.get("stack") or ""):' in src,
@@ -181,7 +182,26 @@ def main() -> int:
     check("${HTTP_PROXY:-}" in leer(f"stacks/{NOMBRE}/compose.tmpl.yaml"),
           "el compose del stack los toma del .env")
 
-    print("\n=== 11. los READMEs lo documentan ===")
+
+    print("\n=== 11. el ejemplo de conexion es del runtime ===")
+    nombres2 = {"DB_NAME": "t_db", "DB_USER": "t", "DB_MIGRATION_USER": "t_mig",
+                "DB_READONLY_USER": "t_ro", "SFTP_USER": "t"}
+    pw2 = {"DB_PASSWORD": "x", "DB_MIGRATION_PASSWORD": "y",
+           "DB_READONLY_PASSWORD": "z", "SFTP_PASSWORD": "s"}
+    ex = summary.render_create("t", "express-postgres-sftp", "t.local", 18001,
+                               12201, nombres2, pw2, "/tmp/t", creds_only=True)
+    check("Laravel" not in ex,
+          "en un proyecto express el resumen NO habla de Laravel")
+    check("DB_HOST=db" in ex and "DB_PASSWORD" in ex,
+          "y si muestra las variables que el stack le pasa al contenedor")
+    nx = summary.render_create("t", "nextjs-postgres-sftp", "t.local", 18001,
+                               12201, nombres2, pw2, "/tmp/t", creds_only=True)
+    check("Laravel" not in nx, "tampoco en un proyecto nextjs")
+    ph = summary.render_create("t", "php-postgres-sftp", "t.local", 18001,
+                               12201, nombres2, pw2, "/tmp/t", creds_only=True)
+    check("Laravel .env" in ph,
+          "y en un proyecto PHP sigue el ejemplo de Laravel (es su runtime)")
+    print("\n=== 12. los READMEs lo documentan ===")
     for n in ("README.md", "README.en.md"):
         t = leer(n)
         check(NOMBRE in t, f"{n} nombra el stack")

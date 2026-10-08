@@ -167,14 +167,23 @@ def render_create(project: str, stack: str, host: str, app_port: int,
             L.append(f"    appctl {project} db unexpose{RESET}")
         L.append("")
 
-    L.append(f"{BOLD}Ejemplo de conexion (Laravel .env){RESET}")
+    # El ejemplo tiene que ser del runtime del proyecto: el stack de PHP usa
+    # Laravel, el de Node no (DB_CONNECTION es una clave de Laravel y en un
+    # proyecto express/nextjs no existe). Los dos reciben las MISMAS variables
+    # por entorno: el stack se las pasa al contenedor.
+    _rt = stack.split("-")[0]
+    _node = _rt in ("nextjs", "express")
+    L.append(f"{BOLD}Ejemplo de conexion "
+             f"({'Node: el entorno ya lo trae' if _node else 'Laravel .env'})"
+             f"{RESET}")
     if not db_publish:
         L.append(f"  {DIM}La base no esta publicada (red interna). Esta es la config")
         L.append(f"  para la app DENTRO del contenedor (host 'db'). Para un cliente")
         L.append(f"  externo hace falta un tunel: ssh -L {int(db_port)+100}:db:{db_port} <usuario>@<host>{RESET}")
     else:
         L.append(f"  {DIM}Dentro del contenedor:{RESET}")
-    L.append(f"  DB_CONNECTION={db_driver}")
+    if not _node:
+        L.append(f"  DB_CONNECTION={db_driver}")
     L.append(f"  DB_HOST=db")
     L.append(f"  DB_PORT={db_port}")
     L.append(f"  DB_DATABASE={names['DB_NAME']}")
@@ -184,7 +193,8 @@ def render_create(project: str, stack: str, host: str, app_port: int,
         _ext = host if _pb in ("", "0.0.0.0", "::", "[::]") else _pb
         L.append("")
         L.append(f"  {DIM}Desde afuera (tu maquina o el cliente):{RESET}")
-        L.append(f"  DB_CONNECTION={db_driver}")
+        if not _node:
+            L.append(f"  DB_CONNECTION={db_driver}")
         L.append(f"  DB_HOST={_ext}")
         L.append(f"  DB_PORT={_pp}")
     L.append("")
