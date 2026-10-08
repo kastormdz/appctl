@@ -100,8 +100,9 @@ def render_create(project: str, stack: str, host: str, app_port: int,
     L.append(f"  {BOLD}Usuario de la aplicacion{RESET}")
     L.append(f"    User     {names['DB_USER']}")
     L.append(f"    Pass     {pw['DB_PASSWORD']}")
-    L.append(f"    Permisos SELECT / INSERT / UPDATE / DELETE")
-    L.append(f"    {DIM}(sin CREATE ni DROP: no puede borrar el schema){RESET}")
+    L.append(f"    Permisos SELECT / INSERT / UPDATE / DELETE / TEMP TABLE")
+    L.append(f"    {DIM}(sin CREATE ni DROP de tablas permanentes: no "
+                 f"puede borrar el schema){RESET}")
     L.append("")
     L.append(f"  {BOLD}Usuario de migraciones{RESET}  {DIM}(para artisan migrate, etc){RESET}")
     L.append(f"    User     {names['DB_MIGRATION_USER']}")

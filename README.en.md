@@ -330,7 +330,7 @@ deciding that. Pinned in the YAML, it can't happen.
 | Object | Name | Permissions |
 |---|---|---|
 | Database | `<project>_db` | — |
-| App role | `<project>` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` |
+| App role | `<project>` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `CREATE TEMPORARY TABLE` |
 | Migration role | `<project>_mig` | everything, including `CREATE SCHEMA` and `DROP` |
 | Read-only role | `<project>_ro` | `SELECT` |
 | Engine superuser | `<project>_admin` | never shown in the summary |
@@ -342,6 +342,15 @@ In PostgreSQL, on top of `CREATE ROLE` and `CREATE DATABASE OWNER`, the init run
 can connect to a client's database. MariaDB has no roles, so the init creates the
 same three **users** with host `'%'` (without a host they'd only get in over a
 local socket) and privileges scoped to the project's database, never to `*.*`.
+
+**Temporary** tables are the case that `REVOKE` takes with it: in PostgreSQL the
+`TEMP` privilege on the database is granted to `PUBLIC` by default, and revoking
+it from `PUBLIC` (which is the right thing to do) also strips it from the
+project's roles. The init grants it back explicitly to the app role and the
+migration role: a temporary table lives in the session's temporary schema, nobody
+else can see it, it dies with the connection and it grants no write on persistent
+data. The **read-only role does not get it** — read-only means read-only, and a
+gate checks that.
 
 ### Why the roles are separate
 

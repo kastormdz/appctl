@@ -328,7 +328,7 @@ haberlo decidido. Fijado en el YAML, eso no puede pasar.
 | Objeto | Nombre | Permisos |
 |---|---|---|
 | Base de datos | `<proyecto>_db` | — |
-| Rol de la app | `<proyecto>` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` |
+| Rol de la app | `<proyecto>` | `SELECT`, `INSERT`, `UPDATE`, `DELETE` y `CREATE TEMPORARY TABLE` |
 | Rol de migraciones | `<proyecto>_mig` | todo, incluido `CREATE SCHEMA` y `DROP` |
 | Rol de lectura | `<proyecto>_ro` | `SELECT` |
 | Superusuario del motor | `<proyecto>_admin` | nunca aparece en el resumen |
@@ -340,6 +340,15 @@ En PostgreSQL, además de `CREATE ROLE` y `CREATE DATABASE OWNER`, el init corre
 se puede conectar a la base de un cliente. En MariaDB no hay roles: el init crea
 los mismos tres **usuarios**, con host `'%'` (sin host solo entrarían por socket
 local) y con los privilegios acotados a la base del proyecto, nunca a `*.*`.
+
+Las tablas **temporales** son el caso que ese `REVOKE` se lleva puesto: en
+Postgres el privilegio `TEMP` sobre la base viene otorgado a `PUBLIC` por
+defecto, y revocárselo a `PUBLIC` (que es lo correcto) también se lo saca a los
+roles del proyecto. El init lo vuelve a otorgar explícitamente al rol de la app y
+al de migraciones: una tabla temporal vive en el esquema temporal de la sesión,
+no la ve nadie más, muere al cerrar la conexión y no habilita ninguna escritura
+sobre datos persistentes. El rol de **solo lectura no lo lleva** — solo lectura
+es solo lectura, y hay un gate que lo verifica.
 
 ### Por qué los roles están separados
 

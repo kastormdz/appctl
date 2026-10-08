@@ -109,6 +109,15 @@ REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT CONNECT, CREATE ON DATABASE :"POSTGRES_DB" TO :"db_user", :"mig_user";
 -- ro solo entra: sin CREATE no puede crear un schema.
 GRANT CONNECT ON DATABASE :"POSTGRES_DB" TO :"ro_user";
+-- Tablas TEMPORALES. El REVOKE de arriba (ALL ON DATABASE FROM PUBLIC) se
+-- llevo el TEMP que Postgres le da a PUBLIC por defecto: medido en
+-- produccion, sin esta linea NINGUN rol del proyecto puede crear una
+-- temporal ('permission denied to create temporary tables in database').
+-- Es un privilegio sin riesgo: la tabla vive en el esquema temporal de la
+-- sesion, no la ve nadie mas, muere al cerrar la conexion y no habilita
+-- ninguna escritura sobre datos persistentes. Al rol de SOLO LECTURA no se
+-- le da: 'solo lectura' es solo lectura, y hay un gate que lo verifica.
+GRANT TEMPORARY ON DATABASE :"POSTGRES_DB" TO :"db_user", :"mig_user";
 GRANT USAGE, CREATE ON SCHEMA public TO :"db_user", :"mig_user";
 GRANT USAGE ON SCHEMA public TO :"ro_user";
 GRANT SELECT, INSERT, UPDATE, DELETE

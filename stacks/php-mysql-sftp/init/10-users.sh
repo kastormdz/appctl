@@ -64,6 +64,17 @@ CREATE USER IF NOT EXISTS '${DB_USER}'@'%'
 GRANT SELECT, INSERT, UPDATE, DELETE
     ON ${DB_NAME}.* TO '${DB_USER}'@'%';
 
+-- Tablas TEMPORALES: un reporte o un ETL las usa y no son un privilegio de
+-- escritura sobre nada permanente (viven en el esquema temporal de la
+-- sesion, no las ve nadie mas, mueren al cerrar la conexion). Acotado a la
+-- base del cliente: 'ON *.*' seria global y no hace falta. Medido en
+-- mariadb:11.8: sin esto da 1044; con esto crea y usa la temporal, y sigue
+-- sin poder crear una permanente (1142) ni borrar una ajena (1142). El rol
+-- de migraciones ya lo tiene por su ALL PRIVILEGES; al de solo lectura no
+-- se le da.
+GRANT CREATE TEMPORARY TABLES
+    ON ${DB_NAME}.* TO '${DB_USER}'@'%';
+
 -- ---------------------------------------------------------------------
 -- usuario de migraciones: todo, incluido CREATE/DROP. Para
 -- 'artisan migrate', migraciones de Django, flyway, lo que sea.

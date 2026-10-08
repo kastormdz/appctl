@@ -147,6 +147,41 @@ def test_init(nombre, rel, debe_aparecer):
         check("no usa 'GRANT OPTION' (no existe como privilegio)", not malos,
               malos[:2])
 
+
+    # ---- tablas TEMPORALES (2026-10-08) ----
+    # Postgres: el init hace REVOKE ALL ON DATABASE FROM PUBLIC, y eso se lleva
+    # el TEMP que PUBLIC tiene por defecto. Medido en produccion: sin el grant
+    # los tres roles dan 'permission denied to create temporary tables'.
+    # MariaDB: sin el grant, 1044.
+    # El de solo lectura NO lo lleva (decision explicita del usuario).
+    # El GRANT puede estar partido en varias lineas: se captura el STATEMENT
+    # entero, no las lineas sueltas (con las lineas sueltas, el usuario queda
+    # en la continuacion y el check no lo ve).
+    temporales = re.findall(r"GRANT[^;]*TEMPORARY[^;]*;", sql, re.I | re.S)
+    check("el init otorga el privilegio de tablas temporales", bool(temporales),
+          "sin esto el cliente no puede crear temporales")
+    if temporales:
+        linea = " ".join(temporales)
+        if "CREATE ROLE" in sql:
+            # Postgres arma los GRANT con variables de psql y el psql del test
+            # es un `cat`: llegan SIN expandir (:"db_user"). Se verifica la
+            # intencion en el codigo, que es lo que importa.
+            check("postgres: TEMPORARY para la app y para migraciones",
+                  "db_user" in linea and "mig_user" in linea, linea[:130])
+            check("postgres: TEMPORARY NO para el rol de solo lectura",
+                  "ro_user" not in linea, linea[:130])
+            check("postgres: el TEMPORARY es sobre la BASE (no sobre el cluster)",
+                  "ON DATABASE" in linea, linea[:130])
+        else:
+            # MariaDB usa heredoc sin comillas: ${DB_USER} si se expande.
+            check("mariadb: CREATE TEMPORARY TABLES para la app",
+                  "'app'@'%'" in linea, linea[:130])
+            check("mariadb: acotado a la base, NUNCA a *.*",
+                  "*.*" not in linea, linea[:130])
+            check("mariadb: y NO para el rol de solo lectura",
+                  "app_ro" not in linea, linea[:130])
+
+
 def test_compose_env_db():
     """El servicio db recibe las variables que su init necesita.
 
@@ -219,6 +254,18 @@ def main():
             print()
     print()
     test_compose_env_db()
+    print()
+    # ---- los inits compartidos tienen que ser byte-identicos ----
+    # Los 4 stacks de postgres comparten el mismo init. Un fix aplicado a uno
+    # solo deja a los otros 3 con el bug, y el sintoma aparece recien cuando se
+    # crea un proyecto de ese stack (fue exactamente lo que paso con las tablas
+    # temporales: 3 stacks sin el grant).
+    pg_inits = sorted(RAIZ.glob("stacks/*postgres*/init/*.sh"))
+    if pg_inits:
+        contenidos = {p.read_text(encoding="utf-8") for p in pg_inits}
+        check("los {0} inits de postgres son byte-identicos".format(len(pg_inits)),
+              len(contenidos) == 1,
+              "difieren: " + ", ".join(sorted(p.parent.parent.name for p in pg_inits)))
     print()
     if FALLOS:
         print("{0} fallo(s): {1}".format(len(FALLOS), ", ".join(FALLOS)))
