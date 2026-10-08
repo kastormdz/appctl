@@ -43,7 +43,12 @@ RUN docker-php-ext-install -j1 pgsql
 # Las libs de RUNTIME van afuera del grupo: `apk del` se lleva las del grupo,
 # y sin libpng/freetype/libjpeg presentes las extensiones no cargan.
 # -j1 una por una: compilar en paralelo tapa el error de la que falla.
-RUN apk add --no-cache libpng libjpeg-turbo freetype libxml2 \
+# icu-data-full: alpine parte los datos de ICU y de fabrica trae
+# icu-data-en (solo ingles). Medido: con eso, intl carga pero
+# ResourceBundle::getLocales() devuelve 4 locales y es_AR NO esta,
+# asi que IntlDateFormatter('es_AR') cae a 'en' — una app en espanol
+# formatearia fechas y monedas en ingles. icu-data-full los trae todos.
+RUN apk add --no-cache libpng libjpeg-turbo freetype libxml2 icu-data-full \
  && apk add --no-cache --virtual .ext-build-deps \
       icu-dev libzip-dev libpng-dev libjpeg-turbo-dev freetype-dev libxml2-dev \
  && docker-php-ext-configure gd --with-freetype --with-jpeg \

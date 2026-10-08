@@ -164,7 +164,9 @@ def main() -> int:
         # OJO: anclado al COMANDO, no a la palabra: el comentario del
         # Dockerfile la menciona y el split cortaba ahi.
         primera = dockerfile.split("apk add --no-cache --virtual")[0]
-        for lib in ("libpng", "libjpeg-turbo", "freetype"):
+        # icu-data-full: sin el, intl carga pero no tiene es_AR (solo los 4
+        # locales ingleses de icu-data-en) y formatea en ingles.
+        for lib in ("libpng", "libjpeg-turbo", "freetype", "icu-data-full"):
             assert re.search(r"(^|\s){0}(\s|\\|$)".format(re.escape(lib)),
                              primera, re.M), \
                 "{0}: {1} esta dentro del grupo virtual (apk del se lo lleva)".format(stack, lib)
