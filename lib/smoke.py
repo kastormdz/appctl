@@ -720,21 +720,35 @@ def app_serves(project_dir: str, app_port: int, project: str,
     clavado a todo proyecto con codigo real (medido: pap-test con su app
     subida devolvia 200 y el upgrade se revertia solo)."""
     try:
+        # SIN -f: con -f cualquier 4xx es error de curl, y el codigo del
+        # cliente puede vivir en un subdirectorio y contestar 403 en la raiz
+        # (medido: coplacteos, app en /dpgleyfederal, 403 en / -> el upgrade
+        # se revertia solo). El estado HTTP se lee aparte y decide el check.
         p = subprocess.run(
-            ["curl", "-q", "-fsS", "--max-time", "10",
+            ["curl", "-q", "-sS", "--max-time", "10", "-w", "\n%{http_code}",
              f"http://127.0.0.1:{app_port}/"],
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.SubprocessError) as e:
         return Check("app responde", False, f"no se pudo pedir: {e}")
-    body = p.stdout
     if p.returncode != 0:
         return Check("app responde", False,
                      f"curl fallo: {p.stderr.strip()[:200]}")
+    _cuerpo, _, _http = p.stdout.rpartition("\n")
+    body, http = _cuerpo, _http.strip()
     if "app: ok" not in body:
         if not expect_stub:
-            primera = body.splitlines()[0][:120] if body else "(vacio)"
-            return Check("app responde (codigo del cliente, HTTP 200)", True,
+            # Con el codigo del cliente, lo que este check prueba es que nginx
+            # y php-fpm se hablan: un 2xx/3xx/4xx lo prueba (la app puede vivir
+            # en un subdirectorio). Un 5xx no (fatal de PHP, fpm sin socket), y
+            # la falta de respuesta tampoco.
+            if not http.startswith(("2", "3", "4")):
+                return Check("app responde", False,
+                             f"HTTP {http or 'sin respuesta'}: el runtime no "
+                             f"contesta: {body[:160]!r}")
+            primera = (body.splitlines()[0][:120] if body.strip()
+                       else "(sin cuerpo)")
+            return Check(f"app responde (codigo del cliente, HTTP {http})", True,
                          f"no es el stub, es la app real: {primera!r}")
         return Check("app responde", False,
                      f"responde pero no es el stub esperado: {body[:200]!r}")
@@ -781,21 +795,29 @@ def app_serves_python(project_dir: str, app_port: int, cfg: dict | None = None,
     200; y nginx mal ruteado da 502).
     """
     try:
+        # SIN -f, por lo mismo que app_serves: una API real puede contestar
+        # 401/403/404 en /api/ y eso no es que el stack este roto.
         p = subprocess.run(
-            ["curl", "-q", "-fsS", "--max-time", "10",
+            ["curl", "-q", "-sS", "--max-time", "10", "-w", "\n%{http_code}",
              f"http://127.0.0.1:{app_port}/api/"],
             capture_output=True, text=True, timeout=20,
         )
     except (OSError, subprocess.SubprocessError) as e:
         return Check("API python responde", False, f"no se pudo pedir: {e}")
-    body = p.stdout
     if p.returncode != 0:
         return Check("API python responde (nginx -> uvicorn)", False,
                      f"curl fallo: {p.stderr.strip()[:200]}")
+    _cuerpo, _, _http = p.stdout.rpartition("\n")
+    body, http = _cuerpo, _http.strip()
     if "app: python ok" not in body:
         if not expect_stub:
-            primera = body.splitlines()[0][:120] if body else "(vacio)"
-            return Check("API python responde (codigo del cliente, HTTP 200)",
+            if not http.startswith(("2", "3", "4")):
+                return Check("API python responde (nginx -> uvicorn)", False,
+                             f"HTTP {http or 'sin respuesta'}: el runtime no "
+                             f"contesta: {body[:160]!r}")
+            primera = (body.splitlines()[0][:120] if body.strip()
+                       else "(sin cuerpo)")
+            return Check(f"API python responde (codigo del cliente, HTTP {http})",
                          True, f"no es el stub, es la API real: {primera!r}")
         return Check("API python responde", False,
                      f"responde pero no es el stub esperado: {body[:200]!r}")

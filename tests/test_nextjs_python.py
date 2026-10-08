@@ -232,9 +232,14 @@ def main() -> int:
     print("\n=== el check de la API: stub vs codigo del cliente ===")
 
     class _Fake:
-        def __init__(self, body, rc=0):
-            self.returncode, self.stdout, self.stderr = rc, body, (
-                "curl: (22) The requested URL returned error: 502" if rc else "")
+        def __init__(self, body, rc=0, code=200):
+            # El smoke llama a curl con -w "\n%{http_code}": el stdout es el
+            # cuerpo y despues el estado en su propia linea. Un fake que
+            # devuelve solo el cuerpo hace que el estado se lea del cuerpo.
+            self.returncode = rc
+            self.stdout = f"{body}\n{code}"
+            self.stderr = ("curl: (22) The requested URL returned error: 502"
+                           if rc else "")
 
     import subprocess
     original = subprocess.run

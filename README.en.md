@@ -820,6 +820,7 @@ appctl/
     ├── test_private_sftp.py   # the private dir: 700, deny, and no rm -rf
     ├── test_sftp_chroot.py    # the chroot carries upload and private only
     ├── test_nextjs_python.py  # the two-runtime stack: nginx, uvicorn, chroot
+    ├── test_app_check_status.py     # the published port: state, info and the bind
     ├── test_db_publish.py     # the published port: state, info and the bind
     ├── test_readme.py         # every README claim against the code
     └── check_names.py         # AST: undefined calls, duplicated defs

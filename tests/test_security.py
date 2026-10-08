@@ -356,8 +356,10 @@ def main() -> int:
           "upgrade no pasa expect_stub=False (sigue exigiendo el stub)")
     from unittest import mock
 
-    real = "<html>mi app de verdad</html>\n"
-    stub = "app: ok\nphp: 8.5.11\n"
+    # stdout de curl CON -w "\n%{http_code}": cuerpo + linea de estado.
+    real = "<html>mi app de verdad</html>\n200"
+    stub = "app: ok\nphp: 8.5.11\n\n200"
+    real_403 = "<html>Forbidden</html>\n403"
     with mock.patch.object(smokemod.subprocess, "run") as m:
         m.return_value = mock.Mock(returncode=0, stdout=real, stderr="")
         ciego = smokemod.app_serves("x", 8001, "acme", {"db_kind": "postgres"})
@@ -368,6 +370,22 @@ def main() -> int:
                                       expect_stub=False)
         check(abierto.ok,
               "upgrade rechaza una app real con HTTP 200 (vuelve el rollback)")
+        # El codigo real puede vivir en un subdirectorio y contestar 403 en la
+        # raiz (coplacteos: app en /dpgleyfederal). Con `curl -f` eso era un
+        # error de curl y el upgrade se revertia solo.
+        m.return_value = mock.Mock(returncode=0, stdout=real_403, stderr="")
+        check(smokemod.app_serves("x", 8001, "acme", {"db_kind": "postgres"},
+                                  expect_stub=False).ok,
+              "upgrade rechaza un 403 de la app real (se revierte solo)")
+        check(not smokemod.app_serves("x", 8001, "acme",
+                                      {"db_kind": "postgres"}).ok,
+              "create acepta un 403 como stub (el check se volvio ciego)")
+        m.return_value = mock.Mock(returncode=0,
+                                   stdout="<html>fatal</html>\n500", stderr="")
+        check(not smokemod.app_serves("x", 8001, "acme",
+                                      {"db_kind": "postgres"},
+                                      expect_stub=False).ok,
+              "upgrade acepta un 500 (un runtime roto pasa como sano)")
         m.return_value = mock.Mock(returncode=0, stdout=stub, stderr="")
         check(smokemod.app_serves("x", 8001, "acme",
                                   {"db_kind": "postgres"},
