@@ -2772,6 +2772,8 @@ def main() -> int:
             componentes:
               php      PHP-FPM + nginx + sshd (5 servicios juntos)
               nextjs   Node 22 + Next.js
+              express  Node 22 + Express + React (nginx sirve el build
+                       de React y proxya /api al backend)
               tomcat   Tomcat 11 + nginx (4 servicios: nginx aparte)
               python   API FastAPI + uvicorn al lado de Next (complemento)
               psql     PostgreSQL
@@ -2784,6 +2786,7 @@ def main() -> int:
               appctl acme php psql sftp --app-port 3001
               appctl acme php mysql
               appctl acme nextjs python psql sftp
+              appctl acme express psql sftp
               appctl acme list
               appctl acme rotate sftp
               appctl acme db expose 5432 --bind 127.0.0.1
@@ -2795,7 +2798,7 @@ def main() -> int:
     c = sub.add_parser("create", help="crear un proyecto")
     c.add_argument("proyecto")
     c.add_argument("componentes", nargs="+", metavar="COMPONENT",
-                   help="php nextjs tomcat python psql mysql sftp cron")
+                   help="php nextjs express tomcat python psql mysql sftp cron")
     c.add_argument("--app-port", type=int)
     c.add_argument("--sftp-port", type=int)
     c.add_argument("--php", help="fijar version, ej: 8.3")
@@ -2867,9 +2870,10 @@ def main() -> int:
     p.add_argument("--php", metavar="VER",
                    help="migrar a otra version de PHP (8.3, 8.4, 8.5...)")
     p.add_argument("--runtime", metavar="RUNTIME",
-                   choices=["php", "nextjs", "nextjs-python", "tomcat"],
-                   help="cambiar de runtime (php <-> nextjs <-> tomcat; "
-                        "nextjs-python agrega la API FastAPI)")
+                   choices=["php", "nextjs", "nextjs-python", "express",
+                            "tomcat"],
+                   help="cambiar de runtime (php <-> nextjs <-> express "
+                        "<-> tomcat; nextjs-python agrega la API FastAPI)")
     p.set_defaults(func=cmd_upgrade)
 
     p = sub.add_parser("info", help="detalle de un proyecto",
@@ -2919,9 +2923,11 @@ def main() -> int:
 
     b = sub.add_parser("build", help="construir las imagenes base (una vez)")
     b.add_argument("--runtime",
-                   choices=["php", "mysql", "nextjs", "nextjs-python", "tomcat"],
+                   choices=["php", "mysql", "nextjs", "nextjs-python",
+                            "express", "tomcat"],
                    help="php+mysql = stack MariaDB; nextjs-python = Next + "
-                        "API FastAPI; el resto, postgres")
+                        "API FastAPI; express = Node + Express + React; "
+                        "el resto, postgres")
     b.add_argument("--stack", default=None)
     b.add_argument("--php", default=None)
     b.add_argument("--force", action="store_true",

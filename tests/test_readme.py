@@ -57,6 +57,22 @@ def todo_el_codigo():
 
 def main():
     rc = 0
+    # ---- la ayuda del CLI tiene que conocer TODOS los stacks del disco ----
+    # El stack nuevo se cablea en el CLI (RUNTIMES, RUNTIME_IMAGES) y en los
+    # READMEs, pero la AYUDA se olvida facil: es lo que el admin lee para
+    # saber que puede pedir. Medido con express: no aparecia ni en la lista de
+    # componentes del epilogo ni en los choices de build/upgrade.
+    print("=== la ayuda del CLI conoce los stacks ===")
+    cli = leer("bin/appctl")
+    epilogo = cli[cli.index("componentes:"):cli.index("ejemplos:")]
+    choices = re.findall(r"choices=\[([^\]]+)\]", cli)
+    for d in sorted(p.name for p in (RAIZ / "stacks").iterdir() if p.is_dir()):
+        rt = d.split("-")[0]
+        check("-h lista el componente {0}".format(rt),
+              re.search(r"^\s+" + rt + r"\s", epilogo, re.M) is not None)
+        check("un choices acepta {0}".format(rt),
+              any('"{0}"'.format(rt) in c for c in choices))
+
     for nombre, comillas in (("README.md", "«"), ("README.en.md", "'")):
         print("=" * 62)
         print("{0}  (el principal es el español)".format(nombre))
