@@ -2070,7 +2070,7 @@ DB_PUBLISH_KEY = "db_host_port"
 
 
 def _render_publish(port: int | None, stack: str = "php-postgres-sftp",
-                    bind: str = "127.0.0.1") -> str:
+                    bind: str = "0.0.0.0") -> str:
     """El bloque ports: del servicio db. Sin puerto: la nada.
 
     El puerto INTERNO lo decide el stack: hardcodear 5432 hacia que un
@@ -2133,17 +2133,21 @@ def cmd_db_expose(args) -> int:
     port = args.puerto
     if not (1024 <= port <= 65535):
         die(f"puerto {port} fuera de rango (1024-65535)")
-    bind = _validar_bind(getattr(args, "bind", "127.0.0.1"))
-    # El default es 127.0.0.1 y eso confunde al que espera que su cliente entre
-    # por el nombre del host: de afuera NO entra. Se dice al momento de exponer,
-    # que es cuando el operador puede corregirlo.
+    bind = _validar_bind(getattr(args, "bind", "0.0.0.0"))
+    # Exponer ES el proposito del comando: el default publica en 0.0.0.0, o
+    # sea al alcance de cualquier red que llegue al host (publicar solo en
+    # 127.0.0.1 obliga a un tunel ssh, que no es el caso de uso). Se dice
+    # fuerte, con la direccion util y como acotarlo, en vez de dejar la base
+    # abierta sin que el operador lo note.
+    _h = _host_guardado(args.proyecto, load_state(args.proyecto)) or "<host>"
     if bind == "127.0.0.1":
         print("  la base queda publicada SOLO en este host (127.0.0.1): de afuera")
-        print("  no entra. Si el cliente se conecta desde otra maquina:")
-        print(f"    appctl {args.proyecto} db expose {port} --bind 0.0.0.0")
+        print("  no entra, sirve solo para un tunel (ssh -L).")
     else:
-        print(f"  atencion: publicando en {bind} — la base queda al alcance "
-              f"de quien llegue a esa direccion, no solo de este host")
+        print(f"  atencion: la base queda al alcance de cualquier red que")
+        print(f"  llegue a {addr_publicada(bind, str(port), _h)} (no solo de este host).")
+        print(f"  Sigue pidiendo password; para acotar quien entra:")
+        print(f"    appctl {args.proyecto} db grant <usuario> --cidr <red>")
 
     compose = d / "compose.yaml"
     bak = d / "compose.yaml.pre-expose"
@@ -2322,7 +2326,7 @@ def _publish_desde_compose(texto: str) -> tuple[str, int] | None:
 
 
 def _set_publish(texto: str, port: int | None, stack: str = "php-postgres-sftp",
-                 state: dict | None = None, bind: str = "127.0.0.1") -> str:
+                 state: dict | None = None, bind: str = "0.0.0.0") -> str:
     """Poner o sacar el bloque ports: del servicio db.
 
     NO se edita el YAML linea por linea. Editarlo a mano fallo dos veces:
@@ -2763,7 +2767,7 @@ def main() -> int:
               appctl acme nextjs python psql sftp
               appctl acme list
               appctl acme rotate sftp
-              appctl acme db expose 5432 --bind 0.0.0.0
+              appctl acme db expose 5432 --bind 127.0.0.1
               appctl acme destroy
             """))
     ap.add_argument("--version", action="version", version="appctl 0.1.0")
@@ -2939,10 +2943,10 @@ def main() -> int:
     # Por defecto SOLO desde este host. Aca va una IP, no una red: medido,
     # docker rechaza un CIDR en ports: ('-p 10.20.0.0/16' -> exit 125). El
     # alcance por red se habilita donde corresponde: `db grant --cidr`.
-    q.add_argument("--bind", default="127.0.0.1", metavar="IP",
+    q.add_argument("--bind", default="0.0.0.0", metavar="IP",
                    help="desde que direccion del host se publica "
-                        "(default 127.0.0.1, o sea solo este host; "
-                        "0.0.0.0 lo abre a toda red que llegue)")
+                        "(default 0.0.0.0: cualquier red que llegue al "
+                        "host; 127.0.0.1 la deja solo para este host)")
     q.set_defaults(func=cmd_db_expose)
 
     q = dsub.add_parser("unexpose", help="cerrar la DB (vuelve al estado de siempre)",

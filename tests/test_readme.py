@@ -220,7 +220,7 @@ def main_una(nombre):
                   "el subcomando existe y el resumen de -h no lo dice")
     # expose: el flag y su default tienen que estar en la ayuda
     check("expose declara --bind con default 127.0.0.1",
-          'add_argument("--bind", default="127.0.0.1"' in cli)
+          'add_argument("--bind", default="0.0.0.0"' in cli)
     check("expose explica que persiste en state.json",
           "ANOTADOS en state.json" in cli)
     check("el epilogo tiene un ejemplo de expose", "db expose 5432" in cli)

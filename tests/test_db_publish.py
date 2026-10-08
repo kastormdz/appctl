@@ -2,9 +2,10 @@
 """El puerto publicado de la DB: se persiste, se muestra y no se abre de mas.
 
 QUE VERIFICA
-  1. `db expose` publica en 127.0.0.1 por defecto (lo que el README promete)
-     y `--bind` acepta una IP, no una red: medido, docker rechaza un CIDR en
-     `ports:` ('-p 10.20.0.0/16:15999:80' -> exit 125).
+  1. `db expose` publica en 0.0.0.0 por defecto: exponer es el proposito del
+     comando (publicar solo en 127.0.0.1 obliga a un tunel ssh). `--bind`
+     acepta una IP, no una red: medido, docker rechaza un CIDR en `ports:`
+     ('-p 10.20.0.0/16:15999:80' -> exit 125).
   2. El render del proyecto respeta el puerto persistido, y publicar mete al
      db en la red `egress`: su unica red (`data`) es internal:true y docker
      NO publica un puerto de ahi, asi que sin ese paso el puerto queda
@@ -103,13 +104,14 @@ def main() -> int:
     print("Puerto publicado de la DB: persistencia, info y bind")
     appctl = cargar_appctl()
 
-    # ---- 1. el bind: 127.0.0.1 por defecto, una IP se acepta, una red no ----
+    # ---- 1. el bind: 0.0.0.0 por defecto, una IP se acepta, una red no ----
     print("\n=== 1. donde se publica ===")
     txt = appctl._render_publish(15432, "php-postgres-sftp")
-    check("127.0.0.1:15432:5432" in txt,
-          "el render publica en 127.0.0.1 (no en 0.0.0.0)")
-    check("0.0.0.0" not in txt,
-          "el render NO publica en 0.0.0.0 por defecto")
+    check("0.0.0.0:15432:5432" in txt,
+          "el render publica en 0.0.0.0 por defecto (exponer es el proposito)")
+    check("127.0.0.1:15432:5432" in
+          appctl._render_publish(15432, "php-postgres-sftp", "127.0.0.1"),
+          "y --bind 127.0.0.1 lo deja solo para este host (caso tunel)")
     check("3306" in appctl._render_publish(15432, "php-mysql-sftp"),
           "el puerto interno lo decide el stack (mariadb: 3306)")
     check("10.20.0.5:15432:5432" in
@@ -127,8 +129,8 @@ def main() -> int:
     # ---- 2. el parser: --bind existe, --cidr es de `db grant` ----
     print("\n=== 2. el parser ===")
     (estado, _), visto = correr_cli(appctl, ["appctl", "dummy", "db", "expose", "15432"])
-    check(estado == "ok" and visto.get("bind") == "127.0.0.1",
-          "`db expose 15432` parsea con bind 127.0.0.1")
+    check(estado == "ok" and visto.get("bind") == "0.0.0.0",
+          "`db expose 15432` parsea con bind 0.0.0.0 (el default nuevo)")
     (estado, _), visto = correr_cli(appctl, ["appctl", "dummy", "db", "expose", "15432",
                                              "--bind", "10.20.0.5"])
     check(estado == "ok" and visto.get("bind") == "10.20.0.5",
@@ -151,7 +153,7 @@ def main() -> int:
             # lo que se verifica son los FLAGS, asi que se los reemplaza por
             # valores reales en vez de saltear la linea.
             cmd = (cmd.replace("<puerto>", "15432").replace("<port>", "15432")
-                      .replace("[--bind IP]", "--bind 127.0.0.1"))
+                      .replace("[--bind IP]", "--bind 0.0.0.0"))
             argv = [a.replace("<p>", "dummy").replace("<proyecto>", "dummy")
                     .replace("<project>", "dummy") for a in cmd.split()]
             (estado, code), _ = correr_cli(appctl, argv)
@@ -314,8 +316,8 @@ def main() -> int:
     cli = (ROOT / "bin" / "appctl").read_text()
     check("db_publish=_db_publish_vivo(args.proyecto)" in cli,
           "cmd_creds consulta la verdad de docker (no el state)")
-    check("--bind 0.0.0.0" in cli and "SOLO en este host" in cli,
-          "db expose avisa al operador cuando publica solo local")
+    check("SOLO en este host" in cli and "cualquier red que" in cli,
+          "db expose avisa el alcance al publicar (local y abierto)")
 
     st2 = dict(st, db_published_port=15432)
     out = summary.render_info(st2, {"SFTP_USER": "t"}, ps, None)

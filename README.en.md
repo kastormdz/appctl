@@ -487,17 +487,19 @@ are in `.gitignore`. A dump contains client data.
 ### Opening it up
 
 ```bash
-appctl <p> db expose 5432                     # publishes on 127.0.0.1 (this host only)
+appctl <p> db expose 5432                     # publishes on 0.0.0.0 (any network that reaches it)
+appctl <p> db expose 5432 --bind 127.0.0.1    # this host only (for an ssh tunnel)
 appctl <p> db expose 5432 --bind 10.20.0.5    # from a specific host IP
 appctl <p> db unexpose                        # close it
 ```
 
-The default is `127.0.0.1`, not a network: publishing on `0.0.0.0` puts the
-database within reach of any network that can reach the host, and whoever ran the
-command has no way to know. `--bind` takes an IP, not a network, because docker
-rejects a CIDR in `ports:`; network-wide access is what `db grant --cidr` is for,
-and that is a database permission, not a host publishing. Publishing the port
-doesn't take the database off its internal network.
+The default is `0.0.0.0`: if you expose the database it is so a client can get in
+from another machine, and publishing only on `127.0.0.1` forces an `ssh -L`
+tunnel. The command says so when publishing, with the usable address
+(`host:port`) and how to narrow it. The database stays protected: it still asks
+for a password, stays on its internal network, and `db grant --cidr` limits which
+network each user connects from. `--bind` takes an IP, not a network, because
+docker rejects a CIDR in `ports:`; `--bind 127.0.0.1` is for the "tunnel only" case.
 
 The port and the bind are recorded in `state.json`: `appctl <p> info` shows them
 and an `upgrade` no longer drops them. They used to live only in the rendered
@@ -506,7 +508,7 @@ back to closed while the client believed it was still open.
 
 `info` and `creds` show the address a client connects with, not the raw bind.
 With `--bind 0.0.0.0` they show the **host** (`dicappsrv…:5435`) and state that
-anyone who reaches that address gets in; with the default `127.0.0.1` they show
+anyone who reaches that address gets in; with `--bind 127.0.0.1` they show
 `127.0.0.1:5435` and warn that **nothing from outside gets in** — the host name
 there would be an address that answers to nobody. `db expose` says so at publish
 time, and `creds` (the summary the developer receives) now carries the database's
@@ -573,7 +575,7 @@ appctl <project> db dump [-o path]           # export the database as gzip
 appctl <project> db restore <file> --yes     # import; OVERWRITES the database
 appctl <project> db list                     # backups that exist
 appctl <project> db rm <file> -y             # delete a backup
-appctl <project> db expose <port> [--bind IP]  # publish (default 127.0.0.1)
+appctl <project> db expose <port> [--bind IP]  # publish (default 0.0.0.0)
 appctl <project> db unexpose                 # close it
 appctl <project> db grant <user>             # add an external user
 appctl <project> db revoke <user> --yes      # take the access away
@@ -861,7 +863,7 @@ Working end to end, verified with both PostgreSQL and MariaDB:
 | `clone` | new data, indexes and credentials; the clone is independent of the source |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, data intact |
 | `db dump` / `restore` | PostgreSQL and MariaDB |
-| `db expose` | publishes the database on a host port, by default only from `127.0.0.1`; the port is recorded and an `upgrade` no longer drops it |
+| `db expose` | publishes the database on a host port, by default on `0.0.0.0` (any network that reaches it; `--bind 127.0.0.1` for this-host-only); the port is recorded and an `upgrade` no longer drops it |
 | `db grant` | adds external users, each with its own password |
 
 All four stacks were verified end to end, including `tomcat-postgres-sftp`.

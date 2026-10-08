@@ -485,17 +485,19 @@ están en `.gitignore`. Un dump tiene datos de clientes.
 ### Exponerla
 
 ```bash
-appctl <p> db expose 5432                     # publica en 127.0.0.1 (solo este host)
+appctl <p> db expose 5432                     # publica en 0.0.0.0 (cualquier red que llegue)
+appctl <p> db expose 5432 --bind 127.0.0.1    # solo este host (para un tunel ssh)
 appctl <p> db expose 5432 --bind 10.20.0.5    # desde una IP concreta del host
 appctl <p> db unexpose                        # cerrarla
 ```
 
-El default es `127.0.0.1` y no una red: publicar en `0.0.0.0` deja la base al
-alcance de cualquier red que llegue al host, y quien corre el comando no tiene
-por qué saber que quedó abierta a medio entorno. `--bind` acepta una IP y no una
-red, porque docker rechaza un CIDR en `ports:`; el alcance por red se habilita
-con `db grant --cidr`, que es un permiso de la base y no una publicación del host.
-Publicar el puerto no saca la base de su red interna.
+El default es `0.0.0.0`: si alguien expone la base es para que un cliente entre
+desde otra máquina, y publicar solo en `127.0.0.1` obliga a un túnel `ssh -L`.
+El comando lo dice al publicar, con la dirección útil (`host:puerto`) y cómo
+acotarlo. La base igual queda protegida: sigue pidiendo password, sigue en su
+red interna y `db grant --cidr` limita desde qué red se conecta cada usuario.
+`--bind` acepta una IP y no una red, porque docker rechaza un CIDR en `ports:`;
+`--bind 127.0.0.1` es para el caso "solo por túnel".
 
 El puerto y el bind quedan anotados en `state.json`: `appctl <p> info` los
 muestra y un `upgrade` no los pierde. Antes vivían solo en el `compose.yaml`
@@ -503,9 +505,9 @@ renderizado, así que el próximo re-render los borraba en silencio y la base
 quedaba cerrada con el cliente creyendo que seguía abierta.
 
 `info` y `creds` muestran la dirección con la que se conecta un cliente, no el
-bind crudo. Con `--bind 0.0.0.0` muestran el **host** (`dicappsrv…:5435`) y
-aclaran que entra cualquiera que llegue a esa dirección; con el default
-`127.0.0.1` muestran `127.0.0.1:5435` y avisan que **de afuera no entra** — el
+bind crudo. Con `0.0.0.0` (el default) muestran el **host** (`dicappsrv…:5435`)
+y aclaran que entra cualquiera que llegue a esa dirección; con `--bind 127.0.0.1`
+muestran `127.0.0.1:5435` y avisan que **de afuera no entra** — el
 nombre del host ahí sería una dirección que no atiende a nadie. `db expose` da
 ese aviso al publicar, y `creds` (el resumen que recibe el developer) incluye el
 estado de la base: antes decía siempre "la DB no se abre desde internet", que con
@@ -571,7 +573,7 @@ appctl <proyecto> db dump [-o ruta]           # exporta la base en gzip
 appctl <proyecto> db restore <archivo> --yes # importa; PISA la base
 appctl <proyecto> db list                    # backups que hay
 appctl <proyecto> db rm <archivo> -y         # borra un backup
-appctl <proyecto> db expose <puerto> [--bind IP]  # publica (default 127.0.0.1)
+appctl <proyecto> db expose <puerto> [--bind IP]  # publica (default 0.0.0.0)
 appctl <proyecto> db unexpose                # cierra
 appctl <proyecto> db grant <usuario>         # alta de usuario externo
 appctl <proyecto> db revoke <usuario> --yes  # le saca el acceso
@@ -857,7 +859,7 @@ Funcional y verificado de punta a punta con PostgreSQL y MariaDB:
 | `clone` | datos, índices y credenciales nuevas; el clon es independiente del origen |
 | `upgrade` | PHP 8.5 → 8.4 → 8.5, con los datos intactos |
 | `db dump` / `restore` | PostgreSQL y MariaDB |
-| `db expose` | publica la base en un puerto del host, por defecto solo desde `127.0.0.1`; el puerto queda anotado y un `upgrade` no lo pierde |
+| `db expose` | publica la base en un puerto del host, por defecto en `0.0.0.0` (cualquier red que llegue; `--bind 127.0.0.1` para solo-este-host); el puerto queda anotado y un `upgrade` no lo pierde |
 | `db grant` | alta de usuarios externos, cada uno con su password |
 
 Los cuatro stacks fueron verificados de punta a punta, incluido
