@@ -224,6 +224,14 @@ def main_una(nombre):
     check("expose explica que persiste en state.json",
           "ANOTADOS en state.json" in cli)
     check("el epilogo tiene un ejemplo de expose", "db expose 5432" in cli)
+    # ---- las extensiones que trae la imagen PHP ----
+    # Medido: intl, gd, zip, bcmath y soap no estaban, y el comentario del
+    # Dockerfile afirmaba que intl venia en la base (falso). Si un README deja
+    # de nombrarlas, un cliente vuelve a preguntar si estan.
+    print("=== imagen PHP: extensiones ===")
+    for ext in ("intl", "gd", "zip", "bcmath", "soap", "icu-data-full"):
+        check(f"el README nombra {ext}", ext in t)
+
     print()
     return 0
 

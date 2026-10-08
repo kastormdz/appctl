@@ -588,15 +588,52 @@ Bajadas una por una contra Docker Hub, no de memoria (2026-10-01):
 | Tomcat | `tomcat:9-jdk21-temurin-noble` | 730 MB |
 
 `php:8.5-fpm-alpine` pesa 150 MB contra 732 MB de bookworm, cinco veces menos,
-y eso decide cuántos clientes entran en el disco. El stack de PHP usa alpine; si
-un cliente necesita una extensión que no compila ahí (GD con librerías del
-sistema, por ejemplo), se cae a bookworm y se acepta el costo.
+y eso decide cuántos clientes entran en el disco. El stack de PHP usa alpine.
+Las extensiones que un cliente pide seguido (`intl`, `gd`, `zip`, `bcmath`,
+`soap`) se compilan ahí sin problema y vienen en la imagen: no hace falta caer a
+bookworm por eso. Ver *Qué trae la imagen PHP*.
 
 En Tomcat, los tags con `jre` en el nombre no existen: solo están los `jdk`.
 
 ---
 
 ## Endurecimiento de PHP y nginx
+
+### Qué trae la imagen PHP
+
+Medido dentro del contenedor con `php -m` y `extension_loaded()`, no copiado de
+una tabla de paquetes Debian (los nombres `php8.5-*` son de Debian; acá son las
+extensiones):
+
+| Extensión | Para qué la pide un cliente |
+|---|---|
+| `pdo_pgsql` + `pgsql` | conectarse a PostgreSQL (o `pdo_mysql` + `mysqli` en el stack de MySQL) |
+| `mbstring` | strings UTF-8 (tildes, ñ) |
+| `intl` | fechas, números y monedas por ICU; Laravel y Symfony lo usan |
+| `gd` | imágenes: TCPDF, PhpSpreadsheet, thumbnails |
+| `zip` | `ZipArchive`: exports de Excel (Laravel Excel, zipstream) |
+| `bcmath` | decimales exactos: JWK/JWT, barcodes PDF417 de TCPDF |
+| `soap` | clientes SOAP legacy |
+| `xml`, `dom`, `SimpleXML`, `xmlreader`, `xmlwriter`, `libxml` | parseo y generación de XML |
+| `curl` | HTTP saliente (`wp_remote_get`, Guzzle) |
+| `Zend OPcache` | caché de opcodes del runtime |
+
+Dos detalles que se pagan solos:
+
+- `Zend OPcache` viene **compilado** en la imagen oficial, sin `.so` propio: se
+  consulta con ese nombre exacto (`extension_loaded('Zend OPcache')`), y buscar
+  `opcache` a secas da falso. No está en el `php.ini` porque no hace falta.
+- `intl` necesita los datos de ICU, y alpine los parte: `icu-data-en` trae solo
+  los locales ingleses. Con eso, `IntlDateFormatter('es_AR')` **formatea en
+  inglés** sin avisar. La imagen instala `icu-data-full` (906 locales, `es_AR`
+  incluido).
+
+Si un cliente necesita una extensión que no está en la lista, se agrega al
+Dockerfile del stack (`stacks/php-*-sftp/image/Dockerfile`), se reconstruye la
+imagen y se mueve el proyecto con `upgrade`. Ojo con las dependencias de build:
+van en un grupo `apk --virtual` que se borra al final, y las librerías de *runtime*
+tienen que quedar afuera de ese grupo porque `apk del` se lleva las del grupo.
+
 
 Los stacks de PHP salen con esto puesto de fábrica. No hay que tocar nada por
 proyecto: va horneado en la imagen.

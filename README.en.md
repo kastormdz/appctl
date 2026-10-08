@@ -590,15 +590,52 @@ Pulled one by one against Docker Hub, not from memory (2026-10-01):
 | Tomcat | `tomcat:9-jdk21-temurin-noble` | 730 MB |
 
 `php:8.5-fpm-alpine` is 150 MB against 732 MB for bookworm, five times less, and
-that decides how many clients fit on the disk. The PHP stack uses alpine; if a
-client needs an extension that won't build there (GD with system libraries, for
-instance), you drop to bookworm and accept the cost.
+that decides how many clients fit on the disk. The PHP stack uses alpine. The
+extensions clients ask for most (`intl`, `gd`, `zip`, `bcmath`, `soap`) build
+there without trouble and ship in the image: there is no need to drop to
+bookworm for them. See *What the PHP image ships*.
 
 On Tomcat, tags with `jre` in the name don't exist: only the `jdk` ones do.
 
 ---
 
 ## PHP and nginx hardening
+### What the PHP image ships
+
+Measured inside the container with `php -m` and `extension_loaded()`, not copied
+from a Debian package table (`php8.5-*` names are Debian's; here they are
+extensions):
+
+| Extension | Why a client asks for it |
+|---|---|
+| `pdo_pgsql` + `pgsql` | PostgreSQL access (`pdo_mysql` + `mysqli` on the MySQL stack) |
+| `mbstring` | UTF-8 strings |
+| `intl` | dates, numbers and currencies via ICU; Laravel and Symfony use it |
+| `gd` | images: TCPDF, PhpSpreadsheet, thumbnails |
+| `zip` | `ZipArchive`: Excel exports (Laravel Excel, zipstream) |
+| `bcmath` | exact decimals: JWK/JWT, TCPDF PDF417 barcodes |
+| `soap` | legacy SOAP clients |
+| `xml`, `dom`, `SimpleXML`, `xmlreader`, `xmlwriter`, `libxml` | XML parsing and generation |
+| `curl` | outbound HTTP (`wp_remote_get`, Guzzle) |
+| `Zend OPcache` | runtime opcode cache |
+
+Two details that pay for themselves:
+
+- `Zend OPcache` ships **compiled in** the official image, with no `.so` of its
+  own: check it by that exact name (`extension_loaded('Zend OPcache')`); looking
+  for plain `opcache` returns false. It is not in `php.ini` because it is not
+  needed.
+- `intl` needs ICU data, and alpine splits it: `icu-data-en` carries only the
+  English locales. With that, `IntlDateFormatter('es_AR')` **formats in English**
+  with no warning. The image installs `icu-data-full` (906 locales, `es_AR`
+  included).
+
+If a client needs an extension that is not on the list, add it to the stack's
+Dockerfile (`stacks/php-*-sftp/image/Dockerfile`), rebuild the image and move the
+project with `upgrade`. Careful with build dependencies: they go in a `apk --virtual`
+group removed at the end, and the *runtime* libraries must stay outside that
+group because `apk del` takes the group's packages with it.
+
 
 The PHP stacks ship with this set from the factory. There's nothing to touch per
 project: it's baked into the image.
