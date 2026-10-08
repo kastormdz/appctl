@@ -263,6 +263,14 @@ image, not at startup) and answers `/api/healthz` with the Express version, the
 node version and the database status: verifying a new stack has to test the
 stack, not a text placeholder.
 
+
+If the network is closed, `create` stores `HTTP_PROXY`/`HTTPS_PROXY` in the
+project's `.env` when you have them in your environment (`appctl` does not
+invent a proxy): `npm ci` runs at **container startup**, so the proxy has to be
+there and not only on the machine where the image is built. Without it, a
+project with real code never starts and the only visible symptom is
+`npm ERR! network`.
+
 ### Tomcat
 
 Tomcat changes the shape of the stack because **it is not PHP**: there's no

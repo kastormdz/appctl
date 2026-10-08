@@ -626,6 +626,18 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
         env_lines.append(f"APP_MEMORY={app_memory}")
     if db_memory:
         env_lines.append(f"DB_MEMORY={db_memory}")
+    # El proxy, para los stacks de NODE. `npm ci` / `npm install` corren en
+    # el ARRANQUE (el cliente sube su codigo y las deps se instalan en el
+    # contenedor), asi que el proxy tiene que estar en el entorno del
+    # CONTENEDOR, no en el del build. El compose de estos stacks interpola
+    # ${HTTP_PROXY:-} desde este .env: sin esto, un proyecto con codigo real
+    # no arranca en una red cerrada y lo unico que se ve es "npm ERR!
+    # network", que no dice que falto una variable.
+    if runtime_of(stack) in ("nextjs", "express"):
+        for _k in ("HTTP_PROXY", "HTTPS_PROXY"):
+            if os.environ.get(_k) and not any(
+                    l.startswith(_k + "=") for l in env_lines):
+                env_lines.append(f"{_k}={os.environ[_k]}")
     (pdir / ".env").write_text("\n".join(env_lines) + "\n")
     (pdir / ".env").chmod(0o600)
 

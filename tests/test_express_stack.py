@@ -172,7 +172,16 @@ def main() -> int:
         igual = ini == leer(f"stacks/{otro}/init/10-roles.sh")
         check(igual, f"init/10-roles.sh identico al de {otro}")
 
-    print("\n=== 10. los READMEs lo documentan ===")
+    print("\n=== 10. el proxy se persiste para los stacks de node ===")
+    cli = leer("bin/appctl")
+    check('if runtime_of(stack) in ("nextjs", "express"):' in cli,
+          "el create guarda HTTP_PROXY/HTTPS_PROXY en el .env de los stacks node")
+    check("os.environ.get(_k)" in cli,
+          "y solo si el admin los tiene en el entorno (no inventa un proxy)")
+    check("${HTTP_PROXY:-}" in leer(f"stacks/{NOMBRE}/compose.tmpl.yaml"),
+          "el compose del stack los toma del .env")
+
+    print("\n=== 11. los READMEs lo documentan ===")
     for n in ("README.md", "README.en.md"):
         t = leer(n)
         check(NOMBRE in t, f"{n} nombra el stack")
