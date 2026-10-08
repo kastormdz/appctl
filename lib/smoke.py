@@ -768,8 +768,11 @@ def app_serves(project_dir: str, app_port: int, project: str,
                      f"php {ver_php}")
     if "node: " in body:
         ver = body.split("node: ")[1].splitlines()[0] if "node: " in body else ""
-        return Check("app responde (nginx -> next standalone)", True,
-                     f"node {ver}")
+        # El mismo marcador ("node: ") lo usan el stub de Next y el de
+        # Express: el nombre del check sale del STACK, no de la pagina.
+        _rt = ("express" if "express" in (cfg or {}).get("stack", "")
+               else "next standalone")
+        return Check(f"app responde (nginx -> {_rt})", True, f"node {ver}")
     if "tomcat:" in body:
         tj = body.split("tomcat: ")[1].splitlines()[0] if "tomcat: " in body else ""
         ja = body.split("java: ")[1].splitlines()[0] if "java: " in body else ""
@@ -984,6 +987,55 @@ def db_es_utilizable(project_dir: str, cfg: dict) -> Check:
                  "responde consultas con el rol de la app, no solo un ping")
 
 
+def app_serves_api(project_dir: str, app_port: int, cfg: dict | None = None,
+                   expect_stub: bool = True) -> Check:
+    """La API del cliente responde detras de nginx (/api -> Express).
+
+    Por que es un check APARTE: nginx sirve el build de React en / y proxya
+    /api al backend. Un 200 en / no prueba NADA de Express: si el backend se
+    murio, / sigue sirviendo el index.html y el proyecto se reporta sano con
+    la API tirada.
+
+    expect_stub True (create): el stub contesta /api/healthz con su JSON.
+    expect_stub False (upgrade): el cliente ya pudo subir su API, asi que un
+    2xx/3xx/4xx alcanza — nginx devuelve 502 si Express no esta, y un fatal
+    de node da 500: esas dos son fallas reales, un 404 de una ruta que no
+    existe no lo es.
+    """
+    try:
+        p = subprocess.run(
+            ["curl", "-q", "-sS", "--max-time", "10", "-w", "\n%{http_code}",
+             f"http://127.0.0.1:{app_port}/api/healthz"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return Check("API express responde", False, f"no se pudo pedir: {e}")
+    if p.returncode != 0:
+        return Check("API express responde (nginx -> express)", False,
+                     f"curl fallo: {p.stderr.strip()[:200]}")
+    _cuerpo, _, _http = p.stdout.rpartition("\n")
+    body, http = _cuerpo, _http.strip()
+    if "express ok" in body:
+        try:
+            d = json.loads(body)
+            return Check("API express responde (nginx -> express)", True,
+                         f"express {d.get('express', '?')} | node "
+                         f"{d.get('node', '?')} | db: {d.get('db', '?')}")
+        except ValueError:
+            return Check("API express responde (nginx -> express)", True,
+                         body[:120])
+    if not expect_stub:
+        if not http.startswith(("2", "3", "4")):
+            return Check("API express responde (nginx -> express)", False,
+                         f"HTTP {http or 'sin respuesta'}: el runtime no "
+                         f"contesta: {body[:160]!r}")
+        primera = body.splitlines()[0][:120] if body.strip() else "(sin cuerpo)"
+        return Check(f"API express responde (codigo del cliente, HTTP {http})",
+                     True, f"no es el stub, es la API real: {primera!r}")
+    return Check("API express responde", False,
+                 f"el stub no contesta /api/healthz: {body[:200]!r}")
+
+
 def all_checks(project_dir: str, cfg: dict, host: str,
                expect_stub: bool = True) -> list[Check]:
     """Suite completa, en el orden en que conviene fallar.
@@ -1015,6 +1067,12 @@ def all_checks(project_dir: str, cfg: dict, host: str,
     checks.append(db_not_reachable_from_other_container(project_dir, cfg))
     checks.append(app_serves(project_dir, cfg["app_port"], project, cfg,
                              expect_stub=expect_stub))
+    # El stack express tiene DOS cosas detras del mismo nginx: el build de
+    # React en / y la API en /api. Sin este check, un backend muerto pasaba
+    # desapercibido con el resto en verde (nginx sigue sirviendo el index).
+    if "express" in (cfg.get("stack") or ""):
+        checks.append(app_serves_api(project_dir, cfg["app_port"], cfg,
+                                     expect_stub=expect_stub))
     # El stack nextjs-python tiene DOS runtimes en el mismo puerto: / lo
     # contesta Next y /api la API. Sin este check, una API caida pasaba
     # desapercibida con el resto en verde.

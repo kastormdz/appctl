@@ -104,7 +104,7 @@ def _default_host() -> str:
 
 DEFAULT_HOST = _default_host()
 
-RUNTIMES = {"php", "nextjs", "tomcat"}
+RUNTIMES = {"php", "nextjs", "express", "tomcat"}
 DATABASES = {"psql", "mysql"}
 SERVICES = {"psql", "mysql", "sftp"}
 # `python` no es un runtime suelto (no hay stack python-postgres-sftp): es
@@ -123,6 +123,9 @@ DEFAULT_TAGS = {
     "mysql": os.environ.get("APPCTL_MYSQL_TAG", "11.8"),
     "sftp": "alpine",
     "nextjs": os.environ.get("APPCTL_NODE_TAG", "22-alpine"),
+    # mismo node 22 que nextjs, pero la app es un backend de Express con el
+    # frontend de React servido como estatico por nginx.
+    "express": os.environ.get("APPCTL_NODE_TAG", "22-alpine"),
     # tomcat oficial de docker (Tomcat + JDK ya resueltos). NO bitnami:
     # desde ago-2025 su catalogo publico es de pago y lo gratuito esta
     # congelado en bitnamilegacy, sin parches de CVE.
@@ -167,7 +170,8 @@ def stack_name(components: set[str]) -> str:
     serian copias identicas con dos lineas de diferencia. Cron se resuelve
     como bandera: `want_cron` se pasa aparte al render.
     """
-    runtime = next((r for r in ("php", "nextjs", "tomcat") if r in components), None)
+    runtime = next((r for r in ("php", "nextjs", "express", "tomcat")
+                    if r in components), None)
     # `python` va pegado al runtime (nextjs-python-postgres-sftp): el nombre
     # tiene que decir que imagen se construye, y la de este stack trae node
     # Y python. No se duplica cada directorio de stack: 5 stacks cubren
@@ -557,7 +561,9 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
                  "      CRON_ENABLED: '0'\n"),
         "__PG_VERSION__": pg_major,
         "__MYSQL_VERSION__": tags.get("mysql", "11.8"),
-        "__NODE_VERSION__": tags.get("nextjs", "22-alpine"),
+        # el runtime del stack, no "nextjs" fijo: con express el proyecto
+        # tiene tag "express" y el get("nextjs") daba el default por suerte.
+        "__NODE_VERSION__": tags.get(runtime_of(stack), "22-alpine"),
         "__TOMCAT_VERSION__": tags.get("tomcat", "11-jdk25-temurin-noble"),
         "__APP_PORT__": str(app_port),
         "__SFTP_PORT__": str(sftp_port or 0),
@@ -693,6 +699,7 @@ RUNTIME_IMAGES = {
     # node Y python en la misma imagen: el stack levanta los dos runtimes
     # detras del mismo nginx (Next en :3000, uvicorn en :8000).
     "nextjs-python-postgres-sftp": ("appctl/node-python-sftp", "nextjs"),
+    "express-postgres-sftp": ("appctl/node-express-sftp", "express"),
     "tomcat-postgres-sftp": ("appctl/tomcat-sftp",     "tomcat"),
 }
 

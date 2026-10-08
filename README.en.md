@@ -156,7 +156,7 @@ Each stack is a directory under `stacks/`, with its `compose.tmpl.yaml` and its
 own image (Dockerfile, entrypoint, nginx) where needed. Adding one means copying
 a directory and adjusting the placeholders.
 
-There are **5**, and each brings up **two containers**: `app` and `db`.
+There are **6**, and each brings up **two containers**: `app` and `db`.
 
 | Stack | App | Database | Notes |
 |---|---|---|---|
@@ -164,6 +164,7 @@ There are **5**, and each brings up **two containers**: `app` and `db`.
 | `php-mysql-sftp` | PHP 8.5 + nginx + sshd | MariaDB 11.8 | |
 | `nextjs-postgres-sftp` | Node 22 + Next.js | PostgreSQL 18 | multi-stage build, `.next` |
 | `nextjs-python-postgres-sftp` | Node 22 + Next.js + Python API (FastAPI) | PostgreSQL 18 | two runtimes in one container: `/api` → uvicorn, the rest → Next |
+| `express-postgres-sftp` | Node 22 + Express + React | PostgreSQL 18 | nginx serves the React build and proxies `/api` to Express |
 | `tomcat-postgres-sftp` | Tomcat 11 + JDK 25 | PostgreSQL 18 | the external proxy talks straight to Tomcat |
 
 SFTP is not a separate container: it's an `sshd` inside the app container, with
@@ -215,6 +216,52 @@ works **with no network** on a fresh `create`.
 The healthcheck hits `/healthz` **and** `/api/healthz`. A check that only looks at
 Next leaves the container green with the API down — exactly the kind of green that
 is worth nothing.
+
+### Express + React
+
+The stack for "Express backend + React frontend", which is what gets asked for
+often. One image with Node 22, one nginx and one port:
+
+```text
+/        -> the REACT BUILD (static, with SPA fallback)
+/api/    -> Express          (127.0.0.1:3000)
+```
+
+```bash
+appctl acme express psql sftp
+```
+
+The client uploads **two folders** over SFTP to `/upload`:
+
+```text
+upload/backend/     package.json + server.js (the Express app)
+upload/frontend/    the React app: source, or already built in dist/ (or build/, out/)
+```
+
+Startup handles both cases: if the backend already has `node_modules` and the
+frontend already has a build with `index.html`, it just starts; otherwise it
+installs (`npm ci`) and builds (`npm run build`) by itself. The backend command
+is whatever is there: the `package.json` `start` script wins, otherwise
+`server.js`, `index.js` or `app.js`.
+
+Three decisions that show up in production:
+
+- **nginx serves the build as static files and proxies `/api`** to the backend
+  without eating the prefix: the client's routes (`app.get('/api/x')`) arrive
+  intact.
+- **SPA fallback for routes only**: `/clients/7` returns `index.html` (React
+  Router handles that in the browser), but a `.js` that doesn't exist returns
+  **404**, not the HTML — otherwise the browser gets HTML where it expects a
+  module and the visible error is `Unexpected token '<'`, which says nothing
+  about the cause.
+- **The healthcheck watches nginx** (answering any 1xx-4xx), not an app
+  `/healthz`: tied to the app's file, any client whose code lacks it stays
+  `unhealthy` forever the moment they upload their real app.
+
+The stub of a freshly created project **is real Express** (installed in the
+image, not at startup) and answers `/api/healthz` with the Express version, the
+node version and the database status: verifying a new stack has to test the
+stack, not a text placeholder.
 
 ### Tomcat
 
@@ -822,7 +869,7 @@ appctl/
 │   ├── dbtool.py              # dump / restore / expose / grant
 │   ├── smoke.py               # the checks (11 on nextjs-python)
 │   └── summary.py             # the summary for the developer
-├── stacks/                    # 5 stacks, one per directory
+├── stacks/                    # 6 stacks, one per directory
 └── tests/
     ├── test_init_sql.py       # runs the inits and validates the SQL they produce
     ├── test_root_pw.py        # parses the password line out of the mariadb log

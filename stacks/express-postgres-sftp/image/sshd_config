@@ -1,0 +1,49 @@
+Port 22
+AddressFamily inet
+ListenAddress 0.0.0.0
+
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+# El subsystem SFTP, en proceso (internal-sftp): sin esta linea sshd no sabe
+# que responder cuando el cliente pide sftp ("subsystem request failed on
+# channel 0"). Al correr dentro del sshd no necesita ningun binario en el
+# chroot: por eso el chroot trae solo /upload y /private, nada mas.
+# -d /upload va en el ForceCommand de abajo: el cliente entra directo al
+# webroot, con /private al lado.
+Subsystem sftp internal-sftp
+
+# Solo SFTP. Sin shell, sin PTY, sin forwarding: la sesion del cliente no
+# puede escalar a una shell interactiva en el contenedor.
+#
+# OJO: "internal-sftp" con ChrootDirectory NO funciona como unico mecanismo.
+# internal-sftp es un wrapper de sshd, no un binario, y no existe dentro del
+# chroot. Con Subsystem sftp apuntando al binario real, esto queda de
+# respaldo para subsistemas que no sean sftp.
+ForceCommand internal-sftp
+PermitTTY no
+X11Forwarding no
+AllowTcpForwarding no
+AllowAgentForwarding no
+PermitTunnel no
+GatewayPorts no
+
+PasswordAuthentication yes
+PermitEmptyPasswords no
+PubkeyAuthentication yes
+
+# solo el usuario del proyecto puede entrar (lo crea el entrypoint)
+AllowUsers __SFTP_USER__
+# MaxAuthTries: NO bajarlo a 3. Un cliente normal tiene 5 llaves en
+# ~/.ssh (id_rsa, id_ecdsa, id_ecdsa_sk, id_ed25519, id_ed25519_sk) y las
+# ofrece TODAS antes de que le pidan la password. Con 3 intentos el server
+# corta con "Too many authentication failures" y el cliente nunca llega a
+# escribir la password que le dio appctl. Es el error #1 de SFTP.
+# 10 es el default de OpenSSH y aguante un cliente con muchas llaves.
+MaxAuthTries 10
+MaxSessions 4
+LoginGraceTime 30
+
+# el chroot lo hace ForceCommand internal-sftp + el home del usuario
+ChrootDirectory __SFTP_HOME__

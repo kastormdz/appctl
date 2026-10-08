@@ -1,4 +1,4 @@
-# Generado por appctl desde stacks/nextjs-postgres-sftp/compose.tmpl.yaml
+# Generado por appctl desde stacks/express-postgres-sftp/compose.tmpl.yaml
 # NO EDITAR A MANO: los cambios se pierden en el proximo
 # `appctl <proyecto> upgrade`, que lo re-renderiza desde este template.
 #
@@ -10,9 +10,10 @@ name: appctl-__PROYECTO__
 services:
 
   # ---------------------------------------------------------------- app ----
-  # nginx + Next.js (standalone) + sshd en un mismo contenedor. nginx es
-  # proxy puro: Next sirve la app y sus estaticos. El cliente sube su
-  # proyecto por SFTP y el entrypoint lo buildea si hace falta.
+  # nginx + Express + sshd en un mismo contenedor. nginx sirve el BUILD DE
+  # REACT como estatico (con fallback SPA para las rutas del router) y
+  # proxya /api al backend de Express. El cliente sube backend/ y
+  # frontend/ por SFTP a /upload; el entrypoint arma /app/start.sh.
   app:
     image: __APP_IMAGE__
     # La imagen es local (la construye `appctl build` y la comparten todos
@@ -123,11 +124,17 @@ __CRON__
           cpus: "${APP_CPUS:-1.0}"
           memory: ${APP_MEMORY:-512M}
     healthcheck:
-      test: ["CMD-SHELL", "curl -qfsS http://127.0.0.1/healthz || exit 1"]
+      # El healthcheck mira que NGINX conteste (cualquier 1xx-4xx), no que
+      # la app sirva /healthz: atarlo a un archivo de la app marca unhealthy
+      # para siempre a todo cliente cuyo codigo no lo tenga, y eso pasa en
+      # cuanto suben su app de verdad. Un 5xx o el silencio si son fallas
+      # reales del runtime. start_period alto: el arranque puede instalar
+      # deps y buildear el frontend.
+      test: ["CMD-SHELL", "curl -q -sS -o /dev/null -w '%{http_code}' http://127.0.0.1/ | grep -qE '^[1-4]'"]
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 45s
+      start_period: 120s
     security_opt:
       - no-new-privileges:true
     # root por defecto: el entrypoint necesita crear el chroot con
