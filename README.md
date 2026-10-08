@@ -502,6 +502,15 @@ muestra y un `upgrade` no los pierde. Antes vivían solo en el `compose.yaml`
 renderizado, así que el próximo re-render los borraba en silencio y la base
 quedaba cerrada con el cliente creyendo que seguía abierta.
 
+`info` y `creds` muestran la dirección con la que se conecta un cliente, no el
+bind crudo. Con `--bind 0.0.0.0` muestran el **host** (`dicappsrv…:5435`) y
+aclaran que entra cualquiera que llegue a esa dirección; con el default
+`127.0.0.1` muestran `127.0.0.1:5435` y avisan que **de afuera no entra** — el
+nombre del host ahí sería una dirección que no atiende a nadie. `db expose` da
+ese aviso al publicar, y `creds` (el resumen que recibe el developer) incluye el
+estado de la base: antes decía siempre "la DB no se abre desde internet", que con
+un puerto expuesto era falso.
+
 ### Usuarios de la base
 
 ```bash

@@ -30,7 +30,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 import ports as portsmod
 import gen as sec
 import smoke as smokemod
-from summary import render_create, render_rotate, render_list, render_info, fmt_limites
+from summary import (render_create, render_rotate, render_list, render_info,
+                      fmt_limites, addr_publicada)
 
 # Donde van los proyectos. Se define con APPCTL_PROJECTS; si no esta, se usa
 # el default de abajo.
@@ -1742,7 +1743,8 @@ def cmd_creds(args) -> int:
                         {k: env[k] for k in
                          ("DB_PASSWORD", "DB_MIGRATION_PASSWORD",
                           "DB_READONLY_PASSWORD", "SFTP_PASSWORD")},
-                        str(build_dir(args.proyecto)), creds_only=True))
+                        str(build_dir(args.proyecto)), creds_only=True,
+                        db_publish=_db_publish_vivo(args.proyecto)))
     return 0
 
 
@@ -2132,7 +2134,14 @@ def cmd_db_expose(args) -> int:
     if not (1024 <= port <= 65535):
         die(f"puerto {port} fuera de rango (1024-65535)")
     bind = _validar_bind(getattr(args, "bind", "127.0.0.1"))
-    if bind != "127.0.0.1":
+    # El default es 127.0.0.1 y eso confunde al que espera que su cliente entre
+    # por el nombre del host: de afuera NO entra. Se dice al momento de exponer,
+    # que es cuando el operador puede corregirlo.
+    if bind == "127.0.0.1":
+        print("  la base queda publicada SOLO en este host (127.0.0.1): de afuera")
+        print("  no entra. Si el cliente se conecta desde otra maquina:")
+        print(f"    appctl {args.proyecto} db expose {port} --bind 0.0.0.0")
+    else:
         print(f"  atencion: publicando en {bind} — la base queda al alcance "
               f"de quien llegue a esa direccion, no solo de este host")
 
@@ -2169,6 +2178,10 @@ def cmd_db_expose(args) -> int:
         die(f"expuse: {detalle}\n"
             f"  se volvio a dejar la db cerrada (como estaba antes).")
     print(f"  el {port} responde")
+    _h = _host_guardado(args.proyecto, load_state(args.proyecto)) or "<host>"
+    _nota = "  (solo desde este host)" if bind == "127.0.0.1" else ""
+    print(f"  direccion para conectarse: "
+          f"{addr_publicada(bind, str(port), _h)}{_nota}")
     st = load_state(args.proyecto)
     st["db_published_port"] = port
     st["db_published_bind"] = bind

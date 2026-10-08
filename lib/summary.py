@@ -25,9 +25,35 @@ def _plain(s: str) -> str:
 SECRET_ONLY = {"DB_ROOT_PASSWORD"}
 
 
+def addr_publicada(bind: str, puerto: str, host: str) -> str:
+    """La direccion que le sirve a un cliente, a partir del bind real.
+
+    0.0.0.0 quiere decir "todas las interfaces": lo util es el nombre del host,
+    porque nadie se conecta a 0.0.0.0. Al reves, 127.0.0.1 es "solo este host":
+    ahi el nombre del host seria una mentira, porque de afuera no entra.
+    """
+    if bind in ("", "0.0.0.0", "::", "[::]"):
+        return f"{host}:{puerto}"
+    return f"{bind}:{puerto}"
+
+
+def alcance_bind(bind: str) -> str:
+    """El sufijo que dice el alcance. Sin esto, 'publicada en' no dice nada."""
+    if _es_local(bind):
+        return "  (solo este host: de afuera no entra)"
+    if bind in ("", "0.0.0.0", "::", "[::]"):
+        return "  (abierta a cualquier red que llegue)"
+    return ""
+
+
+def _es_local(bind: str) -> bool:
+    return bind in ("127.0.0.1", "::1", "[::1]")
+
+
 def render_create(project: str, stack: str, host: str, app_port: int,
                   sftp_port: int | None, names: dict, pw: dict,
-                  pdir: str, creds_only: bool = False) -> str:
+                  pdir: str, creds_only: bool = False,
+                  db_publish: str | None = None) -> str:
     pw = {k: v for k, v in pw.items() if k not in SECRET_ONLY}
     L = []
     bar = "-" * 62
@@ -124,16 +150,43 @@ def render_create(project: str, stack: str, host: str, app_port: int,
         L.append(f"  driver      org.postgresql.Driver  (lo pone el pom/build.gradle)")
         L.append("")
 
+    # La base publicada es lo PRIMERO que tiene que saber quien recibe esto:
+    # la frase "no se abre desde internet" estaba hardcodeada y con un puerto
+    # expuesto era falsa (medido: el admin expuso 5435 y el resumen no lo decia).
+    if db_publish:
+        _pb, _, _pp = db_publish.rpartition(":")
+        L.append(f"{BOLD}{YELLOW}Base publicada{RESET}")
+        L.append(f"  {YELLOW}publicada en {addr_publicada(_pb, _pp, host)}{RESET}"
+                 f"{YELLOW}{alcance_bind(_pb)}{RESET}")
+        if _es_local(_pb):
+            L.append(f"  {DIM}De afuera NO entra. Si el cliente se conecta desde")
+            L.append(f"  otra maquina, hay que re-exponerla:")
+            L.append(f"    appctl {project} db expose {_pp} --bind 0.0.0.0{RESET}")
+        else:
+            L.append(f"  {DIM}Entra quien alcance esa direccion. Se cierra con:")
+            L.append(f"    appctl {project} db unexpose{RESET}")
+        L.append("")
+
     L.append(f"{BOLD}Ejemplo de conexion (Laravel .env){RESET}")
-    L.append(f"  {DIM}La DB no se abre desde internet. Esta es la config para la")
-    L.append(f"  app DENTRO del contenedor (host 'db'). Para un cliente externo")
-    L.append(f"  hace falta un tunel: ssh -L {int(db_port)+100}:db:{db_port} <usuario>@<host>{RESET}")
+    if not db_publish:
+        L.append(f"  {DIM}La base no esta publicada (red interna). Esta es la config")
+        L.append(f"  para la app DENTRO del contenedor (host 'db'). Para un cliente")
+        L.append(f"  externo hace falta un tunel: ssh -L {int(db_port)+100}:db:{db_port} <usuario>@<host>{RESET}")
+    else:
+        L.append(f"  {DIM}Dentro del contenedor:{RESET}")
     L.append(f"  DB_CONNECTION={db_driver}")
     L.append(f"  DB_HOST=db")
     L.append(f"  DB_PORT={db_port}")
     L.append(f"  DB_DATABASE={names['DB_NAME']}")
     L.append(f"  DB_USERNAME={names['DB_USER']}")
     L.append(f"  DB_PASSWORD={pw['DB_PASSWORD']}")
+    if db_publish:
+        _ext = host if _pb in ("", "0.0.0.0", "::", "[::]") else _pb
+        L.append("")
+        L.append(f"  {DIM}Desde afuera (tu maquina o el cliente):{RESET}")
+        L.append(f"  DB_CONNECTION={db_driver}")
+        L.append(f"  DB_HOST={_ext}")
+        L.append(f"  DB_PORT={_pp}")
     L.append("")
 
     L.append(f"{bar}")
@@ -249,9 +302,13 @@ def render_info(st: dict, env: dict, ps_out: str, limits=None,
     _dbn = (st.get("db") or {}).get("name", "-")
     _decl = st.get("db_published_port")
     if db_publish:
-        # Lo que dice docker: la base esta publicada en el host. Se dice
-        # DONDE, porque 0.0.0.0 y 127.0.0.1 no son lo mismo.
-        L.append(f"  DB         {_dbn}  {YELLOW}publicada en {db_publish}{RESET}"
+        # Lo que dice docker: la base esta publicada en el host. Se muestra la
+        # direccion que le sirve a un cliente (el FQDN cuando el bind es
+        # 0.0.0.0) y el alcance, porque 0.0.0.0 y 127.0.0.1 no son lo mismo.
+        _pb, _, _pp = db_publish.rpartition(":")
+        L.append(f"  DB         {_dbn}  {YELLOW}publicada en "
+                 f"{addr_publicada(_pb, _pp, st.get('host', '?'))}{RESET}"
+                 f"{YELLOW}{alcance_bind(_pb)}{RESET}"
                  f"  {DIM}(cerrala: appctl {st['project']} db unexpose){RESET}")
     elif _decl:
         # El state y el contenedor no coinciden: decirlo, no taparlo. Un

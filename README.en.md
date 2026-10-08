@@ -504,6 +504,15 @@ and an `upgrade` no longer drops them. They used to live only in the rendered
 `compose.yaml`, so the next re-render wiped them silently and the database went
 back to closed while the client believed it was still open.
 
+`info` and `creds` show the address a client connects with, not the raw bind.
+With `--bind 0.0.0.0` they show the **host** (`dicappsrv…:5435`) and state that
+anyone who reaches that address gets in; with the default `127.0.0.1` they show
+`127.0.0.1:5435` and warn that **nothing from outside gets in** — the host name
+there would be an address that answers to nobody. `db expose` says so at publish
+time, and `creds` (the summary the developer receives) now carries the database's
+exposure state: it used to always claim "the DB is not open to the internet",
+which was false once a port was published.
+
 ### Database users
 
 ```bash

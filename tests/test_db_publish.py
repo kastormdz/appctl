@@ -280,7 +280,43 @@ def main() -> int:
     out = summary.render_info(st, {"SFTP_USER": "t"}, ps, None, "127.0.0.1:15432")
     check("publicada en 127.0.0.1:15432" in out, "publicada: dice donde esta publicada")
     out = summary.render_info(st, {"SFTP_USER": "t"}, ps, None, "0.0.0.0:15432")
-    check("0.0.0.0:15432" in out, "y si quedo abierta a todo, lo muestra")
+    check("t.local:15432" in out and "cualquier red" in out,
+          "abierta a todo: muestra el host UTIL (no el 0.0.0.0) y el alcance")
+    check("0.0.0.0:15432" not in out,
+          "y no muestra 0.0.0.0, que no es una direccion a la que nadie conecte")
+    out = summary.render_info(st, {"SFTP_USER": "t"}, ps, None, "127.0.0.1:15432")
+    check("127.0.0.1:15432" in out and "de afuera no entra" in out,
+          "solo local: NO muestra el FQDN (mandaria al cliente a una direccion "
+          "que no lo atiende) y avisa que de afuera no entra")
+
+    # ---- 7. `creds` tambien lo dice (antes estaba hardcodeado al reves) ----
+    print("\n=== 7. `creds` dice si la base esta publicada ===")
+    nombres = {"DB_NAME": "t_db", "DB_USER": "t", "DB_MIGRATION_USER": "t_mig",
+               "DB_READONLY_USER": "t_ro", "SFTP_USER": "t"}
+    pw = {"DB_PASSWORD": "x", "DB_MIGRATION_PASSWORD": "y",
+          "DB_READONLY_PASSWORD": "z", "SFTP_PASSWORD": "s"}
+    base = summary.render_create("t", "php-postgres-sftp", "t.local", 18001, 12201,
+                                 nombres, pw, "/tmp/t", creds_only=True)
+    check("no esta publicada" in base,
+          "sin publicar: creds dice que la base no esta publicada")
+    abierto = summary.render_create("t", "php-postgres-sftp", "t.local", 18001,
+                                    12201, nombres, pw, "/tmp/t", creds_only=True,
+                                    db_publish="0.0.0.0:5435")
+    check("t.local:5435" in abierto and "publicada" in abierto.lower(),
+          "publicada en 0.0.0.0: creds la muestra en el FQDN")
+    local = summary.render_create("t", "php-postgres-sftp", "t.local", 18001,
+                                  12201, nombres, pw, "/tmp/t", creds_only=True,
+                                  db_publish="127.0.0.1:5435")
+    check("127.0.0.1:5435" in local and "De afuera NO entra" in local,
+          "publicada solo local: lo dice y explica como abrirla")
+    check("--bind 0.0.0.0" in local,
+          "y da el comando exacto para que el cliente entre")
+    cli = (ROOT / "bin" / "appctl").read_text()
+    check("db_publish=_db_publish_vivo(args.proyecto)" in cli,
+          "cmd_creds consulta la verdad de docker (no el state)")
+    check("--bind 0.0.0.0" in cli and "SOLO en este host" in cli,
+          "db expose avisa al operador cuando publica solo local")
+
     st2 = dict(st, db_published_port=15432)
     out = summary.render_info(st2, {"SFTP_USER": "t"}, ps, None)
     check("NO la publica" in out,
