@@ -163,7 +163,7 @@ There are **6**, and each brings up **two containers**: `app` and `db`.
 | `php-postgres-sftp` | PHP 8.5 + nginx + sshd | PostgreSQL 18 | the default |
 | `php-mysql-sftp` | PHP 8.5 + nginx + sshd | MariaDB 11.8 | |
 | `nextjs-postgres-sftp` | Node 22 + Next.js | PostgreSQL 18 | multi-stage build, `.next` |
-| `nextjs-python-postgres-sftp` | Node 22 + Next.js + Python API (FastAPI) | PostgreSQL 18 | two runtimes in one container: `/api` → uvicorn, the rest → Next |
+| `nextjs-python-postgres-sftp` | Node 22 + Next.js + Python API (FastAPI) | PostgreSQL 18 | two runtimes in one container: Next serves `/api` (the BFF layer) and the Python API stays internal |
 | `express-postgres-sftp` | Node 22 + Express + React | PostgreSQL 18 | nginx serves the React build and proxies `/api` to Express |
 | `tomcat-postgres-sftp` | Tomcat 11 + JDK 25 | PostgreSQL 18 | the external proxy talks straight to Tomcat |
 
@@ -183,8 +183,15 @@ actually asks for it, so the repo doesn't carry stacks nobody has tested.
 
 ```text
 /        -> Next standalone   (127.0.0.1:3000)
-/api/    -> uvicorn + FastAPI (127.0.0.1:8000)
+/api/    -> Next               (route handlers: the BFF layer)
+API py   -> 127.0.0.1:8000    (internal: the BFF consumes it)
 ```
+
+The browser **never reaches the API**: `/api` is answered by Next's route
+handlers (the BFF layer), the only ones that call the API from inside the
+container (`PY_API_URL=http://127.0.0.1:8000`). If you need to publish it
+(Swagger, another system consuming it), set `PY_API_PUBLICA=1` in the project's
+`.env` and recreate the stack: nginx exposes it at `/api/`.
 
 ```bash
 appctl acme nextjs python psql sftp
@@ -307,7 +314,7 @@ makes more sense.
 |---|---|
 | `php` | PHP-FPM 8.5 + nginx + sshd, code volume |
 | `nextjs` | Node 22 + Next.js build, app volume |
-| `python` | FastAPI + uvicorn API next to Next (modifier: `nextjs` only) |
+| `python` | FastAPI + uvicorn API next to Next, **internal** (the BFF consumes it; `PY_API_PUBLICA=1` publishes it) (modifier: `nextjs` only) |
 | `tomcat` | Tomcat 11 + JDK 25, the external proxy talks straight to it |
 | `psql` / `mysql` | PostgreSQL 18 / MariaDB 11.8, private network |
 | `sftp` | sshd with chroot, dedicated port, volume shared with the app |
@@ -429,8 +436,8 @@ On the `nextjs-python` stack the summary adds the API block (URL under `/api/`,
 where the backend goes, and what it must answer):
 
 ```text
-API Python  (FastAPI + uvicorn, detras de nginx)
-  URL        http://apps.example.com:8001/api/
+API Python  (FastAPI + uvicorn)
+  URL        http://127.0.0.1:8000   (INTERNAL: the BFF consumes it)
   Codigo     $APPCTL_PROJECTS/acme/sftp/home/upload/backend   (sube por SFTP)
 ```
 
@@ -822,10 +829,12 @@ API is verified separately (see point 9).
    real IP. The name `db` resolves to a different database and would give a false
    pass.
 8. The app answers what it should, depending on the stack's runtime.
-9. The API answers on `/api/` (`nextjs-python` only). It's a separate check because
-   nginx serves two runtimes on the same port: a 200 on `/` comes from Next, so it
-   proves nothing about Python. With uvicorn down, `/` still returns 200 and the
-   project would look healthy with the API dead.
+9. The API answers (`nextjs-python` only). It's a separate check because nginx
+   serves two runtimes on the same port: a 200 on `/` comes from Next, so it
+   proves nothing about Python, and with uvicorn down `/` still returns 200. By
+   default the API is **internal** and the check asks for it inside the
+   container (`127.0.0.1:8000`); if the project published it
+   (`PY_API_PUBLICA=1`), it asks through the port, at `/api/`.
 10. The SFTP login works: it gets in, lists, and **writes** a file. A read-only SFTP
     is no use for uploading code, and a successful `ls` doesn't detect it.
 11. The compose state has no drift.

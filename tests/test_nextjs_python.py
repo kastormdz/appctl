@@ -100,24 +100,49 @@ def main() -> int:
                 "image/python-launch.sh"):
         check((STACK / rel).is_file(), f"existe {rel}")
 
-    # ---- 3. nginx: dos runtimes, un puerto ----
-    print("\n=== nginx: /api -> uvicorn, resto -> Next ===")
+    # ---- 3. nginx: un puerto, dos runtimes, y la API INTERNA ----
+    #
+    # El default es el de la arquitectura BFF: /api lo contesta NEXT (sus
+    # route handlers) y uvicorn vive interno en 127.0.0.1:8000. El bloque que
+    # publica la API existe, pero ENTRE MARCADORES: el entrypoint lo borra si
+    # PY_API_PUBLICA != 1. Si alguien lo saca de los marcadores, el default
+    # vuelve a exponer la API al navegador sin que nadie lo note: por eso se
+    # verifica la posicion, no solo la existencia.
+    print("\n=== nginx: /api lo sirve Next (BFF), la API queda interna ===")
     ng = leer(f"stacks/{NOMBRE}/image/nginx.conf")
-    check(re.search(r"location /api/ \{", ng) is not None,
-          "hay un location /api/")
-    check("proxy_pass http://127.0.0.1:8000/" in ng,
-          "el /api/ va a uvicorn (127.0.0.1:8000)")
     check("location = /healthz" in ng and "proxy_pass http://127.0.0.1:3000" in ng,
           "/healthz lo contesta Next (el healthcheck depende de eso)")
     check(ng.count("proxy_pass http://127.0.0.1:3000") >= 2,
           "el resto del trafico va a Next")
     check("deny all;" in ng and "/private" in ng,
           "/private queda denegado en nginx (barrera del dir privado)")
+    ini = ng.find("# __PY_API_PUBLICA_INICIO__")
+    fin = ng.find("# __PY_API_PUBLICA_FIN__")
+    check(ini != -1 and fin != -1 and ini < fin,
+          "el bloque de la API publicada esta entre marcadores")
+    bloque = ng[ini:fin] if ini != -1 and fin != -1 and ini < fin else ""
+    check(re.search(r"location /api/ \{", bloque) is not None,
+          "el location /api/ esta DENTRO de los marcadores")
+    check("proxy_pass http://127.0.0.1:8000/" in bloque,
+          "el /api/ publicado va a uvicorn (127.0.0.1:8000)")
     # el prefijo se saca: si no, el cliente tendria que escribir /api/ en
     # cada ruta de su API
     check(re.search(r"location /api/\s*\{\s*proxy_pass http://127\.0\.0\.1:8000/",
-                    ng, re.S) is not None,
+                    bloque, re.S) is not None,
           "el prefijo /api/ se SACA al reenviar (proxy_pass con / final)")
+    check("location /api/" not in ng[:ini] + ng[fin:],
+          "FUERA de los marcadores no queda ningun /api: el default es interno")
+    check("route handlers = la capa BFF" in ng,
+          "el conf explica que /api lo sirve el BFF de Next")
+
+    # ---- 3b. el entrypoint recorta el bloque ----
+    print("\n=== el entrypoint: PY_API_PUBLICA decide ===")
+    ep = leer(f"stacks/{NOMBRE}/image/entrypoint.sh")
+    check("PY_API_PUBLICA" in ep, "el entrypoint lee PY_API_PUBLICA")
+    check("__PY_API_PUBLICA_INICIO__" in ep and "__PY_API_PUBLICA_FIN__" in ep,
+          "recorta por los marcadores")
+    check("-s /etc/nginx/nginx.conf.nuevo" in ep,
+          "si el recorte sale vacio deja el conf original (nginx no arranca sin conf)")
 
     # ---- 4. supervisord: los dos runtimes ----
     print("\n=== supervisord ===")
@@ -135,10 +160,24 @@ def main() -> int:
     print("\n=== el healthcheck no puede mentir ===")
     tmpl = leer(f"stacks/{NOMBRE}/compose.tmpl.yaml")
     hc = re.search(r"test: \[\"CMD-SHELL\", \"(.*?)\"\]", tmpl).group(1)
-    check("/healthz" in hc and "/api/healthz" in hc,
-          "el healthcheck pide /healthz Y /api/healthz")
+    check("/healthz" in hc, "el healthcheck pide /healthz a Next")
+    check("http://127.0.0.1:8000/healthz" in hc,
+          "y la API DIRECTO a 127.0.0.1:8000 (no depende del ruteo de nginx)")
+    check("/api/healthz" not in hc,
+          "no la pide por /api: ese path ahora lo sirve el BFF")
     df = leer(f"stacks/{NOMBRE}/image/Dockerfile")
-    check("/api/healthz" in df, "el HEALTHCHECK de la imagen tambien cubre la API")
+    check("http://127.0.0.1:8000/healthz" in df,
+          "el HEALTHCHECK de la imagen tambien cubre la API (directo)")
+    check('PY_API_PUBLICA: "${PY_API_PUBLICA:-0}"' in tmpl,
+          "PY_API_PUBLICA va en el entorno (default 0: interna)")
+    check('PY_API_URL: "http://127.0.0.1:8000"' in tmpl,
+          "PY_API_URL va en el entorno: es la direccion que usa el BFF")
+    # el check del CLI tiene que saber mirar adentro cuando no esta publicada
+    smoke = leer("lib/smoke.py")
+    check('_container_env_of(app, "PY_API_PUBLICA")' in smoke,
+          "el check del CLI pregunta si la API esta publicada")
+    check('"http://127.0.0.1:8000/"' in smoke,
+          "y la pide adentro del contenedor cuando es interna")
     check('PY_PORT: "8000"' in tmpl, "PY_PORT va en el entorno del contenedor")
 
     # ---- 6. la API: venv, deps y stub ----

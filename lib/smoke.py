@@ -797,25 +797,50 @@ def app_serves_python(project_dir: str, app_port: int, cfg: dict | None = None,
     un HTTP 200 alcanza (uvicorn sano con una ruta que no existe da 404, no
     200; y nginx mal ruteado da 502).
     """
+    # Por DEFECTO la API es interna: /api lo contesta Next (el BFF) y
+    # uvicorn vive en 127.0.0.1:8000 sin publicar. Se pregunta al
+    # CONTENEDOR (no al .env: el .env es lo que appctl escribio, el
+    # contenedor es lo que corre) y se pide por donde corresponde.
+    app = _container_name(project_dir, "app")
+    # _container_env_of ya existia (lo usan los checks de la db): es el mismo
+    # `docker exec <c> printenv <v>`. No se reimplementa.
+    # Solo un "0" EXPLICITO significa interna. Un proyecto creado antes de
+    # este cambio no tiene la variable (env vacio) y su nginx SI publica /api:
+    # tratarlo como interno lo haria pedir adentro una API que esta afuera, y
+    # el check mentiria. Si no se puede preguntar (sin docker), tambien se
+    # asume publica: es el comportamiento historico.
+    try:
+        publica = _container_env_of(app, "PY_API_PUBLICA") != "0"
+    except (OSError, subprocess.SubprocessError):
+        publica = True
+    via = "nginx -> uvicorn" if publica else "interna 127.0.0.1:8000"
     try:
         # SIN -f, por lo mismo que app_serves: una API real puede contestar
-        # 401/403/404 en /api/ y eso no es que el stack este roto.
-        p = subprocess.run(
-            ["curl", "-q", "-sS", "--max-time", "10", "-w", "\n%{http_code}",
-             f"http://127.0.0.1:{app_port}/api/"],
-            capture_output=True, text=True, timeout=20,
-        )
+        # 401/403/404 y eso no es que el stack este roto.
+        if publica:
+            cmd = ["curl", "-q", "-sS", "--max-time", "10", "-w", "\n%{http_code}",
+                   f"http://127.0.0.1:{app_port}/api/"]
+            timeout = 20
+        else:
+            # Adentro del contenedor y con la MISMA ruta que veria por
+            # nginx: nginx saca el prefijo /api/, o sea que /api/ le llega
+            # como /. Pedirle /api/ adentro da 404 siempre (y el check
+            # mentiria en verde con expect_stub=False).
+            cmd = ["docker", "exec", app, "curl", "-q", "-sS", "--max-time", "10",
+                   "-w", "\n%{http_code}", "http://127.0.0.1:8000/"]
+            timeout = 30
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as e:
         return Check("API python responde", False, f"no se pudo pedir: {e}")
     if p.returncode != 0:
-        return Check("API python responde (nginx -> uvicorn)", False,
+        return Check(f"API python responde ({via})", False,
                      f"curl fallo: {p.stderr.strip()[:200]}")
     _cuerpo, _, _http = p.stdout.rpartition("\n")
     body, http = _cuerpo, _http.strip()
     if "app: python ok" not in body:
         if not expect_stub:
             if not http.startswith(("2", "3", "4")):
-                return Check("API python responde (nginx -> uvicorn)", False,
+                return Check(f"API python responde ({via})", False,
                              f"HTTP {http or 'sin respuesta'}: el runtime no "
                              f"contesta: {body[:160]!r}")
             primera = (body.splitlines()[0][:120] if body.strip()
@@ -826,7 +851,7 @@ def app_serves_python(project_dir: str, app_port: int, cfg: dict | None = None,
                      f"responde pero no es el stub esperado: {body[:200]!r}")
     py = body.split("python: ")[1].splitlines()[0] if "python: " in body else ""
     fa = body.split("fastapi: ")[1].splitlines()[0] if "fastapi: " in body else ""
-    return Check("API python responde (nginx -> uvicorn -> fastapi)", True,
+    return Check(f"API python responde ({via} -> fastapi)", True,
                  f"python {py}, fastapi {fa}")
 
 

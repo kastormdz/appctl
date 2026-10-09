@@ -163,7 +163,7 @@ Hay **6**, y cada uno levanta **dos contenedores**: `app` y `db`.
 | `php-postgres-sftp` | PHP 8.5 + nginx + sshd | PostgreSQL 18 | el default |
 | `php-mysql-sftp` | PHP 8.5 + nginx + sshd | MariaDB 11.8 | |
 | `nextjs-postgres-sftp` | Node 22 + Next.js | PostgreSQL 18 | build multi-stage, `.next` |
-| `nextjs-python-postgres-sftp` | Node 22 + Next.js + API Python (FastAPI) | PostgreSQL 18 | dos runtimes en un contenedor: `/api` → uvicorn, el resto → Next |
+| `nextjs-python-postgres-sftp` | Node 22 + Next.js + API Python (FastAPI) | PostgreSQL 18 | dos runtimes en un contenedor: `/api` lo sirve Next (la capa BFF) y la API Python queda interna |
 | `express-postgres-sftp` | Node 22 + Express + React | PostgreSQL 18 | nginx sirve el build de React y proxya `/api` a Express |
 | `tomcat-postgres-sftp` | Tomcat 11 + JDK 25 | PostgreSQL 18 | el proxy externo habla directo con Tomcat |
 
@@ -182,9 +182,16 @@ y así el repo no carga con stacks que nadie probó.
 **una sola imagen** con Node y Python, un solo nginx y un solo puerto:
 
 ```text
-/        -> Next standalone  (127.0.0.1:3000)
-/api/    -> uvicorn + FastAPI (127.0.0.1:8000)
+/        -> Next standalone   (127.0.0.1:3000)
+/api/    -> Next               (route handlers: la capa BFF)
+API py   -> 127.0.0.1:8000    (interna: la consume el BFF)
 ```
+
+El navegador **nunca llega a la API**: `/api` lo contestan los route handlers de
+Next (la capa BFF), que son los únicos que le pegan a la API por dentro del
+contenedor (`PY_API_URL=http://127.0.0.1:8000`). Si necesitás publicarla
+(Swagger, otro sistema que la consume), `PY_API_PUBLICA=1` en el `.env` del
+proyecto y recreá el stack: nginx la expone en `/api/`.
 
 ```bash
 appctl acme nextjs python psql sftp
@@ -304,7 +311,7 @@ tiene más sentido.
 |---|---|
 | `php` | PHP-FPM 8.5 + nginx + sshd, volumen de código |
 | `nextjs` | Node 22 + build de Next.js, volumen de app |
-| `python` | API FastAPI + uvicorn al lado de Next (complemento: solo con `nextjs`) |
+| `python` | API FastAPI + uvicorn al lado de Next, **interna** (la consume el BFF; `PY_API_PUBLICA=1` la publica) (complemento: solo con `nextjs`) |
 | `tomcat` | Tomcat 11 + JDK 25, el proxy externo habla directo |
 | `psql` / `mysql` | PostgreSQL 18 / MariaDB 11.8, red privada |
 | `sftp` | sshd con chroot, puerto dedicado, volumen compartido con la app |
@@ -421,11 +428,11 @@ y pega y falla a las dos de la mañana es un ticket que preferimos no tener.
 
 `create` imprime una sola vez un resumen en texto plano, pensado para reenviar
 sin editarlo. En el stack `nextjs-python` el resumen agrega el bloque de la API
-(URL en `/api/`, dónde va el backend y qué tiene que responder):
+(dónde vive la API, cómo la llama el BFF y qué tiene que responder):
 
 ```text
-API Python  (FastAPI + uvicorn, detras de nginx)
-  URL        http://apps.example.com:8001/api/
+API Python  (FastAPI + uvicorn)
+  URL        http://127.0.0.1:8000   (INTERNA: la consume el BFF)
   Codigo     $APPCTL_PROJECTS/acme/sftp/home/upload/backend   (sube por SFTP)
 ```
 
@@ -816,10 +823,11 @@ mañana, lo que se quiere es la lista completa de una vez. En el stack
 7. La base **no es alcanzable desde la red de otro proyecto**, apuntando a su IP
    real. El nombre `db` resuelve a otra base y daría un falso positivo.
 8. La app responde lo que tiene que responder, según el runtime del stack.
-9. La API responde en `/api/` (solo en `nextjs-python`). Es un check aparte
-   porque nginx sirve dos runtimes en el mismo puerto: un 200 en `/` lo contesta
-   Next, así que no prueba nada de Python. Con uvicorn caído, `/` sigue dando 200
-   y el proyecto se vería sano con la API tirada.
+9. La API responde (solo en `nextjs-python`). Es un check aparte porque nginx sirve
+   dos runtimes en el mismo puerto: un 200 en `/` lo contesta Next, así que no
+   prueba nada de Python, y con uvicorn caído `/` sigue dando 200. Por defecto la
+   API es **interna** y el check la pide dentro del contenedor (`127.0.0.1:8000`);
+   si el proyecto la publicó (`PY_API_PUBLICA=1`), la pide por el puerto, en `/api/`.
 10. El login SFTP funciona: entra, lista y **escribe** un archivo. Un SFTP de solo
     lectura no sirve para subir código, y un `ls` exitoso no lo detecta.
 11. El estado del compose no tiene drift.

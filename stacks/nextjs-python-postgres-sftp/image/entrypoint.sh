@@ -55,7 +55,26 @@ fi
 # O sea: el bug no era node, era nginx sirviendo php.
 if [ -f /usr/local/share/appctl/nginx.conf ]; then
     cp /usr/local/share/appctl/nginx.conf /etc/nginx/nginx.conf
-    log "nginx.conf instalado (proxy a 127.0.0.1:3000 y /api a :8000)"
+    # PY_API_PUBLICA=1 publica la API python en /api/; por defecto NO
+    # (la API queda interna en 127.0.0.1:8000 y /api lo sirve Next: la
+    # capa BFF). El bloque se BORRA, no se comenta: nginx no tiene
+    # comentarios de bloque y un location comentado a mano es lo primero
+    # que alguien descomenta sin leer el por que.
+    if [ "${PY_API_PUBLICA:-0}" = "1" ]; then
+        log "nginx.conf: la API python se PUBLICA en /api/ (PY_API_PUBLICA=1)"
+    else
+        awk '/__PY_API_PUBLICA_INICIO__/{skip=1} !skip{print} /__PY_API_PUBLICA_FIN__/{skip=0}' \
+            /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.nuevo
+        # Si el awk deja el archivo vacio (marcadores rotos), se usa el
+        # original: nginx sin config no arranca y el stack queda muerto.
+        if [ -s /etc/nginx/nginx.conf.nuevo ]; then
+            mv /etc/nginx/nginx.conf.nuevo /etc/nginx/nginx.conf
+        else
+            rm -f /etc/nginx/nginx.conf.nuevo
+            log "AVISO: el recorte del bloque /api salio vacio; se deja el conf completo"
+        fi
+        log "nginx.conf: la API python queda INTERNA (127.0.0.1:8000); /api lo sirve Next (BFF)"
+    fi
 else
     log "AVISO: no encontro /usr/local/share/appctl/nginx.conf: el healthcheck puede fallar"
 fi

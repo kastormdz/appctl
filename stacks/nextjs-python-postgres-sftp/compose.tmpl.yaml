@@ -13,8 +13,8 @@ services:
   # nginx + Next.js + uvicorn + sshd en un mismo contenedor. DOS runtimes
   # detras del MISMO nginx y del MISMO puerto:
   #
-  #   /api/  -> 127.0.0.1:8000   (uvicorn + FastAPI)
-  #   resto  -> 127.0.0.1:3000   (Next standalone)
+  #   todo   -> 127.0.0.1:3000   (Next standalone, /api incluido: el BFF)
+  #   y uvicorn queda INTERNO en 127.0.0.1:8000 (PY_API_PUBLICA=1 lo publica)
   #
   # Por que juntos y no dos contenedores: el cliente tiene UN proyecto, UN
   # puerto y UN SFTP. Dos contenedores serian dos puertos que abrir, dos
@@ -56,8 +56,16 @@ __CRON__
       NO_PROXY: "localhost,127.0.0.1,::1,db,${PROJECT:-}"
       no_proxy: "localhost,127.0.0.1,::1,db,${PROJECT:-}"
       # Puerto de uvicorn DENTRO del contenedor. Lo lee python-launch.sh.
-      # Vive en 127.0.0.1: no se publica al host, sale por nginx en /api.
+      # Vive en 127.0.0.1: no se publica al host, y por defecto tampoco
+      # sale por nginx (es interna: la consume el BFF). PY_API_PUBLICA=1
+      # la publica en /api/.
       PY_PORT: "8000"
+      # Para el BFF de Next: direccion INTERNA del contenedor (no sale
+      # al host ni a la red). Se usa asi: fetch(`${PY_API_URL}/items`).
+      PY_API_URL: "http://127.0.0.1:8000"
+      # 1 = nginx publica la API en /api/ (Swagger, otro sistema que la
+      # consume). 0 o ausente = interna: el navegador solo habla con el BFF.
+      PY_API_PUBLICA: "${PY_API_PUBLICA:-0}"
       SFTP_USER: ${SFTP_USER}
       SFTP_PASSWORD: ${SFTP_PASSWORD}
       SFTP_UID: ${SFTP_UID:-1001}
@@ -141,9 +149,11 @@ __CRON__
       # LOS DOS runtimes: si uvicorn no arranca (requirements.txt roto,
       # main.py con un error de sintaxis), un healthcheck que solo mira
       # Next deja el contenedor en verde con la API caida.
-      # El cliente tiene que responder GET /healthz (Next) y GET /healthz
-      # en su API (que llega como /api/healthz). El stub ya hace las dos.
-      test: ["CMD-SHELL", "curl -qfsS http://127.0.0.1/healthz >/dev/null && curl -qfsS http://127.0.0.1/api/healthz >/dev/null || exit 1"]
+      # El cliente tiene que responder GET /healthz en Next (por nginx) y
+      # GET /healthz en su API. La API se pide DIRECTO a 127.0.0.1:8000:
+      # es interna, y asi el healthcheck no depende del ruteo de nginx ni
+      # de que este publicada. El stub ya hace las dos.
+      test: ["CMD-SHELL", "curl -qfsS http://127.0.0.1/healthz >/dev/null && curl -qfsS http://127.0.0.1:8000/healthz >/dev/null || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5

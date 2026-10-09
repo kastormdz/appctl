@@ -74,8 +74,10 @@ EXPOSE 80 22
 # se reporta sano con media aplicacion muerta.
 # start-period generoso: el primer arranque instala node_modules y
 # requirements.txt (si el cliente los subio sin node_modules/ ni wheels).
+# La API se pide DIRECTO a 127.0.0.1:8000 (es interna; /api lo sirve
+# Next). El de aca es el fallback de la imagen; el del compose manda.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=6 \
   CMD curl -qfsS http://127.0.0.1/healthz >/dev/null \
-      && curl -qfsS http://127.0.0.1/api/healthz >/dev/null || exit 1
+      && curl -qfsS http://127.0.0.1:8000/healthz >/dev/null || exit 1
 
 CMD ["/usr/local/bin/entrypoint.sh"]

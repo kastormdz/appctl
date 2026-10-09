@@ -50,6 +50,24 @@ def _es_local(bind: str) -> bool:
     return bind in ("127.0.0.1", "::1", "[::1]")
 
 
+def _api_publica(pdir: str) -> bool:
+    """Si la API python del proyecto esta publicada en /api/.
+
+    Se lee el .env del proyecto, que es lo que compose le pasa al contenedor.
+    Default: NO (interna: la consume el BFF de Next). Un proyecto viejo tampoco
+    la tiene, y su nginx tampoco la publica: mismo resultado.
+    """
+    try:
+        with open(os.path.join(pdir, ".env"), encoding="utf-8") as f:
+            for linea in f:
+                linea = linea.strip()
+                if linea.startswith("PY_API_PUBLICA="):
+                    return linea.split("=", 1)[1].strip().strip("\"'") == "1"
+    except OSError:
+        pass
+    return False
+
+
 def render_create(project: str, stack: str, host: str, app_port: int,
                   sftp_port: int | None, names: dict, pw: dict,
                   pdir: str, creds_only: bool = False,
@@ -72,12 +90,25 @@ def render_create(project: str, stack: str, host: str, app_port: int,
     # nextjs-python: el stack corre DOS runtimes. El developer tiene que
     # saber por donde entra cada uno sin preguntar nada.
     if "python" in stack:
-        L.append(f"{BOLD}API Python{RESET}  {DIM}(FastAPI + uvicorn, detras de nginx){RESET}")
-        L.append(f"  URL        http://{host}:{app_port}/api/")
+        # La verdad del PROYECTO, no una frase fija: si el .env la publica, la
+        # URL publica; si no, es interna y la consume el BFF de Next.
+        publica = _api_publica(pdir)
+        L.append(f"{BOLD}API Python{RESET}  {DIM}(FastAPI + uvicorn){RESET}")
+        if publica:
+            L.append(f"  URL        http://{host}:{app_port}/api/   {DIM}(publicada){RESET}")
+        else:
+            L.append(f"  URL        http://127.0.0.1:8000   {DIM}(INTERNA: la consume el BFF){RESET}")
         L.append(f"  Codigo     {pdir}/sftp/home/upload/backend   (sube por SFTP)")
         L.append(f"  {DIM}Se arranca con uvicorn: main:app desde ese directorio{RESET}")
-        L.append(f"  {DIM}(o app.main:app si usas un paquete app/). El prefijo{RESET}")
-        L.append(f"  {DIM}/api se SACA al reenviar: tu /items se ve en /api/items.{RESET}")
+        L.append(f"  {DIM}(o app.main:app si usas un paquete app/).{RESET}")
+        if publica:
+            L.append(f"  {DIM}El prefijo /api se SACA al reenviar: tu /items se ve en{RESET}")
+            L.append(f"  {DIM}/api/items.{RESET}")
+        else:
+            L.append(f"  {DIM}/api lo sirve Next (tus route handlers = la capa BFF): el{RESET}")
+            L.append(f"  {DIM}navegador no llega a la API. Llamala desde Next en{RESET}")
+            L.append(f"  {DIM}${{PY_API_URL}} = http://127.0.0.1:8000. Para publicarla:{RESET}")
+            L.append(f"  {DIM}PY_API_PUBLICA=1 en el .env y recrea el stack.{RESET}")
         L.append(f"  {DIM}Las deps van en backend/requirements.txt y se instalan{RESET}")
         L.append(f"  {DIM}al arrancar el contenedor. Tu API tiene que responder{RESET}")
         L.append(f"  {DIM}GET /healthz (200) o el contenedor figura unhealthy.{RESET}")
