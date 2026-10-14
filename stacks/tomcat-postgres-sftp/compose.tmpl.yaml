@@ -36,6 +36,7 @@ services:
     restart: unless-stopped
     environment:
       PROJECT: __PROYECTO__
+__S3_APP_ENV__
 __CRON__
       SFTP_USER: ${SFTP_USER}
       SFTP_PASSWORD: ${SFTP_PASSWORD}
@@ -186,6 +187,7 @@ __DB_PUBLISH__
       timeout: 5s
       retries: 10
       start_period: 30s
+__S3__
 networks:
   # con salida a internet: la app llama a una pasarela de pagos, a un SMTP,
   # a la API de un whatsapp. Sin esto, el cliente no puede cobrar.

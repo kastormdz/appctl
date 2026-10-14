@@ -5,7 +5,8 @@
     appctl list                            ver todos
     appctl <proyecto> <subcomando>         ver un proyecto
 
-Componentes: php | nextjs | tomcat | python | psql | mysql | sftp | cron
+Componentes: php | nextjs | tomcat | python | psql | mysql | sftp | cron | s3
+  (s3 es un complemento: un Garage S3 por proyecto, para cualquier stack)
   (python es un complemento de nextjs: api FastAPI al lado de Next)
 Solo stdlib. Corre en el host, al lado de Docker.
 """
@@ -113,7 +114,7 @@ SERVICES = {"psql", "mysql", "sftp"}
 # validacion de "hay un runtime" y moriria mas adelante con un stack
 # inexistente.
 COMPLEMENTOS = {"python"}
-ALL_COMPONENTS = RUNTIMES | DATABASES | {"sftp", "cron"} | COMPLEMENTOS
+ALL_COMPONENTS = RUNTIMES | DATABASES | {"sftp", "cron", "s3"} | COMPLEMENTOS
 
 # Tags resueltos contra Docker Hub en `create` y escritos FIJOS en el compose.
 # Ver README: un contenedor corriendo no se actualiza solo.
@@ -121,6 +122,10 @@ DEFAULT_TAGS = {
     "php": os.environ.get("APPCTL_PHP_TAG", "8.5-fpm-alpine"),
     "psql": os.environ.get("APPCTL_PG_TAG", "18-alpine"),
     "mysql": os.environ.get("APPCTL_MYSQL_TAG", "11.8"),
+    # Garage (S3 self-hosted). Es una imagen oficial del proyecto, no un
+    # servicio de terceros; el tag se pinea aca y se sube a mano cuando
+    # sale una version.
+    "garage": os.environ.get("APPCTL_GARAGE_TAG", "v2.4.1"),
     "sftp": "alpine",
     "nextjs": os.environ.get("APPCTL_NODE_TAG", "22-alpine"),
     # mismo node 22 que nextjs, pero la app es un backend de Express con el
@@ -330,6 +335,17 @@ def cmd_create(args) -> int:
             "SFTP_PASSWORD": sec.password(20),
             "APP_KEY": sec.app_key(),
         }
+        if "s3" in components:
+            # Garage: la access key la genero YO (GK+24hex, formato que
+            # `garage key import` acepta, medido). El secreto, el rpc y los
+            # tokens viven en el .env: el upgrade los reusa y asi el nodo no
+            # pierde su identidad en un re-render.
+            pw.update({
+                "S3_SECRET_ACCESS_KEY": sec.hex64(),
+                "S3_RPC_SECRET": sec.hex64(),
+                "S3_ADMIN_TOKEN": sec.b64_32(),
+                "S3_METRICS_TOKEN": sec.b64_32(),
+            })
         # MariaDB exige password para root. No se muestra en el summary ni
         # se entrega: es para administracion del contenedor.
         if "mysql" in components:
@@ -341,6 +357,9 @@ def cmd_create(args) -> int:
             "DB_READONLY_USER": f"{project}_ro",
             "SFTP_USER": project,
         }
+        if "s3" in components:
+            names["S3_ACCESS_KEY_ID"] = sec.s3_access_key()
+            names["S3_BUCKET"] = project
         tags = {k: DEFAULT_TAGS[k] for k in components if k in DEFAULT_TAGS}
         if args.php:
             tags["php"] = f"{args.php}-fpm-alpine"
@@ -360,6 +379,7 @@ def cmd_create(args) -> int:
                        names, pw, app_port, sftp_port, host=args.host,
                        pg_major=pg_major, api_key=sec.token(24),
                        want_cron="cron" in components,
+                       want_s3="s3" in components,
                        app_memory=args.app_memory or "",
                        db_memory=args.db_memory or "")
 
@@ -423,6 +443,20 @@ def cmd_create(args) -> int:
         die(f"fallo el up:\n{out[-2500:]}\n"
             f"(no quedo nada a medias: puertos liberados, directorio borrado)")
 
+    # ---- s3: layout + key + bucket ----------------------------------------
+    # Va entre el up y el smoke: el up solo levanta el contenedor, la
+    # configuracion del Garage la hace appctl (la imagen es scratch: adentro
+    # no hay shell, asi que no puede haber un sidecar que la prepare).
+    if "s3" in components:
+        print("  preparando el S3 (layout, key y bucket)...")
+        ok_s3, detalle_s3 = _s3_init(pdir, project, names, pw)
+        print("  %s  %s" % ("OK" if ok_s3 else "FALLA", detalle_s3))
+        if not ok_s3:
+            # No se hace rollback de todo: la app y la DB estan bien y el init
+            # es idempotente. Se sigue y los checks lo dicen; el reintento es
+            # `appctl <p> s3 init`.
+            print(f"  reintentar: appctl {project} s3 init")
+
     # ---- smoke ------------------------------------------------------------
     print("[2/3] verificando...")
     is_mysql = "mysql" in components
@@ -443,6 +477,9 @@ def cmd_create(args) -> int:
         # necesitan las consultas que piden password (los usuarios de
         # mysql). load_env lo lee del disco, que es donde quedo.
         "env": load_env(project),
+        # los checks de s3 se disparan por componente, no por stack: s3
+        # va con cualquiera de los 6.
+        "components": sorted(components),
     }
     checks = smokemod.all_checks(str(pdir), cfg, args.host)
     failed = [c for c in checks if not c.ok]
@@ -464,11 +501,232 @@ def cmd_create(args) -> int:
     return 0
 
 
+S3_SERVICIO = """  # ---- S3 (Garage) --------------------------------------------------------
+  # Un Garage POR PROYECTO: contenedor, volumenes y red propios, como la DB.
+  # Los proyectos no comparten buckets ni credenciales, y si uno se rompe no
+  # se lleva puesto a los demas. Medido en reposo: ~6 MB de RAM.
+  #
+  # La API S3 escucha en 3900 y NO se publica: la consume la app por la red
+  # interna del proyecto (http://garage:3900). No sale al host.
+  #
+  # El layout, la key y el bucket los prepara appctl DESPUES del up (no un
+  # sidecar: la imagen de Garage es scratch, adentro no hay shell).
+  garage:
+    image: dxflrs/garage:__GARAGE_VERSION__
+    # de docker hub: bajarla si no esta local
+    pull_policy: missing
+    container_name: __PROYECTO___garage
+    labels:
+      appctl.proyecto: __PROYECTO__
+      appctl.rol: s3
+      appctl.gestor: appctl
+    hostname: __PROYECTO___garage
+__S3_PUBLISH__
+    restart: unless-stopped
+    volumes:
+      - ./s3/data:/data
+      - ./s3/meta:/meta
+      - ./s3/garage.toml:/etc/garage.toml:ro
+    networks:
+      - data
+    healthcheck:
+      # `garage status` habla con el servidor por RPC: si contesta, el nodo
+      # esta vivo de verdad (no es un proceso zombi). Con el layout sin
+      # aplicar contesta igual: esto mide el proceso, de la configuracion se
+      # ocupa el check del create.
+      test: ["CMD", "/garage", "-c", "/etc/garage.toml", "status"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      # 6 MB medidos en reposo; el techo es para que un cliente que suba
+      # gigabytes no se coma el server. Cambiar por proyecto: S3_MEMORY en
+      # el .env.
+      resources:
+        limits:
+          cpus: "${S3_CPUS:-0.5}"
+          memory: ${S3_MEMORY:-256M}
+"""
+
+S3_APP_ENV = """      # ---- S3 (Garage) del proyecto ------------------------------------
+      # El endpoint es INTERNO: la app lo alcanza por la red del proyecto, no
+      # sale al host. Es PATH-STYLE (http://garage:3900/<bucket>/<clave>): en
+      # el SDK de JS hay que pasar forcePathStyle: true.
+      S3_ENDPOINT: "http://garage:3900"
+      S3_REGION: "us-east-1"
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      # Los mismos valores con los nombres estandar de AWS: asi los SDK los
+      # toman solos, sin configuracion.
+      AWS_ENDPOINT_URL_S3: "http://garage:3900"
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY}
+      AWS_REGION: "us-east-1"
+      AWS_BUCKET: ${S3_BUCKET}
+"""
+
+
+def _render_s3(want: bool, project: str, garage_tag: str,
+               publish: int | None = None, publish_bind: str = "0.0.0.0") -> str:
+    """El servicio garage, o vacio si el proyecto no pidio s3.
+
+    `s3` es una bandera, como `cron`: no cambia la imagen ni la DB, agrega un
+    servicio. Publicar su puerto es OPCIONAL y por defecto NO (`s3 expose`).
+
+    Los valores se hornean ACA y no se dejan como placeholders: el dict `subs`
+    resuelve __PROYECTO__ ANTES de meter este bloque, asi que un __PROYECTO__
+    adentro del bloque quedaba sin sustituir (lo caza el guard de placeholders,
+    que es lo que tiene que pasar).
+    """
+    if not want:
+        return ""
+    pub = ""
+    if publish:
+        pub = ("    ports:\n"
+               f'      - "{publish_bind}:{publish}:3900"\n')
+    return (S3_SERVICIO.replace("__PROYECTO__", project)
+                       .replace("__GARAGE_VERSION__", garage_tag)
+                       .replace("__S3_PUBLISH__\n", pub))
+
+
+def _render_s3_app_env(want: bool) -> str:
+    """Las variables del S3 en el entorno de la app, o vacio."""
+    return S3_APP_ENV if want else ""
+
+
+def _garage_toml(names: dict, pw: dict) -> str:
+    """El garage.toml del proyecto.
+
+    Los secretos salen del .env del proyecto (los genera el create y los
+    reusa el upgrade): si el rpc_secret cambiara en cada re-render, el nodo
+    dejaria de reconocer sus propios datos.
+    """
+    return f"""# Garage del proyecto {names['SFTP_USER']}. Lo escribe appctl: los secretos
+# de abajo son de ESTE proyecto (cada proyecto tiene su Garage).
+metadata_dir = "/meta"
+data_dir = "/data"
+db_engine = "sqlite"
+
+# Single node: una copia de cada objeto, sin replicacion. No hay cluster que
+# replicar: el proyecto es dueño de su Garage.
+replication_factor = 1
+
+rpc_bind_addr = "[::]:3901"
+rpc_public_addr = "127.0.0.1:3901"
+rpc_secret = "{pw['S3_RPC_SECRET']}"
+
+[s3_api]
+s3_region = "us-east-1"
+api_bind_addr = "[::]:3900"
+# Path-style (http://garage:3900/<bucket>/<clave>): el endpoint es un nombre
+# sin puntos, asi que no hace falta el estilo virtual-host.
+root_domain = ".s3.garage.localhost"
+
+[admin]
+api_bind_addr = "[::]:3903"
+admin_token = "{pw['S3_ADMIN_TOKEN']}"
+metrics_token = "{pw['S3_METRICS_TOKEN']}"
+"""
+
+
+def _s3_node_id(salida: str) -> str:
+    """El node id del `garage status`.
+
+    Va al principio de la fila de la tabla (16 hex). El grep va anclado al
+    principio de linea a proposito: la salida tambien trae
+    'Connection established to <id>' y sin ancla ese id se cuela primero.
+    """
+    for linea in salida.splitlines():
+        m = re.match(r"([0-9a-f]{16})\s", linea)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _s3_init(pdir: Path, project: str, names: dict, pw: dict,
+             timeout: int = 300) -> tuple[bool, str]:
+    """Deja el Garage del proyecto LISTO: layout, key y bucket. Idempotente.
+
+    Se hace desde aca y no con un sidecar porque la imagen de Garage es
+    scratch: adentro no hay shell, el unico ejecutable es /garage.
+
+    Medido contra v2.4.1:
+      - `layout show` imprime 'Current cluster layout version: N'. Con 0 hay
+        que asignar y aplicar; con >=1 ya esta. Aplicar dos veces la misma
+        version es lo que las docs dicen que NO hay que hacer.
+      - `layout assign <node-id> -z <zona> -c <cap> -t <tag>`: el ORDEN
+        importa. -t es multi-valor y con `-t x <node-id>` se come el node id
+        como segundo tag: falla con '<node-ids>... not provided'.
+      - `key info` / `bucket info`: si contestan, ya esta hecho.
+    """
+    c = f"{project}_garage"
+    base = ["docker", "exec", c, "/garage", "-c", "/etc/garage.toml"]
+
+    def g(*args, t=90):
+        # sh() corre con shell=True y recibe un STRING. Con una lista, el shell
+        # se queda con el primer elemento y le pasa el resto como SUS
+        # argumentos: el `garage status` nunca corrio y el init espero 300s un
+        # node id que no podia llegar (medido en el E2E). Los valores son
+        # nuestros (proyecto ya validado, GK hex), pero se citan igual.
+        cmd = " ".join(sh_quote(str(x)) for x in
+                       ["docker", "exec", c, "/garage", "-c", "/etc/garage.toml", *args])
+        return sh(cmd, timeout=t)
+
+    # 1. el nodo tiene que contestar antes de tocar nada
+    deadline = time.time() + timeout
+    node = ""
+    while time.time() < deadline:
+        r = g("status")
+        node = _s3_node_id((r.stdout or "") + (r.stderr or ""))
+        if node:
+            break
+        time.sleep(3)
+    if not node:
+        return False, "el Garage no contesta `status` (revisar: appctl %s logs --service garage)" % project
+
+    # 2. el layout (single node, una zona)
+    r = g("layout", "show")
+    m = re.search(r"Current cluster layout version: (\d+)", (r.stdout or "") + (r.stderr or ""))
+    if not m:
+        return False, "no pude leer la version del layout"
+    if int(m.group(1)) == 0:
+        cap = os.environ.get("APPCTL_S3_CAPACITY", "10GB")
+        g("layout", "assign", node, "-z", "dc1", "-c", cap, "-t", "appctl")
+        r = g("layout", "apply", "--version", "1")
+        if r.returncode != 0:
+            return False, f"no pude aplicar el layout: {((r.stdout or '') + (r.stderr or ''))[-300:]}"
+
+    # 3. la access key (la genero appctl: el secreto vive en el .env)
+    gk = names["S3_ACCESS_KEY_ID"]
+    r = g("key", "info", gk)
+    if r.returncode != 0:
+        r = g("key", "import", "--yes", "-n", project, gk, pw["S3_SECRET_ACCESS_KEY"])
+        if r.returncode != 0:
+            return False, f"no pude importar la access key: {((r.stdout or '') + (r.stderr or ''))[-300:]}"
+
+    # 4. el bucket, con permisos para esa key
+    b = names["S3_BUCKET"]
+    r = g("bucket", "info", b)
+    if r.returncode != 0:
+        r = g("bucket", "create", b)
+        if r.returncode != 0:
+            return False, f"no pude crear el bucket: {((r.stdout or '') + (r.stderr or ''))[-300:]}"
+        r = g("bucket", "allow", b, "--key", gk, "--read", "--write", "--owner")
+        if r.returncode != 0:
+            return False, f"no pude dar permisos sobre el bucket: {((r.stdout or '') + (r.stderr or ''))[-300:]}"
+    return True, f"layout v{max(int(m.group(1)), 1)}, key {gk[:6]}..., bucket {b}"
+
+
+
 def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
                    components: set[str], tags: dict, names: dict, pw: dict,
                    app_port: int, sftp_port: int | None, host: str,
                    pg_major: str, api_key: str,
-                   want_cron: bool = False,
+                   want_cron: bool = False, want_s3: bool = False,
+                   s3_publish: int | None = None,
+                   s3_publish_bind: str = "0.0.0.0",
                    app_memory: str = "", db_memory: str = "",
                    db_publish: int | None = None,
                    db_publish_bind: str = "127.0.0.1") -> None:
@@ -494,6 +752,13 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
     for sub in ("db/data", "db/init", "sftp/home/upload", "nginx",
                 "cron", "logs", "build"):
         (pdir / sub).mkdir(parents=True, exist_ok=True)
+    if want_s3:
+        # Los datos del S3 viven en el proyecto, como los de la DB: asi
+        # `destroy` es borrar una carpeta y el backup es del proyecto.
+        # 755 por lo mismo que db/data: el contenedor escribe ahi.
+        for sub in ("s3/data", "s3/meta"):
+            (pdir / sub).mkdir(parents=True, exist_ok=True)
+            os.chmod(pdir / sub, 0o755)
 
     # ./db/data se monta sobre /var/lib/postgresql/data (o /var/lib/mysql), y el
     # directorio del proyecto es 700 para que las credenciales no se lean.
@@ -551,6 +816,12 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
     # 127.0.0.1 le corta el acceso. El puerto y el bind viajan juntos.
     "__DB_PUBLISH__": (_render_publish(db_publish, stack, db_publish_bind)
                        if db_publish else ""),
+    # s3 tambien es una bandera (como cron): no cambia la imagen ni la DB,
+    # agrega el servicio garage. El bloque va aca y no en el template para
+    # que los 6 stacks no lo repitan (y no se desincronicen).
+    "__S3__": _render_s3(want_s3, project, tags.get("garage", "v2.4.1"),
+                         s3_publish, s3_publish_bind),
+    "__S3_APP_ENV__": _render_s3_app_env(want_s3),
     "__APP_IMAGE__": image_tag(stack, tags.get(runtime_of(stack),
                                                  DEFAULT_TAGS[runtime_of(stack)])),
 
@@ -670,6 +941,12 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
             % project
         )
 
+    # garage.toml: 0600 como el .env, tiene los secretos del nodo.
+    if want_s3:
+        f = pdir / "s3" / "garage.toml"
+        f.write_text(_garage_toml(names, pw))
+        f.chmod(0o600)
+
     # state
     state = {
         "project": project, "stack": stack, "host": host,
@@ -682,6 +959,11 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
                          "migracion": names["DB_MIGRATION_USER"],
                          "readonly": names["DB_READONLY_USER"]}},
         "sftp": {"user": names["SFTP_USER"], "port": sftp_port} if sftp_port else None,
+        "s3": ({"bucket": names["S3_BUCKET"],
+                "access_key_id": names["S3_ACCESS_KEY_ID"],
+                "endpoint": "http://garage:3900",
+                "region": "us-east-1",
+                "publish": s3_publish} if want_s3 else None),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "api_key": api_key,
         "appctl_version": "0.1.0",
@@ -2010,7 +2292,7 @@ def cmd_destroy(args) -> int:
         print("  DATOS:  se conservan (--keep-data)")
 
     if not args.yes and not args.keep_data:
-        r = input("  esto borra la DB y el codigo..confirmar? [s/N] ")
+        r = input("  esto borra la DB, el codigo y los archivos de S3..confirmar? [s/N] ")
         if r.strip().lower() not in ("s", "si", "y", "yes"):
             print("cancelado")
             return 1
@@ -2134,6 +2416,106 @@ def _validar_bind(bind: str) -> str:
             f"  docker no acepta una red en ports:; para habilitar una red "
             f"esta `appctl <p> db grant --cidr <red>`")
     return v
+
+
+
+def cmd_s3_init(args) -> int:
+    """Prepara el Garage: layout, key y bucket. Idempotente (se puede repetir)."""
+    pdir = build_dir(args.proyecto)
+    st = load_state(args.proyecto)
+    if not st:
+        die(f"{args.proyecto}: no es un proyecto appctl")
+    if "s3" not in (st.get("components") or []):
+        die(f"{args.proyecto} no tiene s3. Se agrega en el create: "
+            f"appctl <proyecto> <stack> ... s3")
+    names = _nombres_de_state(pdir, st)
+    pw = _passwords_de_env(pdir)
+    ok, detalle = _s3_init(pdir, args.proyecto, names, pw)
+    print(f"  {'OK' if ok else 'FALLA'}  {detalle}")
+    return 0 if ok else 1
+
+
+def cmd_s3_status(args) -> int:
+    """Como esta el S3 del proyecto: contenedor, layout, bucket y key."""
+    pdir = build_dir(args.proyecto)
+    st = load_state(args.proyecto)
+    if not st:
+        die(f"{args.proyecto}: no es un proyecto appctl")
+    if "s3" not in (st.get("components") or []):
+        die(f"{args.proyecto} no tiene s3")
+    s3 = st.get("s3") or {}
+    c = f"{args.proyecto}_garage"
+    print(f"  proyecto  {args.proyecto}")
+    print(f"  bucket    {s3.get('bucket')}")
+    print(f"  key       {s3.get('access_key_id')}")
+    print(f"  endpoint  {s3.get('endpoint')}  (interno: solo la red del proyecto)")
+    print(f"  region    {s3.get('region')}")
+    # sh() recibe un STRING (shell=True): con una lista no corre y el status
+    # dice "no corre" con el contenedor sano.
+    r = sh(f"docker inspect -f {{{{.State.Health.Status}}}} {sh_quote(c)}", timeout=30)
+    print(f"  garage    {r.stdout.strip() or 'no corre'}")
+    for etiqueta, sub in (("layout", ["layout", "show"]), ("bucket", ["bucket", "info", s3.get("bucket") or ""]),
+                          ("key", ["key", "info", s3.get("access_key_id") or ""])):
+        cmd = " ".join(sh_quote(str(x)) for x in
+                       ["docker", "exec", c, "/garage", "-c", "/etc/garage.toml", *sub])
+        r = sh(cmd, timeout=60)
+        salida = (r.stdout or "") + (r.stderr or "")
+        salida = "\n".join(l for l in salida.splitlines()
+                            if not re.search(r"INFO|garage_|Connected|handshake", l)).strip()
+        print(f"\n  ==== {etiqueta} ====")
+        for l in (salida.splitlines() or ["(sin salida)"])[:12]:
+            print(f"    {l}")
+    return 0
+
+
+def cmd_s3_garage(args) -> int:
+    """Pasa los argumentos al CLI de Garage del proyecto.
+
+    `appctl acme s3 garage bucket list`, `... key create backup`, etc. Es el
+    mismo binario que usa el init: todo lo que Garage sabe hacer queda a mano
+    sin reimplementar nada.
+    """
+    pdir = build_dir(args.proyecto)
+    st = load_state(args.proyecto)
+    if not st or "s3" not in (st.get("components") or []):
+        die(f"{args.proyecto} no tiene s3")
+    c = f"{args.proyecto}_garage"
+    cmd = " ".join(sh_quote(str(x)) for x in
+                   ["docker", "exec", c, "/garage", "-c", "/etc/garage.toml", *args.args])
+    r = sh(cmd, timeout=120)
+    salida = (r.stdout or "") + (r.stderr or "")
+    for l in salida.splitlines():
+        if not re.search(r"INFO|garage_|Connected|handshake", l):
+            print(f"  {l}")
+    return r.returncode
+
+
+def _nombres_de_state(pdir: Path, st: dict) -> dict:
+    """Los nombres publicos de un proyecto ya creado (los necesita el init)."""
+    s3 = st.get("s3") or {}
+    db = st.get("db") or {}
+    users = db.get("users") or {}
+    return {"DB_NAME": db.get("name") or f"{st['project']}_db",
+            "DB_USER": users.get("app") or st["project"],
+            "DB_MIGRATION_USER": users.get("migracion") or f"{st['project']}_mig",
+            "DB_READONLY_USER": users.get("readonly") or f"{st['project']}_ro",
+            "SFTP_USER": (st.get("sftp") or {}).get("user") or st["project"],
+            "S3_BUCKET": s3.get("bucket") or st["project"],
+            "S3_ACCESS_KEY_ID": s3.get("access_key_id") or ""}
+
+
+def _passwords_de_env(pdir: Path) -> dict:
+    """Los secretos del proyecto, del .env (0600). Lo usa el init del S3."""
+    pw = {}
+    try:
+        for linea in (pdir / ".env").read_text(encoding="utf-8").splitlines():
+            if "=" in linea and not linea.startswith("#"):
+                k, v = linea.split("=", 1)
+                pw[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return pw
+
 
 
 def cmd_db_expose(args) -> int:
@@ -2847,7 +3229,7 @@ def main() -> int:
                            con --service.
                            """))
     p.add_argument("proyecto")
-    p.add_argument("--service", choices=["app", "db"],
+    p.add_argument("--service", choices=["app", "db", "garage"],
                    help="a que servicio: app o db (default: los dos)")
     p.add_argument("--memory", help="ej: 2G (al servicio apuntado, o a los dos)")
     p.add_argument("--db-memory", help="ej: 1G (solo persistente: exige --save)")
@@ -2902,7 +3284,7 @@ def main() -> int:
 
     p = sub.add_parser("shell", help="shell en un contenedor")
     p.add_argument("proyecto")
-    p.add_argument("--service", default="app", choices=["app", "db"])
+    p.add_argument("--service", default="app", choices=["app", "db", "garage"])
     p.add_argument("--bash", action="store_true")
     p.set_defaults(func=cmd_shell)
 
@@ -2939,6 +3321,25 @@ def main() -> int:
     # (el proyecto queda entre el verbo y el subcomando), no a
     # `appctl db dump acme`. Por eso el proyecto es un ARGUMENTO DE `db`,
     # no de cada subparser, y los subcomandos no lo piden.
+    p = sub.add_parser("s3", help="el S3 del proyecto (Garage): estado, "
+                                 "reintentar el init, o pasarle un comando "
+                                 "al garage")
+    p.add_argument("proyecto")
+    s3sub = p.add_subparsers(dest="s3cmd")
+
+    q = s3sub.add_parser("init", help="preparar layout, key y bucket "
+                                      "(idempotente)")
+    q.set_defaults(func=cmd_s3_init)
+
+    q = s3sub.add_parser("status", help="estado del S3 (default sin subcomando)")
+    q.set_defaults(func=cmd_s3_status)
+
+    q = s3sub.add_parser("garage", help="pasarle un comando al CLI de Garage "
+                                        "(bucket, key, layout, ...)")
+    q.add_argument("args", nargs=argparse.REMAINDER)
+    q.set_defaults(func=cmd_s3_garage)
+    p.set_defaults(func=cmd_s3_status)
+
     p = sub.add_parser("db", help="la base de un proyecto (dump, restore, "
                                   "list, rm, expose, unexpose, grant, revoke, "
                                   "users)")
@@ -3040,7 +3441,7 @@ def main() -> int:
     # de argparse. Va en SIN_PROYECTO, que da el mensaje util.
     VERBS = {"info", "creds", "logs", "shell", "psql", "restart",
              "rotate", "destroy", "upgrade", "limits", "clone", "db",
-             "set-host"}
+             "s3", "set-host"}
     # Comandos que EXISTEN pero no toman proyecto. Sin esto, `appctl acme
     # doctor` cae al default (create), toma "doctor" por un componente y
     # responde "componentes desconocidos: doctor", que manda a buscar el
@@ -3062,7 +3463,7 @@ def main() -> int:
                "--help", "--version", "-V",
                "info", "creds", "logs", "shell", "psql", "restart",
                "rotate", "destroy", "upgrade", "limits", "clone", "db",
-               "set-host"}
+               "s3", "set-host"}
 
     a = sys.argv[1:]
     if a[0] not in GLOBALS:

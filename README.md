@@ -316,6 +316,7 @@ tiene más sentido.
 | `psql` / `mysql` | PostgreSQL 18 / MariaDB 11.8, red privada |
 | `sftp` | sshd con chroot, puerto dedicado, volumen compartido con la app |
 | `cron` | crontab del cliente, ejecutado dentro del contenedor de la app |
+| `s3` | Garage: un S3 compatible **por proyecto**, para cualquier stack |
 
 `cron` es una bandera, no un stack: no cambia la imagen ni la base, solo hace que
 el entrypoint habilite el crontab que el cliente sube a `/upload/cron/crontab`.
@@ -335,6 +336,7 @@ appctl acme php mysql
 appctl acme nextjs psql sftp --app-port 3001
 appctl acme nextjs python psql sftp
 appctl acme php psql sftp cron --app-memory 2G
+appctl acme nextjs python psql sftp s3
 ```
 
 **Opciones de `create`:**
@@ -358,6 +360,50 @@ appctl acme php psql sftp cron --app-memory 2G
 - el puerto de app y el de SFTP están libres, en el registro y en la red real
 - el proyecto no existe todavía
 - el stack resultante existe en `stacks/`
+
+### S3 (Garage)
+
+`s3` es otra bandera, como `cron`: no cambia la imagen ni la base, agrega un
+**Garage** — un S3 compatible, self-hosted, escrito en Rust — **por proyecto**.
+Cada proyecto con S3 tiene su contenedor, sus volúmenes y sus credenciales: los
+clientes no comparten buckets, nadie ve lo del vecino, y si uno se rompe no se
+lleva puesto a los demás. En reposo son ~6 MB de RAM (medido).
+
+```bash
+appctl acme nextjs python psql sftp s3
+```
+
+La API S3 escucha en **3900 y no se publica**: la consume la app por la red
+interna del proyecto (`http://garage:3900`). Es **path-style**, así que en el SDK
+de JavaScript hay que pasar `forcePathStyle: true`. La app ya recibe todo por
+entorno, con los nombres propios y con los de AWS:
+
+| Variable | Valor |
+|---|---|
+| `S3_ENDPOINT` / `AWS_ENDPOINT_URL_S3` | `http://garage:3900` |
+| `S3_REGION` / `AWS_REGION` | `us-east-1` |
+| `S3_BUCKET` / `AWS_BUCKET` | el nombre del proyecto |
+| `S3_ACCESS_KEY_ID` / `AWS_ACCESS_KEY_ID` | `GK…` (la genera appctl) |
+| `S3_SECRET_ACCESS_KEY` / `AWS_SECRET_ACCESS_KEY` | 64 hex |
+
+Los nombres duplicados son a propósito: los SDK toman los de AWS solos, sin
+configuración.
+
+El bucket y la key los prepara `appctl` **después** del `up`, no un sidecar: la
+imagen de Garage es *scratch*, adentro no hay shell. Asigna el layout del nodo,
+importa la key con las credenciales que generó y crea el bucket con permisos de
+lectura y escritura. Todo idempotente: correrlo de nuevo no toca nada.
+
+```bash
+appctl acme s3                       # estado: contenedor, layout, bucket y key
+appctl acme s3 init                  # reintentar la preparación
+appctl acme s3 garage bucket list    # cualquier comando del CLI de Garage
+```
+
+Desde afuera no se llega (es interno, como la base): para mirarlo,
+`ssh -L 3900:garage:3900 <usuario>@<host>`.
+
+---
 
 ---
 

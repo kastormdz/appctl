@@ -68,6 +68,25 @@ def _api_publica(pdir: str) -> bool:
     return False
 
 
+def _s3_del_env(pdir: str) -> dict:
+    """Las credenciales del S3 del proyecto, leidas del .env (0600).
+
+    Se leen del disco y no de un parametro: el resumen lo usan el create, creds
+    e info, y los tres tienen que decir lo MISMO. El .env es la fuente.
+    """
+    out = {}
+    try:
+        with open(os.path.join(pdir, ".env"), encoding="utf-8") as f:
+            for linea in f:
+                if "=" in linea and not linea.startswith("#"):
+                    k, v = linea.strip().split("=", 1)
+                    if k.startswith("S3_"):
+                        out[k] = v
+    except OSError:
+        pass
+    return out
+
+
 def render_create(project: str, stack: str, host: str, app_port: int,
                   sftp_port: int | None, names: dict, pw: dict,
                   pdir: str, creds_only: bool = False,
@@ -204,6 +223,21 @@ def render_create(project: str, stack: str, host: str, app_port: int,
     # por entorno: el stack se las pasa al contenedor.
     _rt = stack.split("-")[0]
     _node = _rt in ("nextjs", "express")
+    # El S3 del proyecto (Garage), si lo tiene. El developer necesita las tres
+    # cosas: donde, con que credenciales y como se llama el bucket.
+    _s3 = _s3_del_env(pdir)
+    if _s3.get("S3_BUCKET"):
+        L.append(f"{BOLD}S3 (Garage){RESET}  {DIM}(interno: solo la red del proyecto){RESET}")
+        L.append(f"  Endpoint   http://garage:3900   {DIM}(path-style){RESET}")
+        L.append(f"  Region     us-east-1")
+        L.append(f"  Bucket     {_s3.get('S3_BUCKET')}")
+        L.append(f"  Access key {_s3.get('S3_ACCESS_KEY_ID')}")
+        L.append(f"  Secret     {_s3.get('S3_SECRET_ACCESS_KEY')}")
+        L.append(f"  {DIM}La app ya las tiene en el entorno (S3_* y los AWS_*).{RESET}")
+        L.append(f"  {DIM}De afuera, tunel: ssh -L 3900:garage:3900 <usuario>@<host>{RESET}")
+        L.append(f"  {DIM}Administrarlo: appctl {project} s3 garage <comando>{RESET}")
+        L.append("")
+
     L.append(f"{BOLD}Ejemplo de conexion "
              f"({'Node: el entorno ya lo trae' if _node else 'Laravel .env'})"
              f"{RESET}")

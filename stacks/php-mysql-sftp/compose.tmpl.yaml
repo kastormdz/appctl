@@ -23,6 +23,7 @@ services:
     restart: unless-stopped
     environment:
       PROJECT: __PROYECTO__
+__S3_APP_ENV__
 __CRON__
       SFTP_USER: ${SFTP_USER}
       SFTP_PASSWORD: ${SFTP_PASSWORD}
@@ -175,6 +176,7 @@ __DB_PUBLISH__
       retries: 10
       start_period: 40s
 
+__S3__
 networks:
   egress:
     driver: bridge

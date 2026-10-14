@@ -57,3 +57,23 @@ def app_key() -> str:
 
 def token(length: int = 32) -> str:
     return secrets.token_urlsafe(length)
+
+
+def s3_access_key() -> str:
+    """Access key ID de Garage: GK + 24 hex.
+
+    Medido con `garage key import`: Garage acepta una key con este formato sin
+    quejarse (el id es lo unico que ve el cliente; el secreto va aparte).
+    """
+    return "GK" + secrets.token_hex(12)
+
+
+def hex64() -> str:
+    """64 hex: el formato del rpc_secret y del secret de una access key."""
+    return secrets.token_hex(32)
+
+
+def b64_32() -> str:
+    """32 bytes en base64: el formato de los tokens de Garage (admin/metrics)."""
+    import base64
+    return base64.b64encode(secrets.token_bytes(32)).decode()

@@ -11,6 +11,7 @@ COMPORTAMIENTO: que un cliente de otra red no llega a la DB.
 """
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -146,6 +147,120 @@ def wait_healthy(project_dir: str, services: list[str], timeout: int = 150) -> l
                                     f"timeout a los {timeout}s "
                                     f"(estado actual: {_health_of(container)})"))
     return checks
+
+
+def _s3_cfg(cfg: dict) -> dict:
+    """Los datos del S3 del proyecto: del state si estan, del .env si no.
+
+    El create arma el cfg de memoria (todavia no hay state.json); el upgrade lo
+    arma del state. Los dos tienen el .env, que es donde viven las credenciales.
+    """
+    s3 = dict((cfg or {}).get("s3") or {})
+    env = (cfg or {}).get("env") or {}
+    s3.setdefault("bucket", env.get("S3_BUCKET", ""))
+    s3.setdefault("access_key_id", env.get("S3_ACCESS_KEY_ID", ""))
+    return s3
+
+
+def s3_garage_listo(project_dir: str, cfg: dict) -> Check:
+    """El Garage del proyecto esta vivo Y con el layout aplicado.
+
+    `layout show` imprime 'Current cluster layout version: N'. Con 0 el nodo
+    existe pero no tiene rol y el S3 no acepta NADA (todas las operaciones
+    contestan 'Layout not ready' con 500). Es el estado en el que queda si el
+    init no corrio, y el healthcheck del contenedor NO lo detecta: ese mide el
+    proceso, no la configuracion.
+    """
+    c = _container_name(project_dir, "garage")
+    try:
+        r = subprocess.run(["docker", "exec", c, "/garage", "-c", "/etc/garage.toml",
+                            "layout", "show"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return Check("Garage responde", False, f"no se pudo preguntar: {e}")
+    salida = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        return Check("Garage responde", False, f"`layout show` fallo: {salida.strip()[-200:]}")
+    m = re.search(r"Current cluster layout version: (\d+)", salida)
+    if not m:
+        return Check("Garage responde", False,
+                     f"no pude leer la version del layout: {salida.strip()[-200:]}")
+    if int(m.group(1)) < 1:
+        return Check("Garage listo (layout aplicado)", False,
+                     "el layout esta en version 0: el S3 no acepta operaciones. "
+                     "Se arregla con: appctl <proyecto> s3 init")
+    return Check("Garage listo (layout aplicado)", True, f"layout v{m.group(1)}")
+
+
+def s3_la_app_lo_alcanza(project_dir: str, cfg: dict) -> Check:
+    """La app llega al S3 por la red del proyecto.
+
+    Se le pide el /health del puerto S3 desde DENTRO del contenedor de la app:
+    un 403 alcanza (esa API exige auth para todo, asi que 403 = hay algo
+    escuchando del otro lado). El fallo que importa es el error de conexion: la
+    app puede estar perfecta y el bucket inalcanzable.
+    """
+    app = _container_name(project_dir, "app")
+    try:
+        r = subprocess.run(["docker", "exec", app, "curl", "-q", "-sS", "-o", "/dev/null",
+                            "-w", "%{http_code}", "--max-time", "10",
+                            "http://garage:3900/health"],
+                           capture_output=True, text=True, timeout=25)
+    except (OSError, subprocess.SubprocessError) as e:
+        return Check("la app alcanza el S3", False, f"no se pudo pedir: {e}")
+    http = (r.stdout or "").strip()
+    if r.returncode != 0 or not http or http == "000":
+        return Check("la app alcanza el S3", False,
+                     f"no llega a garage:3900: {(r.stderr or '').strip()[:160] or 'sin respuesta'}")
+    return Check("la app alcanza el S3 (http://garage:3900)", True,
+                 f"HTTP {http} (403 es lo normal sin credenciales: la API S3 pide auth)")
+
+
+def s3_bucket_y_key(project_dir: str, cfg: dict) -> Check:
+    """El bucket existe y la access key tiene permisos sobre el."""
+    s3 = _s3_cfg(cfg)
+    bucket = s3.get("bucket") or ""
+    gk = s3.get("access_key_id") or ""
+    if not bucket or not gk:
+        return Check("bucket y key del S3", False, "el state no tiene bucket/access key")
+    c = _container_name(project_dir, "garage")
+    try:
+        r = subprocess.run(["docker", "exec", c, "/garage", "-c", "/etc/garage.toml",
+                            "bucket", "info", bucket], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        return Check("bucket y key del S3", False, f"no se pudo preguntar: {e}")
+    salida = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        return Check("bucket y key del S3", False,
+                     f"no existe el bucket {bucket}: {salida.strip()[-200:]}")
+    if gk not in salida:
+        return Check("bucket y key del S3", False,
+                     f"la key {gk[:6]}... no aparece con permisos en el bucket {bucket}")
+    return Check(f"bucket {bucket} con permisos para la key", True, gk[:6] + "...")
+
+
+def s3_creds_en_la_app(project_dir: str, cfg: dict) -> Check:
+    """La app tiene las credenciales del S3 en su entorno.
+
+    Una key rotada, un .env a medias o un compose re-renderizado sin las
+    variables no se notan hasta que el cliente sube un archivo.
+    """
+    s3 = _s3_cfg(cfg)
+    app = _container_name(project_dir, "app")
+    vars_ = ["S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_BUCKET", "S3_ENDPOINT"]
+    try:
+        r = subprocess.run(["docker", "exec", app, "printenv"] + vars_,
+                           capture_output=True, text=True, timeout=25)
+    except (OSError, subprocess.SubprocessError) as e:
+        return Check("el S3 esta en el entorno de la app", False, f"no se pudo preguntar: {e}")
+    vals = dict(zip(vars_, (r.stdout or "").strip().splitlines()))
+    faltan = [k for k, v in vals.items() if not v]
+    if r.returncode != 0 or faltan:
+        return Check("el S3 esta en el entorno de la app", False,
+                     f"falta(n): {', '.join(faltan) or 'todas'}")
+    if s3.get("access_key_id") and vals["S3_ACCESS_KEY_ID"] != s3["access_key_id"]:
+        return Check("el S3 esta en el entorno de la app", False,
+                     f"la key del entorno ({vals['S3_ACCESS_KEY_ID'][:6]}...) no es la del proyecto")
+    return Check("el S3 esta en el entorno de la app", True, vals["S3_ENDPOINT"])
 
 
 def _container_name(project_dir: str, service: str) -> str:
@@ -1070,7 +1185,10 @@ def all_checks(project_dir: str, cfg: dict, host: str,
     checks: list[Check] = []
     project = cfg["project"]
 
-    checks += wait_healthy(project_dir, ["db", "app"])
+    # el garage tarda lo suyo en arrancar (es un proceso rust con sqlite
+    # arriba); se espera como a la db.
+    _svcs = ["db", "app"] + (["garage"] if "s3" in (cfg.get("components") or []) else [])
+    checks += wait_healthy(project_dir, _svcs)
     # el healthcheck del stub no toca la DB, asi que "app healthy" puede
     # pasar antes de que postgres termine el initdb. esperar la DB real.
     checks.append(_wait_db_ready(
@@ -1101,6 +1219,15 @@ def all_checks(project_dir: str, cfg: dict, host: str,
     # El stack nextjs-python tiene DOS runtimes en el mismo puerto: / lo
     # contesta Next y /api la API. Sin este check, una API caida pasaba
     # desapercibida con el resto en verde.
+    # El S3 es un COMPONENTE, no un stack: va con cualquiera de los 6. Los
+    # cuatro checks cubren las dos formas de romperse sin que se note: el
+    # Garage sin layout (el S3 contesta 500 en todo) y la app sin las
+    # credenciales (anda perfecto hasta que sube un archivo).
+    if "s3" in (cfg.get("components") or []):
+        checks.append(s3_garage_listo(project_dir, cfg))
+        checks.append(s3_la_app_lo_alcanza(project_dir, cfg))
+        checks.append(s3_bucket_y_key(project_dir, cfg))
+        checks.append(s3_creds_en_la_app(project_dir, cfg))
     if "python" in (cfg.get("stack") or ""):
         checks.append(app_serves_python(
             project_dir, cfg["app_port"], cfg, expect_stub=expect_stub))
