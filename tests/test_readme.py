@@ -28,6 +28,17 @@ README = RAIZ / "README.md"
 FALLOS = []
 
 
+def _cli():
+    """El CLI cargado como modulo, para leer sus constantes (ALL_COMPONENTS)."""
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader("appctl", str(RAIZ / "bin/appctl"))
+    spec = importlib.util.spec_from_loader("appctl", loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    return m
+
+
 def check(nombre, cond, detalle=""):
     print(("  PASS  " if cond else "  FAIL  ") + nombre
           + ("" if cond else "\n            {0}".format(detalle)))
@@ -72,6 +83,15 @@ def main():
               re.search(r"^\s+" + rt + r"\s", epilogo, re.M) is not None)
         check("un choices acepta {0}".format(rt),
               any('"{0}"'.format(rt) in c for c in choices))
+
+    # Los COMPONENTES, no solo los runtimes que tienen directorio en stacks/:
+    # `sftp`, `cron` y `s3` son banderas y el bucle de arriba no los ve. Un
+    # componente nuevo sin documentar en el epilogo es invisible para el que
+    # corre `appctl` pelado (paso con s3: estaba en el docstring y en los
+    # choices, pero no en la lista que el usuario ve).
+    for comp in sorted(_cli().ALL_COMPONENTS):
+        check("-h lista el componente {0}".format(comp),
+              re.search(r"^\s+" + re.escape(comp) + r"\s", epilogo, re.M) is not None)
 
     for nombre, comillas in (("README.md", "«"), ("README.en.md", "'")):
         print("=" * 62)

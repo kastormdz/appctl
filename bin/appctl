@@ -3162,6 +3162,7 @@ def main() -> int:
               mysql    MariaDB / MySQL
               sftp     SFTP con chroot
               cron     crontab con supervisor
+              s3       Garage: un S3 por proyecto (cualquier stack)
 
             ejemplos:
               appctl acme php psql sftp
@@ -3169,6 +3170,7 @@ def main() -> int:
               appctl acme php mysql
               appctl acme nextjs python psql sftp
               appctl acme express psql sftp
+              appctl acme nextjs python psql sftp s3
               appctl acme list
               appctl acme rotate sftp
               appctl acme db expose 5432 --bind 127.0.0.1
