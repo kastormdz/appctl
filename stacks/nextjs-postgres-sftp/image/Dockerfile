@@ -35,10 +35,11 @@ COPY nginx.conf /etc/nginx/nginx.conf
 COPY nginx.conf /usr/local/share/appctl/nginx.conf
 COPY sshd_config /etc/ssh/sshd_config
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY start-next.sh /usr/local/bin/start-next.sh
 COPY fixperms.sh /usr/local/bin/fixperms.sh
 COPY supervisord.conf /etc/supervisord.conf
 
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/fixperms.sh \
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/start-next.sh /usr/local/bin/fixperms.sh \
  && mkdir -p /srv/sftp /srv/sftp/upload /app/.next /run/nginx /var/log/nginx \
  && rm -f /etc/nginx/conf.d/default.conf
 

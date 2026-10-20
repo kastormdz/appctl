@@ -124,9 +124,16 @@ def main() -> int:
     check("start.sh" in ep and "chmod 755 /app/start.sh" in ep,
           "escribe /app/start.sh ejecutable")
     # regla dura del repo: nunca rm -rf sobre datos del cliente
-    malos = [l for l in ep.splitlines()
-             if "rm -rf" in l and ("upload" in l or "frontend" in l or "backend" in l
-                                   or "WEBROOT" in l or "APP_SRC" in l)]
+    malos = []
+    for l in ep.splitlines():
+        # la unica excepcion: borrar la COPIA de un DATA_DIR dentro de /app
+        # (si no, el dir de datos queda duplicado tras cada reinicio). El
+        # original vive en el webroot y no se toca.
+        if 'rm -rf "${APP_SRC:?}/${_d}"' in l:
+            continue
+        if "rm -rf" in l and ("upload" in l or "frontend" in l or "backend" in l
+                              or "WEBROOT" in l or "APP_SRC" in l):
+            malos.append(l)
     check(not malos, f"ningun rm -rf sobre datos del cliente ({len(malos)} encontrados)")
     check("mkdir -p" in ep, "crea con mkdir -p, nunca borrando")
 

@@ -205,7 +205,19 @@ the developer uploads everything over the same session:
 ```text
 /upload/              the Next app (package.json, app/, etc)
 /upload/backend/      the API (main.py + requirements.txt)
+/upload/siga/         the DATA (PDFs, records): never copied into the app
 ```
+
+**Data outside the code.** Everything the app writes goes into a directory under
+`/upload` and is read from there: with `DATA_DIRS="siga"` in the project `.env`
+that directory is **not copied** into the app on every start (otherwise each
+restart duplicates the files and takes forever). The app sees it at
+`/srv/sftp/upload/siga`; the developer sees it as `/siga` over SFTP.
+
+**Standalone.** `next build` only emits the lightweight server (the one the
+stack runs) when `next.config` has `output: 'standalone'`. If it's missing the
+container still starts, but with `next start` (more RAM), and says so in the
+project logs.
 
 | Detail | How it works |
 |---|---|

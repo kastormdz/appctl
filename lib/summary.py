@@ -87,6 +87,28 @@ def _s3_del_env(pdir: str) -> dict:
     return out
 
 
+def _arbol_para(stack: str) -> str:
+    """El arbol que el developer tiene que subir, por stack.
+
+    Sale de lo que busca el entrypoint de cada stack (donde el codigo, donde el
+    backend, donde los datos), no de una idea: si el developer pone las carpetas
+    en otro lado, el stack no arranca y no dice por que.
+    """
+    if stack.startswith("nextjs-python"):
+        return (
+            "/upload/                      <- la raiz del SFTP (el chroot)\n|-- package.json              <- la app Next (frontend + BFF)\n|-- next.config.*             <- con output:'standalone' (la mitad de RAM)\n|-- pnpm-lock.yaml\n|-- app/                      <- las rutas de Next\n|   `-- api/.../route.ts      <- el BFF: lo unico que ve el navegador\n|-- public/\n|-- backend/                  <- la API FastAPI\n|   |-- main.py               <- app = FastAPI()\n|   `-- requirements.txt\n`-- siga/                     <- PDFs y constancias: DATOS, no codigo\n\nNext y la API tienen que responder GET /healthz (200), o el contenedor\nfigura unhealthy. La API escucha en 127.0.0.1:8000 y NO se publica: el BFF\nle pega ahi. Los archivos van a /srv/sftp/upload/siga (lo ven los DOS\nruntimes; NO /app/siga) y con DATA_DIRS=siga en el .env no se copian a\n/app en cada arranque. Despues de subir:  appctl <proyecto> restart"
+        )
+    if stack.startswith("express"):
+        return '/upload/\n|-- backend/                  <- Express (package.json + server.js)\n`-- frontend/                 <- React (se buildea y nginx sirve el build)\n\nDespues de subir:  appctl <proyecto> restart  (instala y buildea lo que falte)'
+    if stack.startswith("nextjs"):
+        return "/upload/\n|-- package.json\n|-- next.config.*             <- con output:'standalone' (la mitad de RAM)\n|-- app/  (o pages/)\n`-- public/\n\nDespues de subir:  appctl <proyecto> restart  (instala y buildea lo que falte)"
+    if stack.startswith("php"):
+        return '/upload/                      <- la raiz del SFTP ES el webroot\n|-- index.php\n`-- ... (lo que sirva nginx)\n\nDespues de subir:  appctl <proyecto> restart'
+    if stack.startswith("tomcat"):
+        return 'El .war se deploya por el manager:  http://<host>:<puerto>/manager/html\n(misma credencial que el SFTP)'
+    return ""
+
+
 def render_create(project: str, stack: str, host: str, app_port: int,
                   sftp_port: int | None, names: dict, pw: dict,
                   pdir: str, creds_only: bool = False,
@@ -263,6 +285,18 @@ def render_create(project: str, stack: str, host: str, app_port: int,
         L.append(f"  DB_HOST={_ext}")
         L.append(f"  DB_PORT={_pp}")
     L.append("")
+
+    # ---- Como desplegar: el arbol que el developer tiene que subir ---------
+    # Sale tambien en `creds`, que es el paquete que se le pasa al cliente para
+    # que despliegue: sin el arbol, sube las carpetas donde le parece y el
+    # stack no arranca, sin decir por que.
+    _arbol = _arbol_para(stack).replace("<proyecto>", project)
+    if _arbol:
+        L.append(f"{BOLD}Como desplegar{RESET}  {DIM}(subir por SFTP, a la raiz){RESET}")
+        L.append("")
+        for _l in _arbol.splitlines():
+            L.append(f"  {_l}" if _l.strip() else "")
+        L.append("")
 
     L.append(f"{bar}")
     L.append(f"Credenciales en  {pdir}/.env   {DIM}(0600){RESET}")

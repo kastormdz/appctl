@@ -158,7 +158,31 @@ fi
 # es del usuario SFTP mientras que lo que corre es de app.
 if [ -n "$(ls -A "${WEBROOT}" 2>/dev/null)" ]; then
     log "codigo del cliente detectado en el webroot"
-    cp -a "${WEBROOT}/." "${APP_SRC}/" 2>/dev/null || true
+    # Copia del codigo, salteando los DIRECTORIOS DE DATOS (DATA_DIRS).
+    # Un `siga/` con miles de PDFs no tiene por que duplicarse en /app: era el
+    # doble de disco y un arranque lentisimo. Los datos se leen del webroot
+    # compartido (/srv/sftp/upload/...), no de la copia.
+    _excl=""
+    for _d in ${DATA_DIRS:-}; do
+        case "$_d" in
+            ""|.|..|*/*) continue ;;   # solo nombres simples: nunca un path
+        esac
+        _excl="$_excl --exclude=./$_d"
+    done
+    # shellcheck disable=SC2086
+    if [ -n "$_excl" ]; then
+        tar -C "${WEBROOT}" -cf - $_excl . 2>/dev/null | tar -C "${APP_SRC}" -xf - 2>/dev/null \
+            || cp -a "${WEBROOT}/." "${APP_SRC}/" 2>/dev/null || true
+    else
+        cp -a "${WEBROOT}/." "${APP_SRC}/" 2>/dev/null || true
+    fi
+    # y que no quede una copia vieja de esos dirs en /app (de un arranque previo)
+    for _d in ${DATA_DIRS:-}; do
+        case "$_d" in
+            ""|.|..|*/*) continue ;;
+        esac
+        rm -rf "${APP_SRC:?}/${_d}" 2>/dev/null || true
+    done
 fi
 chown -R app:app "${APP_SRC}" 2>/dev/null || true
 find "${APP_SRC}" -type d -exec chmod 755 {} + 2>/dev/null || true

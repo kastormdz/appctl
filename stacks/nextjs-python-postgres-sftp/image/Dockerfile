@@ -60,9 +60,10 @@ COPY nginx.conf /usr/local/share/appctl/nginx.conf
 COPY sshd_config /etc/ssh/sshd_config
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY python-launch.sh /usr/local/bin/python-launch.sh
+COPY start-next.sh /usr/local/bin/start-next.sh
 COPY supervisord.conf /etc/supervisord.conf
 
-RUN chmod +x /usr/local/bin/entrypoint.sh \
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/start-next.sh \
       /usr/local/bin/python-launch.sh \
  && mkdir -p /srv/sftp /srv/sftp/upload /srv/sftp/private \
       /app/.next /app/backend /run/nginx /var/log/nginx \

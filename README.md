@@ -205,7 +205,18 @@ mantener y el código repartido en dos uploads distintos. Con `python` al lado d
 ```text
 /upload/              la app de Next (package.json, app/, etc)
 /upload/backend/      la API (main.py + requirements.txt)
+/upload/siga/         los DATOS (PDFs, constancias): no se copian a la app
 ```
+
+**Datos fuera del código.** Todo lo que la app escribe va en un directorio de
+`/upload` y se lee de ahí: con `DATA_DIRS="siga"` en el `.env` del proyecto ese
+directorio **no se copia** a la app en cada arranque (si no, cada reinicio
+duplica los archivos y tarda una eternidad). La app lo ve en
+`/srv/sftp/upload/siga`; el developer, como `/siga` por SFTP.
+
+**Standalone.** `next build` emite el server liviano (el que corre el stack) solo
+si `next.config` tiene `output: 'standalone'`. Si falta, el contenedor arranca
+igual, pero con `next start` (más RAM), y lo avisa en los logs del proyecto.
 
 | Detalle | Cómo funciona |
 |---|---|

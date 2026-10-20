@@ -38,6 +38,9 @@ services:
     restart: unless-stopped
     environment:
       PROJECT: __PROYECTO__
+      # Directorios de DATOS dentro de /upload que NO se copian a la app
+      # (PDFs, adjuntos): se leen del webroot compartido. Ej: "siga docs"
+      DATA_DIRS: "${DATA_DIRS:-}"
 __S3_APP_ENV__
 __CRON__
       # pnpm install y pip install necesitan la red en RUNTIME, no solo en
