@@ -223,8 +223,20 @@ if [ -n "$(ls -A "${WEBROOT}" 2>/dev/null)" ]; then
     done
 fi
 chown -R app:app "${APP_SRC}" 2>/dev/null || true
-find "${APP_SRC}" -type d -exec chmod 755 {} + 2>/dev/null || true
-find "${APP_SRC}" -type f -exec chmod 644 {} + 2>/dev/null || true
+# Normalizar permisos del CODIGO DEL CLIENTE (que llega por SFTP con modos
+# arbitrarios), pero NUNCA tocar node_modules: ahi los .bin son scripts y
+# binarios que pierden el +x con un chmod 644 y el build muere con
+# "sh: next: Permission denied" (medido). node_modules lo maneja pnpm.
+find "${APP_SRC}" -type d -not -path "*/node_modules/*" -exec chmod 755 {} + 2>/dev/null || true
+find "${APP_SRC}" -type f -not -path "*/node_modules/*" -exec chmod 644 {} + 2>/dev/null || true
+# Reparacion de un node_modules que ya quedo sin +x (proyectos con la imagen
+# vieja): barato, idempotente y evita el build roto.
+if [ -d "${APP_SRC}/node_modules/.bin" ]; then
+    find "${APP_SRC}/node_modules/.bin" -maxdepth 1 \( -type f -o -type l \) \
+        -exec chmod +x {} + 2>/dev/null || true
+    find "${APP_SRC}/node_modules" -maxdepth 4 -path "*/dist/bin/*" -type f \
+        -exec chmod +x {} + 2>/dev/null || true
+fi
 
 # --- stub de Next ---------------------------------------------------------
 # Se escribe SOLO si el cliente no subio una app de Next. Antes el stub

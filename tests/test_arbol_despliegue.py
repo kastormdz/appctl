@@ -128,6 +128,14 @@ up_frag = app.split("def cmd_upgrade")[1][:14000] if "def cmd_upgrade" in app el
 check(up_frag.count("_wait_app_ready(pdir)") >= 2,
       "upgrade espera healthy en las dos ramas antes de verificar")
 
+# --- 5f. el chmod no rompe node_modules ------------------------------------
+for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp"):
+    ep4 = (RAIZ / "stacks" / st / "image/entrypoint.sh").read_text(encoding="utf-8")
+    check('-not -path "*/node_modules/*" -exec chmod 644' in ep4,
+          f"{st}: el chmod 644 no toca node_modules")
+    check("find \"${APP_SRC}/node_modules/.bin\"" in ep4,
+          f"{st}: repara el +x de node_modules/.bin")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")
