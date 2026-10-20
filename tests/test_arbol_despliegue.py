@@ -122,6 +122,12 @@ for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp"):
     check("ES_STUB" in sn2 and "stub de verificacion" in sn2,
           f"{st}: start-next.sh no ejecuta el stub como si fuera la app")
 
+# --- 5e. upgrade espera healthy antes de verificar -------------------------
+check("def _wait_app_ready" in app, "existe _wait_app_ready")
+up_frag = app.split("def cmd_upgrade")[1][:14000] if "def cmd_upgrade" in app else app
+check(up_frag.count("_wait_app_ready(pdir)") >= 2,
+      "upgrade espera healthy en las dos ramas antes de verificar")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

@@ -1366,6 +1366,41 @@ def _wait_db_ready(pdir: Path | str, timeout: int = 180) -> bool:
     return False
 
 
+def _wait_app_ready(pdir: Path | str, timeout: int = 1200) -> bool:
+    """Espera a que el contenedor de la app quede healthy.
+
+    El entrypoint instala dependencias y buildea Next: la primera vez son
+    MINUTOS. Verificar apenas vuelve `up -d` da FAIL sobre un upgrade que
+    estaba perfecto (medido: rollback de un upgrade correcto porque el build
+    todavia no habia terminado). El healthcheck del contenedor solo pasa a
+    healthy cuando nginx + el backend responden, asi que es el dato correcto.
+
+    unhealthy sostenido (no el arranque) corta antes: no tiene sentido
+    esperar 20 minutos un contenedor que ya se sabe roto.
+    """
+    import time
+    project = Path(pdir).name
+    deadline = time.time() + timeout
+    unhealthy_seguidos = 0
+    while time.time() < deadline:
+        r = subprocess.run(
+            ["docker", "inspect", f"{project}_app", "--format",
+             "{{.State.Health.Status}}"],
+            capture_output=True, text=True, timeout=20)
+        estado = (r.stdout or "").strip()
+        if estado == "healthy":
+            return True
+        if estado in ("unhealthy", "exited", "dead"):
+            unhealthy_seguidos += 1
+            # ~90s unhealthy de verdad: se corta
+            if unhealthy_seguidos >= 18:
+                return False
+        else:
+            unhealthy_seguidos = 0
+        time.sleep(5)
+    return False
+
+
 def cmd_clone(args) -> int:
     """Copia un proyecto CON TODOS SUS DATOS, en otro puerto.
 
@@ -1796,6 +1831,11 @@ def cmd_upgrade(args) -> int:
                 r = sh("docker compose up -d", cwd=build_dir(project), timeout=300)
                 if r.returncode == 0:
                     print("  aplicado (docker compose up -d)")
+                    if not _wait_app_ready(pdir):
+                        print("  la app no quedo healthy: mirar: appctl %s logs"
+                              % project)
+                        return 1
+                    print("  app healthy")
                 else:
                     print("  no se pudo aplicar; mirar: appctl %s logs" % project)
                     return r.returncode
@@ -1889,6 +1929,11 @@ def cmd_upgrade(args) -> int:
                 r = sh("docker compose up -d", cwd=build_dir(project), timeout=300)
                 if r.returncode == 0:
                     print("  aplicado (docker compose up -d)")
+                    if not _wait_app_ready(pdir):
+                        print("  la app no quedo healthy: mirar: appctl %s logs"
+                              % project)
+                        return 1
+                    print("  app healthy")
                 else:
                     print("  no se pudo aplicar; mirar: appctl %s logs" % project)
                     return r.returncode
@@ -1912,6 +1957,10 @@ def cmd_upgrade(args) -> int:
     r = sh("docker compose up -d", cwd=build_dir(project), timeout=600)
     if r.returncode == 0:
         print("  aplicado (docker compose up -d)")
+        if not _wait_app_ready(pdir):
+            print("  la app no quedo healthy: revisar: appctl %s logs" % project)
+            return 1
+        print("  app healthy")
     else:
         print("  no se pudo aplicar; revisar: appctl %s logs" % project)
         return r.returncode
@@ -1928,6 +1977,14 @@ def cmd_upgrade(args) -> int:
         restore_generated()
         die("el up fallo: se restauraron los archivos anteriores\n"
             f"  logs del que fallo:  appctl {project} logs")
+
+    # El up de arriba puede haber RECREADO la app (imagen nueva): el
+    # entrypoint vuelve a instalar y buildear. Sin esta espera, los checks
+    # corren contra un contenedor a medio arrancar y el upgrade se revierte
+    # solo, con el compose nuevo ya correcto.
+    if not _wait_app_ready(pdir):
+        print("  la app no quedo healthy; los checks van a fallar y se "
+              "revierte. Mirar: appctl %s logs" % project)
 
     # ---- verificar, y volver atras SOLO si algo se rompio ---------------
     # Sin esto, un stack nuevo que rompe deja al cliente caido y uno se
