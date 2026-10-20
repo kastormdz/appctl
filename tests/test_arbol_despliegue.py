@@ -103,6 +103,15 @@ for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp"):
     check("_debe_buildear" in ep2 and ".next/BUILD_ID" in ep2,
           f"{st}: re-buildea si el codigo es mas nuevo que el build")
 
+# --- 5c. upgrade aplica de verdad (el .env no lo lee restart) --------------
+app = (RAIZ / "bin/appctl").read_text(encoding="utf-8")
+check("docker compose up -d" in app.split("def cmd_upgrade")[1][:9000],
+      "upgrade aplica con up -d (re-lee el .env)")
+check("se re-aplica con: appctl %s restart" not in app,
+      "upgrade ya no manda a restart (que no re-lee el entorno)")
+check("si tocaste el .env, se aplica con --yes" in app,
+      "upgrade avisa como aplicar un cambio de .env")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

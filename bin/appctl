@@ -1788,6 +1788,19 @@ def cmd_upgrade(args) -> int:
                 # esto es una vista previa y no escribe nada.
                 save_state(project, st)
                 print("  (el state quedo al dia)")
+            # El compose puede estar igual y el .env NO (DATA_DIRS,
+            # PY_API_PUBLICA, PY_API_URL...). `restart` no re-lee el entorno:
+            # el contenedor se queda con el viejo. `up -d` recrea solo si la
+            # config cambio, asi que es seguro llamarlo siempre.
+            if args.yes:
+                r = sh("docker compose up -d", cwd=build_dir(project), timeout=300)
+                if r.returncode == 0:
+                    print("  aplicado (docker compose up -d)")
+                else:
+                    print("  no se pudo aplicar; mirar: appctl %s logs" % project)
+                    return r.returncode
+            else:
+                print("  (si tocaste el .env, se aplica con --yes)")
             return 0
         print(f"el compose esta igual pero la IMAGEN cambio:\n"
               f"  en el compose: {img}\n"
@@ -1868,6 +1881,19 @@ def cmd_upgrade(args) -> int:
                 # esto es una vista previa y no escribe nada.
                 save_state(project, st)
                 print("  (el state quedo al dia)")
+            # El compose puede estar igual y el .env NO (DATA_DIRS,
+            # PY_API_PUBLICA, PY_API_URL...). `restart` no re-lee el entorno:
+            # el contenedor se queda con el viejo. `up -d` recrea solo si la
+            # config cambio, asi que es seguro llamarlo siempre.
+            if args.yes:
+                r = sh("docker compose up -d", cwd=build_dir(project), timeout=300)
+                if r.returncode == 0:
+                    print("  aplicado (docker compose up -d)")
+                else:
+                    print("  no se pudo aplicar; mirar: appctl %s logs" % project)
+                    return r.returncode
+            else:
+                print("  (si tocaste el .env, se aplica con --yes)")
             return 0
         print(f"el compose esta igual pero la IMAGEN cambio:\n"
               f"  en el compose: {img}\n"
@@ -1878,9 +1904,17 @@ def cmd_upgrade(args) -> int:
 
     print(f"compose actualizado  (respaldo: {backup.name})")
     if not args.yes:
-        print("\nse re-aplica con: appctl %s restart" % project)
-        print("revisalo con:      appctl %s info" % project)
+        print("\nse aplica con: appctl %s upgrade --yes" % project)
+        print("revisalo con:  appctl %s info" % project)
         return 0
+    # Aplicar de verdad: `restart` no re-lee el .env ni recrea con el compose
+    # nuevo; `up -d` si, y recrea solo lo que cambio.
+    r = sh("docker compose up -d", cwd=build_dir(project), timeout=600)
+    if r.returncode == 0:
+        print("  aplicado (docker compose up -d)")
+    else:
+        print("  no se pudo aplicar; revisar: appctl %s logs" % project)
+        return r.returncode
 
     try:
         _assert_compose_valid(pdir)
