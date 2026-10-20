@@ -97,6 +97,12 @@ for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp", "express-postg
         df = (d / "image/Dockerfile").read_text(encoding="utf-8")
         check("start-next.sh" in df, f"{st}: el Dockerfile copia start-next.sh")
 
+# --- 5b. re-build por fecha, no por server.js ------------------------------
+for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp"):
+    ep2 = (RAIZ / "stacks" / st / "image/entrypoint.sh").read_text(encoding="utf-8")
+    check("_debe_buildear" in ep2 and ".next/BUILD_ID" in ep2,
+          f"{st}: re-buildea si el codigo es mas nuevo que el build")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

@@ -309,8 +309,28 @@ if [ -f package.json ] && [ ! -d node_modules ]; then
     tail -3 /tmp/pnpm-install.log
 fi
 
-if [ -f package.json ] && [ -d node_modules ] && [ ! -f server.js ] && \
-   [ ! -f .next/standalone/server.js ]; then
+# Cuando buildear: si no hay build, o si el codigo es MAS NUEVO que el build.
+# Sin lo segundo, subir un cambio por SFTP + restart NO re-buildeaba; y con el
+# fallback sin standalone (que no emite server.js) cada arranque re-buildeaba
+# al pepe. .next/BUILD_ID es la marca de un build terminado, con o sin standalone.
+_debe_buildear=0
+if [ -f package.json ] && [ -d node_modules ]; then
+    if [ ! -f server.js ] && [ ! -f .next/standalone/server.js ]; then
+        _debe_buildear=1
+    fi
+    if [ -f .next/BUILD_ID ]; then
+        if [ -n "$(find . -newer .next/BUILD_ID \( -name '*.ts' -o -name '*.tsx' \
+                -o -name '*.js' -o -name '*.jsx' -o -name '*.mjs' \
+                -o -name 'next.config.*' -o -name 'package.json' \) \
+                -not -path './node_modules/*' -not -path './.next/*' -print -quit 2>/dev/null)" ]; then
+            _debe_buildear=1
+            log "codigo mas nuevo que el build: re-buildeando"
+        fi
+    else
+        _debe_buildear=1
+    fi
+fi
+if [ "$_debe_buildear" = 1 ]; then
     log "sin build: corriendo pnpm build (puede tardar)"
     if ! NEXT_TELEMETRY_DISABLED=1 pnpm build > /tmp/pnpm-build.log 2>&1; then
         tail -25 /tmp/pnpm-build.log
