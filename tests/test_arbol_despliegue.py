@@ -112,6 +112,16 @@ check("se re-aplica con: appctl %s restart" not in app,
 check("si tocaste el .env, se aplica con --yes" in app,
       "upgrade avisa como aplicar un cambio de .env")
 
+# --- 5d. el stub no tapa a la app real -------------------------------------
+for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp"):
+    d2 = RAIZ / "stacks" / st / "image"
+    ep3 = (d2 / "entrypoint.sh").read_text(encoding="utf-8")
+    check("era el stub, lo borro" in ep3,
+          f"{st}: el entrypoint borra el stub cuando llega la app")
+    sn2 = (d2 / "start-next.sh").read_text(encoding="utf-8")
+    check("ES_STUB" in sn2 and "stub de verificacion" in sn2,
+          f"{st}: start-next.sh no ejecuta el stub como si fuera la app")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

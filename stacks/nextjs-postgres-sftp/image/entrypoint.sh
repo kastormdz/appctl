@@ -195,6 +195,13 @@ find "${APP_SRC}" -type f -exec chmod 644 {} + 2>/dev/null || true
 if [ -f "${APP_SRC}/package.json" ] || [ -f "${APP_SRC}/server.js" ] || \
    [ -f "${APP_SRC}/.next/standalone/server.js" ]; then
     log "next: app del cliente detectada"
+    # El stub de un arranque anterior TAPA a la app recien subida: start-next.sh
+    # ejecuta `node server.js` y ese server.js era el stub. Se detecta por la
+    # marca de la primera linea y se borra: con app real, el stub no va mas.
+    if [ -f "${APP_SRC}/server.js" ] && head -n5 "${APP_SRC}/server.js" 2>/dev/null | grep -q "stub de verificacion"; then
+        log "next: era el stub, lo borro (ahora hay app propia)"
+        rm -f "${APP_SRC}/server.js"
+    fi
 else
     log "next: sin app propia, se escribe el stub de verificacion"
     cat > "${APP_SRC}/server.js" <<'STUB'
