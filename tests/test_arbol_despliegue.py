@@ -146,6 +146,13 @@ for st in ("php-postgres-sftp", "php-mysql-sftp", "nextjs-postgres-sftp",
 check("un upgrade que deja la app caida" in app or "se vuelve atras" in app,
       "upgrade revierte si la app no queda healthy")
 
+# --- 5h. la IP de la DB se toma de la red data, no concatenada -------------
+smoke = (RAIZ / "lib/smoke.py").read_text(encoding="utf-8")
+check('{{$k}}={{$v.IPAddress}}' in smoke, "smoke: parsea nombre=ip por red")
+check('endswith("_data")' in smoke, "smoke: elige la IP de la red *_data")
+check('{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' not in smoke,
+      "smoke: no concatena las IPs de todas las redes")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

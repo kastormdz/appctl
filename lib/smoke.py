@@ -814,11 +814,25 @@ def _container_ip(container: str) -> str:
     este proyecto alcanza por DNS": el nombre `db` dentro de otra red
     resuelve a otra base.
     """
+    # OJO: un contenedor puede estar en varias redes (data + egress desde que
+    # existe salida a internet). El template viejo concatenaba TODAS las IPs y
+    # armaba "172.21.0.3172.20.0.2": el probe apuntaba a una IP inexistente y
+    # el check decia "ni el propio proyecto alcanza su DB". Se elige la IP de
+    # la red `*_data`, que es la que corresponde al aislamiento.
     r = subprocess.run(
         ["docker", "inspect", container, "--format",
-         "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"],
+         "{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.IPAddress}} {{end}}"],
         capture_output=True, text=True, timeout=30)
-    return (r.stdout or "").strip()
+    pares = {}
+    for token in (r.stdout or "").split():
+        if "=" in token:
+            k, v = token.split("=", 1)
+            if v:
+                pares[k] = v
+    for red, ip in pares.items():
+        if red.endswith("_data"):
+            return ip
+    return next(iter(pares.values()), "")
 
 def app_serves(project_dir: str, app_port: int, project: str,
                 cfg: dict | None = None,
