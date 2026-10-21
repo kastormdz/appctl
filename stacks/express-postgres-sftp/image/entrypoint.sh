@@ -52,6 +52,22 @@ else
 fi
 rm -f /etc/nginx/conf.d/default.conf 2>/dev/null || true
 
+# --- temp dirs de nginx ---------------------------------------------------
+# nginx manda al disco el cuerpo de un POST que no entra en client_body_buffer
+# (8k por default). El paquete de Alpine deja /var/lib/nginx y tmp como
+# nginx:nginx 700 y el worker corre como `app`: cualquier POST de mas de ~8k
+# moria con 500 y en el log solo decia "open() ... Permission denied".
+# Medido: 5 KB -> 200, 20 KB -> 500. Se arregla aca, en cada arranque, porque
+# el chown del paquete vuelve en cada imagen nueva.
+mkdir -p /var/lib/nginx/tmp/client_body /var/lib/nginx/tmp/proxy \
+         /var/lib/nginx/tmp/fastcgi /var/lib/nginx/tmp/scgi /var/lib/nginx/tmp/uwsgi
+chown -R app:app /var/lib/nginx 2>/dev/null || true
+chmod 755 /var/lib/nginx 2>/dev/null || true
+chmod 700 /var/lib/nginx/tmp 2>/dev/null || true
+for _t in client_body proxy fastcgi scgi uwsgi; do
+    chmod 700 "/var/lib/nginx/tmp/$_t" 2>/dev/null || true
+done
+
 mkdir -p "${WEBROOT}" "${APP_SRC}" /app/backend /app/frontend-dist \
          /run/nginx /var/log/nginx /var/log/supervisor
 
