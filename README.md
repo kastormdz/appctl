@@ -109,7 +109,7 @@ $APPCTL_PROJECTS/<proyecto>/          # uno por cliente
 ├── db/init/                          # scripts de initdb
 ├── db/data/                          # volumen de la base
 ├── sftp/home/upload/                 # el código del cliente
-├── sftp/home/private/                # solo SFTP (privado: lo crea el entrypoint)
+├── sftp/home/private/                # dueño SFTP, grupo app: la app lee su config, la web no lo sirve
 ├── backups/                          # dumps (privado: lo crea el primer db dump)
 └── state.json
 ```
@@ -846,8 +846,8 @@ stacks PHP nginx tiene el root en `/upload`, así que no lo sirve; además hay u
 symlink `upload/link -> ../private`. En `nextjs-python` nginx es proxy puro (no
 hay root), y el `deny` queda igual como defensa en profundidad: el día que
 alguien agregue un server block con root, la barrera ya está puesta. Queda con
-dueño el usuario SFTP y modo 700: ni nginx ni php-fpm entran. Desde PHP se llega
-por filesystem con la ruta `/srv/sftp/private`, si los permisos lo permiten.
+dueño el usuario SFTP, grupo `app` y modo 750: el SFTP escribe y la app (php-fpm o
+node) lee desde `/srv/sftp/private` lo que guarda ahí (su `config.php`). nginx no lo sirve nunca.
 
 Por SFTP el cliente ve solo `/upload` y `/private`, nada más. El SFTP corre con `ForceCommand
 internal-sftp` dentro del propio sshd, así que el chroot no lleva binarios:
@@ -941,7 +941,7 @@ appctl/
     ├── test_root_pw.py        # parsea la línea del log de mariadb
     ├── test_security.py       # el compose no publica la DB
     ├── test_php_hardening.py  # cookies, headers y el .htaccess que no se lee
-    ├── test_private_sftp.py   # el dir privado: 700, deny y sin rm -rf
+    ├── test_private_sftp.py   # el dir privado: 750+grupo app, deny y sin rm -rf
     ├── test_sftp_chroot.py    # el chroot solo trae upload y private
     ├── test_nextjs_python.py  # el stack de dos runtimes: nginx, uvicorn, chroot
     ├── test_app_check_status.py     # el puerto publicado: state, info y el bind

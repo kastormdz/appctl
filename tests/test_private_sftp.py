@@ -3,7 +3,7 @@
 
 QUE VERIFICA: en los ARCHIVOS de los stacks PHP (entrypoint, nginx.conf)
 que (1) el arranque JAMAS borra upload/, (2) existe /private hermano de
-/upload con dueño SFTP y modo 700, (3) nginx no sirve /private ni sigue
+/upload con dueño SFTP y modo 750 + grupo app, (3) nginx no sirve /private ni sigue
 symlinks hacia el.
 
 QUE NO VERIFICA: el comportamiento en runtime (permisos efectivos,
@@ -73,8 +73,13 @@ def main() -> int:
                         r"\"?\$\{PRIVATEDIR\}\"", ep) is not None,
               f"{stack}: /private queda del usuario SFTP (numerico, no depende "
               f"del orden de creacion)")
-        check(re.search(r"chmod 700 \"\$\{PRIVATEDIR\}\"", ep) is not None,
-              f"{stack}: /private queda en 700 (ni nginx ni php-fpm entran)")
+        # 750 con grupo app: el SFTP escribe, PHP/Node lee su config.php
+        # (una app real lo hace) y la web no lo sirve porque nginx tiene
+        # root /upload + location ^~ /private/ + disable_symlinks.
+        check(re.search(r"chmod 750 \"\$\{PRIVATEDIR\}\"", ep) is not None,
+              f"{stack}: /private queda en 750")
+        check(re.search(r"chgrp app \"\$\{PRIVATEDIR\}\"", ep) is not None,
+              f"{stack}: /private es del grupo app (lo lee php-fpm/node)")
         check(re.search(r"rm\s+-rf.*PRIVATEDIR", ep) is None,
               f"{stack}: ningun rm -rf toca /private")
 
@@ -89,9 +94,11 @@ def main() -> int:
         check("disable_symlinks on;" in ng,
               f"{stack}: no sigue symlinks (frena upload/link -> ../private)")
 
-    # ---- 4. PHP llega por filesystem solo si los permisos dejan ----
-    # Sin open_basedir, PHP PUEDE abrir /srv/sftp/private por path; lo que
-    # lo frena es el 700 con dueño 1001 (php-fpm corre como app/1000).
+    # ---- 4. PHP puede leer /private (es donde vive su config) ----
+    # Con 750+grupo app, php-fpm SI abre /private por filesystem: es a
+    # proposito, una app real guarda config.php ahi. Lo que impide servirlo
+    # por HTTP son las barreras de nginx (root /upload, location ^~ /private/,
+    # disable_symlinks), que se verifican arriba.
     print("\n=== php.ini: sin jaula que oculte el problema ===")
     for stack in PHP_STACKS:
         ini = (ROOT / "stacks" / stack / "image" / "php.ini").read_text()
@@ -99,8 +106,8 @@ def main() -> int:
                    if l.strip() and not l.strip().startswith(";")
                    and "open_basedir" in l]
         check(not activos,
-              f"{stack}: sin open_basedir activo (el aislamiento es el modo "
-              f"700, auditable con stat)")
+              f"{stack}: sin open_basedir (el aislamiento de la web es nginx; "
+              f"php debe poder leer su propio config en /private)")
 
     # ---- 5. paridad entre stacks ----
     print("\n=== los dos stacks PHP, sin drift ===")

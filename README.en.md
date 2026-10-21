@@ -109,7 +109,7 @@ $APPCTL_PROJECTS/<project>/            # one per client
 ├── db/init/                          # initdb scripts
 ├── db/data/                          # database volume
 ├── sftp/home/upload/                 # the client's code
-├── sftp/home/private/                # SFTP only (private: created by the entrypoint)
+├── sftp/home/private/                # SFTP-owned, app group: the app reads its config, the web can't serve it
 ├── backups/                          # dumps (private: created by the first db dump)
 └── state.json
 ```
@@ -854,8 +854,8 @@ explicit `location` denies it and `disable_symlinks on` stops the
 `upload/link -> ../private` symlink trick. On `nextjs-python` nginx is a pure
 proxy (no root), and the `deny` stays anyway as defence in depth: the day someone
 adds a server block with a root, the barrier is already there. It belongs to the
-SFTP user, mode 700: neither nginx nor php-fpm gets in. From PHP it is reachable
-over the filesystem at `/srv/sftp/private`, if permissions allow.
+SFTP user, group `app`, mode 750: SFTP writes and the app (php-fpm or node) reads
+from `/srv/sftp/private` what it keeps there (its `config.php`). nginx never serves it.
 
 Over SFTP the client only sees `/upload` and `/private`, nothing else. SFTP runs with `ForceCommand
 internal-sftp` inside sshd itself, so the chroot carries no binaries: no
@@ -952,7 +952,7 @@ appctl/
     ├── test_root_pw.py        # parses the password line out of the mariadb log
     ├── test_security.py       # the compose doesn't publish the database
     ├── test_php_hardening.py  # cookies, headers, and the .htaccess nobody reads
-    ├── test_private_sftp.py   # the private dir: 700, deny, and no rm -rf
+    ├── test_private_sftp.py   # the private dir: 750+app group, deny, no rm -rf
     ├── test_sftp_chroot.py    # the chroot carries upload and private only
     ├── test_nextjs_python.py  # the two-runtime stack: nginx, uvicorn, chroot
     ├── test_app_check_status.py     # the published port: state, info and the bind
