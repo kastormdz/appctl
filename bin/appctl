@@ -1958,8 +1958,15 @@ def cmd_upgrade(args) -> int:
     if r.returncode == 0:
         print("  aplicado (docker compose up -d)")
         if not _wait_app_ready(pdir):
-            print("  la app no quedo healthy: revisar: appctl %s logs" % project)
-            return 1
+            # Un upgrade que deja la app caida NO se queda asi: se restaura el
+            # compose anterior y se vuelve a levantar. Medido: un cambio que
+            # daba 500 en produccion quedo aplicado y "solo avisaba".
+            print("  la app no quedo healthy: se vuelve atras")
+            restore_generated()
+            sh("docker compose up -d", cwd=pdir, timeout=900)
+            _wait_app_ready(pdir)
+            print("  archivos anteriores restaurados y stack levantado")
+            die("upgrade revertido: el proyecto quedo como estaba antes")
         print("  app healthy")
     else:
         print("  no se pudo aplicar; revisar: appctl %s logs" % project)

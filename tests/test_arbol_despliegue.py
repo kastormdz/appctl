@@ -136,6 +136,16 @@ for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp"):
     check("find \"${APP_SRC}/node_modules/.bin\"" in ep4,
           f"{st}: repara el +x de node_modules/.bin")
 
+# --- 5g. private legible por el proceso de la app --------------------------
+for st in ("php-postgres-sftp", "php-mysql-sftp", "nextjs-postgres-sftp",
+           "nextjs-python-postgres-sftp", "express-postgres-sftp",
+           "tomcat-postgres-sftp"):
+    ep5 = (RAIZ / "stacks" / st / "image/entrypoint.sh").read_text(encoding="utf-8")
+    check('chmod 750 "${PRIVATEDIR}"' in ep5 and 'chgrp app "${PRIVATEDIR}"' in ep5,
+          f"{st}: private 750 con grupo app (la app lee, la web no lo sirve)")
+check("un upgrade que deja la app caida" in app or "se vuelve atras" in app,
+      "upgrade revierte si la app no queda healthy")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

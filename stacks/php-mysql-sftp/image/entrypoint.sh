@@ -101,8 +101,9 @@ PRIVATEDIR="${SFTP_CHROOT}/private"
 mkdir -p "${PRIVATEDIR}"
 chown "${SFTP_UID}:${SFTP_GID}" "${PRIVATEDIR}" 2>/dev/null || true
 # 700 y dueño el usuario SFTP: ni nginx ni php-fpm (usuario app) entran.
-chmod 700 "${PRIVATEDIR}" 2>/dev/null || true
-log "private: uid=${SFTP_UID} 700 (solo SFTP, la web no lo ve)"
+chmod 750 "${PRIVATEDIR}" 2>/dev/null || true
+chgrp app "${PRIVATEDIR}" 2>/dev/null || true
+log "private: uid=${SFTP_UID} 750 grupo app (SFTP escribe, PHP/Node lee, la web no lo sirve)"
 
 # --- chroot minimalista: solo lo que el cliente debe ver -------------------
 # El SFTP corre con ForceCommand internal-sftp, EN el proceso de sshd: no

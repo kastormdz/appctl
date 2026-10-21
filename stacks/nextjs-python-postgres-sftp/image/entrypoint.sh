@@ -129,8 +129,9 @@ log "upload: uid=${SFTP_UID} 700 (escribible por el usuario SFTP)"
 PRIVATEDIR="${SFTP_CHROOT}/private"
 mkdir -p "${PRIVATEDIR}"
 chown "${SFTP_UID}:${SFTP_GID}" "${PRIVATEDIR}" 2>/dev/null || true
-chmod 700 "${PRIVATEDIR}" 2>/dev/null || true
-log "private: uid=${SFTP_UID} 700 (solo SFTP, la web no lo ve)"
+chmod 750 "${PRIVATEDIR}" 2>/dev/null || true
+chgrp app "${PRIVATEDIR}" 2>/dev/null || true
+log "private: uid=${SFTP_UID} 750 grupo app (SFTP escribe, PHP/Node lee, la web no lo sirve)"
 
 # nginx corre como `app` (los workers) y el codigo de /app es de app.
 for _u in nginx www-data; do
