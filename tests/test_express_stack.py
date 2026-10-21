@@ -157,7 +157,9 @@ def main() -> int:
     print("\n=== 7. el compose ===")
     cp = leer(f"stacks/{NOMBRE}/compose.tmpl.yaml")
     check("__APP_IMAGE__" in cp, "usa el placeholder de la imagen")
-    check("start_period: 120s" in cp,
+    # 600s: el build de React/Next puede tardar minutos y docker marcaba
+    # unhealthy a los 95s (medido en sigam-tst, revertia upgrades correctos).
+    check("start_period: 600s" in cp,
           "start_period largo: el arranque puede instalar y buildear")
     check("image: __APP_IMAGE__" in cp and "container_name: __PROYECTO___app" in cp,
           "los placeholders del resto de los stacks")

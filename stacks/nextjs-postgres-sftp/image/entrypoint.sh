@@ -221,13 +221,21 @@ fi
 # Solo si el cliente no subio una app de Next. Antes dependia de que el
 # webroot estuviera VACIO: un webroot con otros archivos dejaba a Next sin
 # server.js y el contenedor quedaba unhealthy sin decir por que.
-if [ -f "${APP_SRC}/package.json" ] || [ -f "${APP_SRC}/server.js" ] || \
-   [ -f "${APP_SRC}/.next/standalone/server.js" ]; then
+# ¿el server.js que hay es el stub de verificacion? Se mira ANTES de decidir,
+# porque el stub no es una app: si solo hay stub, hay que volver a escribirlo
+# (un proyecto sin frontend vive de el). Medido: confundirlos dejaba el
+# contenedor en 502 para siempre porque se borraba el unico server.js.
+_es_stub=0
+if [ -f "${APP_SRC}/server.js" ] && head -n5 "${APP_SRC}/server.js" 2>/dev/null | grep -q "stub de verificacion"; then
+    _es_stub=1
+fi
+# App real = package.json, build standalone, o un server.js que NO es el stub.
+if [ -f "${APP_SRC}/package.json" ] || [ -f "${APP_SRC}/.next/standalone/server.js" ] \
+   || { [ -f "${APP_SRC}/server.js" ] && [ "$_es_stub" = 0 ]; }; then
     log "next: app del cliente detectada"
     # El stub de un arranque anterior TAPA a la app recien subida: start-next.sh
-    # ejecuta `node server.js` y ese server.js era el stub. Se detecta por la
-    # marca de la primera linea y se borra: con app real, el stub no va mas.
-    if [ -f "${APP_SRC}/server.js" ] && head -n5 "${APP_SRC}/server.js" 2>/dev/null | grep -q "stub de verificacion"; then
+    # ejecuta `node server.js`. Con app real, el stub ya no va.
+    if [ "$_es_stub" = 1 ]; then
         log "next: era el stub, lo borro (ahora hay app propia)"
         rm -f "${APP_SRC}/server.js"
     fi

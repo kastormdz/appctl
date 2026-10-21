@@ -160,6 +160,14 @@ for st in ("nextjs-postgres-sftp", "nextjs-python-postgres-sftp", "express-postg
 check('estado in ("exited", "dead", "restarting")' in app,
       "la espera solo abandona si el contenedor esta muerto o reiniciando")
 
+# --- 5j. el stub no se confunde con una app -------------------------------
+for st in ("nextjs-python-postgres-sftp", "nextjs-postgres-sftp"):
+    ep6 = (RAIZ / "stacks" / st / "image/entrypoint.sh").read_text(encoding="utf-8")
+    check("_es_stub=0" in ep6 and "App real = package.json" in ep6,
+          f"{st}: distingue stub de app real antes de borrar")
+    check('if [ "$_es_stub" = 1 ]; then' in ep6,
+          f"{st}: solo borra el server.js si es el stub Y hay app real")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

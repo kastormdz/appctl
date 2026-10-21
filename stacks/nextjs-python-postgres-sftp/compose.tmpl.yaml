@@ -161,7 +161,7 @@ __CRON__
       interval: 15s
       timeout: 5s
       retries: 5
-      start_period: 45s
+      start_period: 600s
     security_opt:
       - no-new-privileges:true
     # root por defecto: el entrypoint necesita crear el chroot con
@@ -229,13 +229,12 @@ __DB_PUBLISH__
       resources:
         limits:
           cpus: "${DB_CPUS:-0.75}"
-          memory: ${DB_MEMORY:-512M}
-    healthcheck:
+          memory: ${DB_MEMORY:-512M}    healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_ADMIN_USER} -d ${DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 600s
+      start_period: 30s
 __S3__
 networks:
   # con salida a internet: la app llama a una pasarela de pagos, a un SMTP,
