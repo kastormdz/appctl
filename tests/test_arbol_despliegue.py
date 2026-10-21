@@ -153,6 +153,13 @@ check('endswith("_data")' in smoke, "smoke: elige la IP de la red *_data")
 check('{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' not in smoke,
       "smoke: no concatena las IPs de todas las redes")
 
+# --- 5i. start_period largo en los stacks Node + espera paciente ----------
+for st in ("nextjs-postgres-sftp", "nextjs-python-postgres-sftp", "express-postgres-sftp"):
+    comp2 = (RAIZ / "stacks" / st / "compose.tmpl.yaml").read_text(encoding="utf-8")
+    check("start_period: 600s" in comp2, f"{st}: start_period 600s (buildea Next)")
+check('estado in ("exited", "dead", "restarting")' in app,
+      "la espera solo abandona si el contenedor esta muerto o reiniciando")
+
 # --- 6. los READMEs lo documentan -----------------------------------------
 for readme in ("README.md", "README.en.md"):
     t = (RAIZ / readme).read_text(encoding="utf-8")

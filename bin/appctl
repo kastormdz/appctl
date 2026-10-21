@@ -1390,13 +1390,13 @@ def _wait_app_ready(pdir: Path | str, timeout: int = 1200) -> bool:
         estado = (r.stdout or "").strip()
         if estado == "healthy":
             return True
-        if estado in ("unhealthy", "exited", "dead"):
-            unhealthy_seguidos += 1
-            # ~90s unhealthy de verdad: se corta
-            if unhealthy_seguidos >= 18:
-                return False
-        else:
-            unhealthy_seguidos = 0
+        # "unhealthy" NO corta la espera: es lo normal mientras nginx esta
+        # arriba y Next todavia no escucha (502 en /healthz) o mientras el
+        # entrypoint buildea. Medido: 200s en 502 y despues healthy; cortar
+        # ahi revertia un upgrade correcto. Solo se abandona si el contenedor
+        # esta muerto o reiniciandose en loop.
+        if estado in ("exited", "dead", "restarting"):
+            return False
         time.sleep(5)
     return False
 
