@@ -91,8 +91,18 @@ mkdir -p "${SFTP_CHROOT}/upload"
 # inexistente falla -> con `set -e` el entrypoint muere -> restart loop.
 # Con numeros no depende del orden.
 chown "${SFTP_UID}:${SFTP_GID}" "${SFTP_CHROOT}/upload" 2>/dev/null || true
-chmod 700 "${SFTP_CHROOT}/upload" 2>/dev/null || true
-log "upload: uid=1001 700 (escribible por el usuario SFTP)"
+# 755 y no 700: el dueño sigue siendo el usuario SFTP (escribe igual), pero
+# php-fpm y nginx corren como `app` y con 700 no podian ni atravesar el
+# directorio: la app devolvia 500 con "require_once: Permission denied" en
+# cuanto el cliente subia un archivo o una carpeta con permisos restrictivos.
+chmod 755 "${SFTP_CHROOT}/upload" 2>/dev/null || true
+chgrp app "${SFTP_CHROOT}/upload" 2>/dev/null || true
+# Normalizar lo que ya subio el cliente: se AGREGA lectura y traversal (a+rX,
+# la X solo para directorios y archivos ya ejecutables); no se quita nada. Sin
+# esto, una carpeta en 700 subida por SFTP rompe la app hasta que alguien
+# entra a mano.
+find "${WEBROOT}" -exec chmod a+rX {} + 2>/dev/null || true
+log "upload: uid=${SFTP_UID} 755 (SFTP escribe, php/nginx leen)"
 
 # --- directorio privado: SFTP si, web no ----------------------------------
 # Hermano de /upload dentro del chroot: el cliente lo ve por SFTP como

@@ -87,8 +87,14 @@ mkdir -p "${SFTP_CHROOT}/upload"
 # padres root:root. Cambiar el owner del chroot a un usuario hace que sshd
 # rechace la sesion y el contenedor entre en restart loop.
 chown "${SFTP_USER}:app" "${SFTP_CHROOT}/upload" 2>/dev/null || true
-chmod 700 "${SFTP_CHROOT}/upload" 2>/dev/null || true
-log "upload: ${SFTP_USER}:app 700 (solo el usuario SFTP escribe)"
+# 755 y no 700: el dueño sigue siendo el usuario SFTP (escribe igual), pero
+# php-fpm y nginx corren como `app` y con 700 no podian ni atravesar el
+# directorio: 500 con "require_once: Permission denied" en cuanto el cliente
+# subia un archivo o carpeta con permisos restrictivos (visualizadorminero).
+chmod 755 "${SFTP_CHROOT}/upload" 2>/dev/null || true
+chgrp app "${SFTP_CHROOT}/upload" 2>/dev/null || true
+find "${WEBROOT}" -exec chmod a+rX {} + 2>/dev/null || true
+log "upload: ${SFTP_USER}:app 755 (SFTP escribe, php/nginx leen)"
 
 # --- directorio privado: SFTP si, web no ----------------------------------
 # Hermano de /upload dentro del chroot: el cliente lo ve por SFTP como

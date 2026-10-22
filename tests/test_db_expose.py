@@ -90,6 +90,14 @@ for st in STACKS:
                             bind="0.0.0.0")
     check("garage" in out_s3, f"{st}: con s3 en el estado, el servicio garage sobrevive")
 
+print("\n=== webroot legible por la app (PHP)")
+for st in ("php-postgres-sftp", "php-mysql-sftp"):
+    ep = (RAIZ / "stacks" / st / "image/entrypoint.sh").read_text(encoding="utf-8")
+    check('chmod 755 "${SFTP_CHROOT}/upload"' in ep,
+          f"{st}: el upload queda 755 (php/nginx corren como app)")
+    check('find "${WEBROOT}" -exec chmod a+rX' in ep,
+          f"{st}: normaliza lo subido por SFTP a+rX")
+
 print("\n=== puerto automatico")
 check("nargs=\"?\", default=None" in (RAIZ / "bin/appctl").read_text(encoding="utf-8"),
       "el puerto es opcional en el parser")
