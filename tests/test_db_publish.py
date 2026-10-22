@@ -152,7 +152,10 @@ def main() -> int:
             # Las lineas de referencia usan placeholders (<puerto>, [--bind IP]):
             # lo que se verifica son los FLAGS, asi que se los reemplaza por
             # valores reales en vez de saltear la linea.
-            cmd = (cmd.replace("<puerto>", "15432").replace("<port>", "15432")
+            # `[puerto]` es el puerto OPCIONAL (sin el, el CLI elige uno libre):
+            # se quita para probar esa forma, que es la que documenta el README.
+            cmd = (cmd.replace("[puerto]", "").replace("[<puerto>]", "")
+                      .replace("<puerto>", "15432").replace("<port>", "15432")
                       .replace("[--bind IP]", "--bind 0.0.0.0"))
             argv = [a.replace("<p>", "dummy").replace("<proyecto>", "dummy")
                     .replace("<project>", "dummy") for a in cmd.split()]
