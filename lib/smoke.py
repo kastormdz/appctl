@@ -608,7 +608,30 @@ def db_roles_exist(project_dir: str, cfg: dict) -> Check:
                                     shlex.quote(su[1])),
                                  timeout=30, stdin=sql + "\n")
     texto = (out or "").strip()
-    if rc != 0:
+    if rc != 0 and db_kind == "mysql":
+        # root con password aleatoria (MARIADB_RANDOM_ROOT_PASSWORD) o sin
+        # acceso: se verifica cada rol LOGUEANDOSE con su propia password.
+        # Prueba mas fuerte que leer mysql.user: el rol existe y su clave anda.
+        pares = [(env.get("DB_USER"), env.get("DB_PASSWORD")),
+                 (env.get("DB_MIGRATION_USER"), env.get("DB_MIGRATION_PASSWORD")),
+                 (env.get("DB_READONLY_USER"), env.get("DB_READONLY_PASSWORD"))]
+        pares = [(u, p) for u, p in pares if u and p]
+        if pares:
+            malos = []
+            for usuario, clave in pares:
+                rc2, out2 = _compose_input(
+                    project_dir, "db", "sh", "-c",
+                    "MYSQL_PWD=%s mariadb --protocol=socket -u%s -N -B -e "
+                    "'select 1'" % (shlex.quote(clave), shlex.quote(usuario)),
+                    timeout=30)
+                if rc2 != 0:
+                    malos.append(f"{usuario}: {(out2 or '').strip()[:80]}")
+            if not malos:
+                return Check("los tres roles existen", True,
+                             f"los {len(pares)} roles entran con su password "
+                             f"(root no es accesible desde el .env)")
+            return Check("los tres roles existen", False,
+                         "roles que no entran: " + "; ".join(malos))
         return Check("los tres roles existen", False,
                      f"no se pudo consultar: {texto[:120]}")
     digitos = [l.strip() for l in texto.splitlines() if l.strip().isdigit()]
