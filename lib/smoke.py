@@ -681,6 +681,22 @@ def db_not_reachable_from_host(project_dir: str, port: int = 5432,
                      "primero tiene que conectar desde la red interna; "
                      "si eso falla el problema es otro (password/host)")
 
+    # 1b. si el operador la PUBLICO a proposito (`db expose`), el invariante
+    # que protege este check ("nadie la expuso sin querer") ya se cumplio: la
+    # base esta en un puerto del host A PROPOSITO y anotado. Sin esto el check
+    # daba PASS probando el puerto INTERNO (3306/5432), que esta cerrado
+    # mientras la base escucha en 3307 — un verde que no probaba nada.
+    try:
+        _st = json.loads((Path(str(project_dir)) / "state.json")
+                         .read_text(encoding="utf-8"))
+    except Exception:
+        _st = {}
+    _pub = _st.get("db_published_port")
+    if _pub:
+        return Check("DB inalcanzable desde el host", True,
+                     f"publicada A PROPOSITO en {_st.get('db_published_bind')}:"
+                     f"{_pub} (anotado en state; `db unexpose` la cierra)")
+
     # 2. y desde el host NO tiene que conectar
     # el flag va antes del nombre de la imagen. Despues llega al comando
     # pg_isready, que responde "unknown flag" y hace que este check de
