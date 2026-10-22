@@ -604,6 +604,8 @@ están en `.gitignore`. Un dump tiene datos de clientes.
 appctl <p> db expose 5432                     # publica en 0.0.0.0 (cualquier red que llegue)
 appctl <p> db expose 5432 --bind 127.0.0.1    # solo este host (para un tunel ssh)
 appctl <p> db expose 5432 --bind 10.20.0.5    # desde una IP concreta del host
+appctl <p> db expose                            # elige el primer puerto libre (3306/5432 +)
+                                                # y dice cual: no hace falta saber que hay ocupado
 appctl <p> db unexpose                        # cerrarla
 ```
 
@@ -689,7 +691,7 @@ appctl <proyecto> db dump [-o ruta]           # exporta la base en gzip
 appctl <proyecto> db restore <archivo> --yes # importa; PISA la base
 appctl <proyecto> db list                    # backups que hay
 appctl <proyecto> db rm <archivo> -y         # borra un backup
-appctl <proyecto> db expose <puerto> [--bind IP]  # publica (default 0.0.0.0)
+appctl <proyecto> db expose [puerto] [--bind IP]   # publica (default 0.0.0.0); sin puerto, elige uno libre
 appctl <proyecto> db unexpose                # cierra
 appctl <proyecto> db grant <usuario>         # alta de usuario externo
 appctl <proyecto> db revoke <usuario> --yes  # le saca el acceso

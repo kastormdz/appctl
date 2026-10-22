@@ -2630,6 +2630,12 @@ def cmd_db_expose(args) -> int:
     """
     d, stack = _db_paths(args)
     port = args.puerto
+    if port is None:
+        # Sin puerto: el primero libre desde el puerto nativo del motor.
+        desde = 3306 if "mysql" in stack else 5432
+        port = _puerto_libre(desde)
+        print(f"  puerto automatico: {port} (el {desde} y los siguientes "
+              f"hasta {port} estaban usados)")
     if not (1024 <= port <= 65535):
         die(f"puerto {port} fuera de rango (1024-65535)")
     bind = _validar_bind(getattr(args, "bind", "0.0.0.0"))
@@ -2824,6 +2830,58 @@ def _publish_desde_compose(texto: str) -> tuple[str, int] | None:
     return None
 
 
+def _puerto_escuchando(port: int) -> bool:
+    """True si algo ya escucha en ese puerto de este host (cualquier bind)."""
+    import socket
+    for host in ("127.0.0.1", "::1"):
+        fam = socket.AF_INET6 if ":" in host else socket.AF_INET
+        s = socket.socket(fam, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            if s.connect_ex((host, port)) == 0:
+                return True
+        finally:
+            s.close()
+    return False
+
+
+def _puertos_en_uso() -> set[int]:
+    """Puertos que ya usa appctl (cualquier proyecto) o docker en el host."""
+    import json as _json
+    import re as _re
+    usados: set[int] = set()
+    try:
+        for st_file in Path(PROJECTS_DIR).glob("*/state.json"):
+            try:
+                st = _json.loads(st_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for k in ("db_published_port", "app_port", "sftp_port"):
+                v = st.get(k)
+                if isinstance(v, int):
+                    usados.add(v)
+    except Exception:
+        pass
+    r = sh("docker ps --format '{{.Ports}}'", timeout=30)
+    for m in _re.finditer(r":(\d+)->", r.stdout or ""):
+        usados.add(int(m.group(1)))
+    return usados
+
+
+def _puerto_libre(desde: int, limite: int = 200) -> int:
+    """El primer puerto libre desde `desde`, sin pisar nada del host.
+
+    Medido: el operador no tiene por que saber que puerto esta usado; con
+    esto `db expose` sin argumento elige solo y lo informa.
+    """
+    usados = _puertos_en_uso()
+    for p in range(desde, min(desde + limite, 65536)):
+        if p in usados or _puerto_escuchando(p):
+            continue
+        return p
+    die(f"no encontre un puerto libre entre {desde} y {desde + limite}")
+
+
 def _set_publish(texto: str, port: int | None, stack: str = "php-postgres-sftp",
                  state: dict | None = None, bind: str = "0.0.0.0") -> str:
     """Poner o sacar el bloque ports: del servicio db.
@@ -2848,8 +2906,24 @@ def _set_publish(texto: str, port: int | None, stack: str = "php-postgres-sftp",
     tmpl = (STACKS_DIR / stack / "compose.tmpl.yaml").read_text(encoding="utf-8")
     subs = _subs_from_existing(texto, state)
     subs["__DB_PUBLISH__"] = _render_publish(port, stack, bind)
+    # Los marcadores de S3 tambien se resuelven aca. El re-render del expose
+    # no los conocia y los dejaba crudos: en un stack mysql la linea 26
+    # quedaba como `__S3_APP_ENV__` y el YAML moria con "could not find
+    # expected ':'". Medido en visualizadorminero (22/10).
+    s3 = (state or {}).get("s3") or {}
+    subs["__S3__"] = _render_s3(bool(s3), subs.get("__PROYECTO__", ""),
+                                DEFAULT_TAGS.get("garage", "v2.4.1"),
+                                s3.get("publish"), "0.0.0.0")
+    subs["__S3_APP_ENV__"] = _render_s3_app_env(bool(s3))
     for k, v in subs.items():
         tmpl = tmpl.replace(k, v)
+    # Guard: si quedo un marcador, el error tiene que decir CUAL, no un
+    # "yaml: line 26" que manda a buscar el problema al lugar equivocado.
+    import re as _re
+    _resto = sorted(set(_re.findall(r"__[A-Z0-9_]+__", tmpl)))
+    if _resto:
+        die("el compose generado quedo con marcadores sin sustituir: "
+            + ", ".join(_resto))
     # El db tiene que estar tambien en egress: su unica red (data) es
     # internal:true, sin gateway, y docker NO publica un puerto de ahi
     # (lo deja en null sin decir por que). data sigue internal, asi que
@@ -3465,7 +3539,9 @@ def main() -> int:
         "El puerto y el bind quedan ANOTADOS en state.json: `info` los muestra y\n"
         "un `upgrade` no los pierde. Antes de darlo por hecho se prueba que el\n"
         "puerto responda de verdad; si no responde, se revierte todo."))
-    q.add_argument("puerto", type=int)
+    q.add_argument("puerto", type=int, nargs="?", default=None,
+                   help="puerto del host; si se omite, se elige el primero "
+                        "libre desde 3306 (mysql) o 5432 (postgres)")
     # Por defecto SOLO desde este host. Aca va una IP, no una red: medido,
     # docker rechaza un CIDR en ports: ('-p 10.20.0.0/16' -> exit 125). El
     # alcance por red se habilita donde corresponde: `db grant --cidr`.

@@ -611,6 +611,8 @@ are in `.gitignore`. A dump contains client data.
 ```bash
 appctl <p> db expose 5432                     # publishes on 0.0.0.0 (any network that reaches it)
 appctl <p> db expose 5432 --bind 127.0.0.1    # this host only (for an ssh tunnel)
+appctl <p> db expose                            # picks the first free port (3306/5432 +)
+                                                # and prints it: no need to know what's taken
 appctl <p> db expose 5432 --bind 10.20.0.5    # from a specific host IP
 appctl <p> db unexpose                        # close it
 ```
