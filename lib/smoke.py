@@ -320,7 +320,14 @@ def _db_probe_cmd(db_kind: str, host: str = "db", port: str = "",
     """
     p_ = port or ("3306" if db_kind == "mysql" else "5432")
     if db_kind == "mysql":
-        return ["sh", "-c", f"mariadb-admin ping -h {host} -P {p_}"]
+        # `Access denied` = el servidor CONTESTÓ (red abierta), que es lo que
+        # se prueba aca; pero mariadb-admin sale con error en ese caso y el
+        # check lo leia como "no llego" (visualizadorminero, root con password
+        # aleatoria: el pre-check fallaba y el upgrade se revertia solo).
+        # alive o Access denied -> 0; no conecta -> != 0.
+        return ["sh", "-c",
+                f"mariadb-admin ping -h {host} -P {p_} 2>&1 | "
+                f"grep -qE 'alive|Access denied'"]
     user, db = _pg_user_and_db(project)
     cmd = f"pg_isready -h {host} -p {p_} -U {user}"
     if db:
