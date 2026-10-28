@@ -3336,12 +3336,25 @@ def _versiones_ofertadas() -> dict[str, str]:
         "tomcat": DEFAULT_TAGS.get("tomcat", ""),
         "garage": DEFAULT_TAGS.get("garage", ""),
     }
-    r = sh("docker images --format '{{.Repository}}:{{.Tag}}'", timeout=5)
-    vs = sorted({m.group(1) for m in
-                 _re.finditer(r"appctl/php-\w+:(\d+\.\d+\.\d+)-fpm-alpine",
-                              r.stdout or "")})
+    # Primero los composes de los proyectos (lectura de archivos: ~5 ms) y
+    # solo si no hay ninguno se consulta docker (~400 ms). El `-h` se usa
+    # todo el tiempo y no puede costar medio segundo.
+    import re as _re2
+    vs = set()
+    try:
+        for comp in Path(PROJECTS_DIR).glob("*/compose.yaml"):
+            m = _re2.search(r"appctl/php-\w+:(\d+\.\d+\.\d+)-fpm-alpine",
+                            comp.read_text(encoding="utf-8", errors="ignore"))
+            if m:
+                vs.add(m.group(1))
+    except Exception:
+        pass
+    if not vs:
+        r = sh("docker images --format '{{.Repository}}:{{.Tag}}'", timeout=5)
+        vs = {m.group(1) for m in _re.finditer(r"appctl/php-\w+:(\d+\.\d+\.\d+)-fpm-alpine",
+                                               r.stdout or "")}
     if vs:
-        v["php"] = vs[-1] + "-fpm-alpine"
+        v["php"] = sorted(vs)[-1] + "-fpm-alpine"
     return v
 
 
