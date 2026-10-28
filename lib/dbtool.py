@@ -643,16 +643,27 @@ def hba_aplicar(project_dir: str | Path, stack: str,
     if len(salida) < 2 or salida[1].strip() in ("", "0"):
         raise DbError("pg_hba quedo sin la regla 'reject' final")
 
-    # 4. recargar
-    rr = subprocess.run(
-        ["docker", "exec", *_pw_flag(project_dir, stack),
-         f"{project_dir.name}_db", "sh", "-c",
-         "psql -U $(printenv POSTGRES_USER) -d $(printenv POSTGRES_DB) "
-         "-tAc 'SELECT pg_reload_conf()'"],
-        capture_output=True, text=True, timeout=60)
-    if "t" not in (rr.stdout or ""):
-        raise DbError("pg_reload_conf() no confirmo:\n"
-                      + _as_text(rr.stderr)[:300])
+    # 4. recargar. Con reintentos: si la base todavia esta inicializando el
+    # socket no existe y un fallo duro dejaba el archivo escrito pero sin
+    # recargar (el proximo reinicio lo tomaba, pero el mensaje era un error).
+    import time as _time
+    ultimo = ""
+    for intento in range(30):
+        rr = subprocess.run(
+            ["docker", "exec", *_pw_flag(project_dir, stack),
+             f"{project_dir.name}_db", "sh", "-c",
+             "psql -U $(printenv POSTGRES_USER) -d $(printenv POSTGRES_DB) "
+             "-tAc 'SELECT pg_reload_conf()'"],
+            capture_output=True, text=True, timeout=60)
+        if "t" in (rr.stdout or ""):
+            break
+        ultimo = _as_text(rr.stderr)[:200]
+        _time.sleep(2)
+    else:
+        raise DbError("el pg_hba quedo escrito pero pg_reload_conf() no "
+                      "confirmo en 60 s:\n  " + ultimo + "\n"
+                      "  el archivo se aplica solo en el proximo reinicio de "
+                      "la base: appctl <p> restart")
 
     detalle = ", ".join(f"{a['user']}@{a['cidr']}" for a in allows) or "(nadie externo)"
     return (f"pg_hba: allow-list activa ({len(allows)} origen/es: {detalle})\n"

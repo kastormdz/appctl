@@ -500,19 +500,6 @@ def cmd_create(args) -> int:
             # `appctl <p> s3 init`.
             print(f"  reintentar: appctl {project} s3 init")
 
-    # ---- pg_hba: allow-list desde el minuto cero ---------------------------
-    # El pg_hba que escribe el init permite 172.16.0.0/12 (cualquier contenedor
-    # del host) y 192.168.0.0/16 (toda la LAN). Este bloque lo reemplaza por:
-    # este host + la red del PROPIO proyecto + lo que se agregue con
-    # `db grant <usuario> <origen>` + reject. Los proyectos existentes siguen
-    # con el archivo viejo hasta que se les corra un grant.
-    if "mysql" not in components:
-        try:
-            _dbt = _load_dbtool()
-            print("  " + _dbt.hba_aplicar(pdir, stack, []).replace("\n", "\n  "))
-        except Exception as _e:
-            print(f"  pg_hba: no se pudo aplicar la allow-list: {_e}")
-
     # ---- smoke ------------------------------------------------------------
     print("[2/3] verificando...")
     is_mysql = "mysql" in components
@@ -550,6 +537,22 @@ def cmd_create(args) -> int:
         print(f"  shell: appctl {project} shell")
         print(f"  el proyecto quedo creado. appctl {project} destroy lo reverse.\n")
         return 2
+
+    # ---- pg_hba: allow-list ------------------------------------------------
+    # VA DESPUES del smoke a proposito: el sed sobre pg_hba competia con los
+    # scripts de init de postgres (que corren con su propio pg_hba y el server
+    # en el socket) y los tres roles quedaban sin crear. Con la base ya
+    # inicializada, el bloque se escribe y se recarga sin carrera.
+    # Reemplaza el pg_hba permisivo del init (172.16.0.0/12 + 192.168.0.0/16)
+    # por: este host + la red del PROPIO proyecto + lo que se agregue con
+    # `db grant <usuario> <origen>` + reject.
+    if "mysql" not in components:
+        try:
+            _dbt = _load_dbtool()
+            print("  " + _dbt.hba_aplicar(pdir, stack, []).replace("\n", "\n  "))
+        except Exception as _e:
+            print(f"  pg_hba: OJO, la allow-list no se aplico: {_e}")
+            print(f"         el proyecto quedo con el pg_hba permisivo del init")
 
     # ---- summary ----------------------------------------------------------
     print(render_create(project, stack, args.host, app_port, sftp_port,
