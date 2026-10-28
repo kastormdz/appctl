@@ -535,6 +535,131 @@ def revoke(project_dir: str | Path, stack: str, *, user: str) -> str:
     return f"postgres: DROP OWNED BY + DROP ROLE {user}" + _err(r)
 
 
+# --- allow-list de origen (pg_hba gestionado) ------------------------------
+
+HBA_BEGIN = "# >>> appctl: allow-list (gestionado: no editar a mano)"
+HBA_END = "# <<< appctl: allow-list"
+
+
+def normalize_origen(cidr: str, stack: str) -> str:
+    """El origen tal como lo escribe el usuario -> forma canonica del motor."""
+    return _normalize_cidr(cidr, db_kind(stack))
+
+
+def _proyecto_subnet(project_dir: Path) -> str:
+    """La subred de la red `data` del proyecto (ahi vive el contenedor app)."""
+    r = subprocess.run(
+        ["docker", "network", "inspect", f"appctl-{project_dir.name}_data",
+         "-f", "{{range .IPAM.Config}}{{.Subnet}}{{end}}"],
+        capture_output=True, text=True, timeout=30)
+    return (r.stdout or "").strip()
+
+
+def hba_gestionado(project_dir: str | Path, stack: str) -> bool:
+    """True si el pg_hba ya tiene el bloque de appctl."""
+    if db_kind(stack) != "postgres":
+        return False
+    project_dir = Path(project_dir)
+    hba = _pg_hba_file(project_dir)
+    r = subprocess.run(
+        ["docker", "exec", f"{project_dir.name}_db", "sh", "-c",
+         f"grep -q '^{HBA_BEGIN}' {hba} 2>/dev/null"],
+        capture_output=True, text=True, timeout=30)
+    return r.returncode == 0
+
+
+def hba_bloque(db: str, subnet: str, allows: list[dict]) -> str:
+    """El texto del bloque gestionado. Puro: se puede testear sin docker."""
+    lineas = [
+        HBA_BEGIN,
+        "# Permite: este host y la red del propio proyecto. Lo externo entra",
+        "# SOLO por las lineas de abajo (appctl <p> db grant <user> <origen>).",
+        "local   all   all                          scram-sha-256",
+        "host    all   all   127.0.0.1/32           scram-sha-256",
+        "host    all   all   ::1/128                scram-sha-256",
+    ]
+    if subnet:
+        lineas.append(
+            f"host    all   all   {subnet:<22} scram-sha-256   # red del proyecto")
+    for a in allows:
+        usuario = str(a.get("user", "")).strip()
+        origen = str(a.get("cidr", "")).strip()
+        if not usuario or not origen:
+            continue
+        _validate_ident(usuario)
+        lineas.append(
+            f"host    {db:<10} {usuario:<14} {origen:<22} scram-sha-256")
+    lineas += [
+        "# todo lo que no este listado arriba: afuera",
+        "host    all   all   all                    reject",
+        HBA_END,
+    ]
+    return "\n".join(lineas) + "\n"
+
+
+def hba_aplicar(project_dir: str | Path, stack: str,
+                allows: list[dict]) -> str:
+    """Reescribe el bloque gestionado de pg_hba con la allow-list.
+
+    `allows` son dicts {user, cidr} ya normalizados. El bloque va PRIMERO y
+    termina en `reject`: en pg_hba gana la primera regla que coincide, asi que
+    una linea agregada al final no restringe nada (era el bug: con
+    `host all all 172.16.0.0/12` arriba, el CIDR del grant nunca se evaluaba).
+    """
+    project_dir = Path(project_dir)
+    if db_kind(stack) != "postgres":
+        return ("mysql: no usa pg_hba; el origen va en la identidad del "
+                "usuario ('user'@'origen').")
+    hba = _pg_hba_file(project_dir)
+    db = _db_name(project_dir, stack)
+    subnet = _proyecto_subnet(project_dir)
+
+    bloque = hba_bloque(db, subnet, allows)
+
+    # 1. sacar el bloque anterior (idempotente) y 2. escribir el nuevo ARRIBA
+    r = subprocess.run(
+        ["docker", "exec", f"{project_dir.name}_db", "sh", "-c",
+         f"test -f {hba} && sed -i '/^{HBA_BEGIN}/,/^{HBA_END}/d' {hba}"],
+        capture_output=True, text=True, timeout=60)
+    if r.returncode != 0:
+        raise DbError(f"no se pudo limpiar el bloque anterior de {hba}:\n"
+                      f"{_as_text(r.stderr)[:300]}")
+    w = subprocess.run(
+        ["docker", "exec", "-i", f"{project_dir.name}_db", "sh", "-c",
+         f"cat - {hba} > {hba}.appctl && mv {hba}.appctl {hba}"],
+        input=bloque, capture_output=True, text=True, timeout=60)
+    if w.returncode != 0:
+        raise DbError(f"no se pudo escribir {hba}:\n{_as_text(w.stderr)[:300]}")
+
+    # 3. verificar que quedo ARRIBA y con el reject
+    v = subprocess.run(
+        ["docker", "exec", f"{project_dir.name}_db", "sh", "-c",
+         f"head -1 {hba}; grep -c 'reject' {hba}"],
+        capture_output=True, text=True, timeout=30)
+    salida = (v.stdout or "").strip().splitlines()
+    if not salida or salida[0].strip() != HBA_BEGIN:
+        raise DbError("el bloque de appctl no quedo al principio de pg_hba.conf "
+                      "(sin eso no restringe nada)")
+    if len(salida) < 2 or salida[1].strip() in ("", "0"):
+        raise DbError("pg_hba quedo sin la regla 'reject' final")
+
+    # 4. recargar
+    rr = subprocess.run(
+        ["docker", "exec", *_pw_flag(project_dir, stack),
+         f"{project_dir.name}_db", "sh", "-c",
+         "psql -U $(printenv POSTGRES_USER) -d $(printenv POSTGRES_DB) "
+         "-tAc 'SELECT pg_reload_conf()'"],
+        capture_output=True, text=True, timeout=60)
+    if "t" not in (rr.stdout or ""):
+        raise DbError("pg_reload_conf() no confirmo:\n"
+                      + _as_text(rr.stderr)[:300])
+
+    detalle = ", ".join(f"{a['user']}@{a['cidr']}" for a in allows) or "(nadie externo)"
+    return (f"pg_hba: allow-list activa ({len(allows)} origen/es: {detalle})\n"
+            f"  red del proyecto: {subnet or '(no se pudo leer)'}\n"
+            f"  todo lo demas: reject")
+
+
 # --- validacion ------------------------------------------------------------
 
 def _normalize_cidr(cidr: str, kind: str) -> str:

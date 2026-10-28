@@ -150,6 +150,22 @@ appctl <p> set-host <nombre-del-servidor>
 
 ---
 
+
+Un proyecto arranca con la base **cerrada**: el `pg_hba.conf` permite sólo
+este host y la red del propio proyecto, y termina en `reject`. Para que entre
+un cliente se le da un origen concreto (una IP o una red):
+
+```
+appctl acme db grant cliente 192.168.33.66        # una IP
+appctl acme db grant reportes 192.168.0.0/24      # una red
+appctl acme db revoke cliente
+```
+
+La lista queda en `state.json` (`db_access`) y se re-escribe sola en
+`pg_hba.conf`; sin esa línea, el `GRANT` no alcanza: `pg_hba` es lo que decide
+de **dónde** se puede entrar. En MariaDB el origen va en la identidad del
+usuario (`'cliente'@'192.168.33.66'`).
+
 ## Los stacks
 
 Cada stack es un directorio bajo `stacks/`, con su `compose.tmpl.yaml` y una

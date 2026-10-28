@@ -500,6 +500,19 @@ def cmd_create(args) -> int:
             # `appctl <p> s3 init`.
             print(f"  reintentar: appctl {project} s3 init")
 
+    # ---- pg_hba: allow-list desde el minuto cero ---------------------------
+    # El pg_hba que escribe el init permite 172.16.0.0/12 (cualquier contenedor
+    # del host) y 192.168.0.0/16 (toda la LAN). Este bloque lo reemplaza por:
+    # este host + la red del PROPIO proyecto + lo que se agregue con
+    # `db grant <usuario> <origen>` + reject. Los proyectos existentes siguen
+    # con el archivo viejo hasta que se les corra un grant.
+    if "mysql" not in components:
+        try:
+            _dbt = _load_dbtool()
+            print("  " + _dbt.hba_aplicar(pdir, stack, []).replace("\n", "\n  "))
+        except Exception as _e:
+            print(f"  pg_hba: no se pudo aplicar la allow-list: {_e}")
+
     # ---- smoke ------------------------------------------------------------
     print("[2/3] verificando...")
     is_mysql = "mysql" in components
@@ -1003,6 +1016,8 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
         "project": project, "stack": stack, "host": host,
         "app_port": app_port, "sftp_port": sftp_port,
         "components": sorted(components), "tags": tags,
+        # allow-list de origen (pg_hba). Vacia = solo el proyecto y el host.
+        "db_access": [],
         "db": {"kind": "postgres" if "psql" in components else
                      ("mysql" if "mysql" in components else None),
                "name": names["DB_NAME"],
@@ -2159,7 +2174,10 @@ def cmd_set_host(args) -> int:
     f = build_dir(args.proyecto) / "state.json"
     f.write_text(json.dumps(st, indent=2) + "\n")
     print(f"  host de {args.proyecto}: {st.get('host', '?')} -> {nuevo}")
-    print(f"  el resumen ahora dice:  http://{nuevo}:{st['app_port']}")
+    if st.get("app_port"):
+        print(f"  el resumen ahora dice:  http://{nuevo}:{st['app_port']}")
+    else:
+        print(f"  el resumen ahora dice:  {nuevo} (proyecto solo-base: sin app)")
     return 0
 
 
@@ -2462,7 +2480,10 @@ def cmd_destroy(args) -> int:
 
     print(f"proyecto: {project}")
     print(f"  dir:    {pdir}")
-    print(f"  app:    {st.get('host', '?')}:{st.get('app_port', '?')}")
+    if st.get("app_port"):
+        print(f"  app:    {st.get('host', '?')}:{st['app_port']}")
+    else:
+        print("  app:    (no hay: proyecto solo-base)")
     if st.get("sftp_port"):
         print(f"  sftp:   {st.get('host')}:{st['sftp_port']}")
     if args.keep_data:
@@ -3189,6 +3210,11 @@ def cmd_db_grant(args) -> int:
     """Dar acceso a un usuario externo, con su password y su origen."""
     d, stack = _db_paths(args)
     db = _load_dbtool()
+    origen = args.origen or args.cidr or "127.0.0.1"
+    try:
+        origen = db.normalize_origen(origen, stack)
+    except db.DbError as e:
+        die(str(e))
     pw = args.password
     if not pw:
         if not sys.stdin.isatty():
@@ -3201,15 +3227,29 @@ def cmd_db_grant(args) -> int:
                 die("no se pudo leer la password")
     try:
         print("  " + db.grant(d, stack, user=args.usuario, password=pw,
-                              cidr=args.cidr, role=args.rol,
+                              cidr=origen, role=args.rol,
                               schema=args.schema, migrate=args.rol == "migrate")
               .replace("\n", "\n  "))
     except db.DbError as e:
         die(str(e))
 
+    # Persistir la allow-list en el state y APLICARLA: en postgres el pg_hba
+    # es lo que decide de donde se entra, y una linea al final del archivo no
+    # restringe nada (el bloque viejo permitia 172.16/12 y 192.168/16 antes).
+    st = load_state(args.proyecto)
+    acc = [a for a in (st.get("db_access") or [])
+           if a.get("user") != args.usuario]
+    acc.append({"user": args.usuario, "cidr": origen, "role": args.rol})
+    st["db_access"] = acc
+    save_state(args.proyecto, st)
+    try:
+        print("  " + db.hba_aplicar(d, stack, acc).replace("\n", "\n  "))
+    except db.DbError as e:
+        die(str(e))
+
     print(f"\n  IMPORTANTE: este usuario solo entra si la db esta publicada.\n"
-          f"    appctl {args.proyecto} db expose <puerto>\n"
-          f"  y solo desde {args.cidr} (o el % que le diste).")
+          f"    appctl {args.proyecto} db expose\n"
+          f"  y solo desde {origen}.")
     return 0
 
 
@@ -3223,6 +3263,15 @@ def cmd_db_revoke(args) -> int:
         print("  " + db.revoke(d, stack, user=args.usuario))
     except db.DbError as e:
         die(str(e))
+    st = load_state(args.proyecto)
+    acc = [a for a in (st.get("db_access") or [])
+           if a.get("user") != args.usuario]
+    st["db_access"] = acc
+    save_state(args.proyecto, st)
+    try:
+        print("  " + db.hba_aplicar(d, stack, acc).replace("\n", "\n  "))
+    except db.DbError:
+        pass
     return 0
 
 
@@ -3551,6 +3600,8 @@ def main() -> int:
               appctl acme list
               appctl acme rotate sftp
               appctl acme db expose 5432 --bind 127.0.0.1
+              appctl acme db grant cliente 192.168.33.66
+              appctl acme db grant reportes 192.168.0.0/24 --rol readonly
               appctl acme destroy
             """))
     ap.add_argument("--version", action="version", version="appctl 0.1.0")
@@ -3767,13 +3818,16 @@ def main() -> int:
 
     q = dsub.add_parser("grant", help="dar acceso a un usuario externo")
     q.add_argument("usuario")
+    # El origen es POSICIONAL (`db grant usuario 192.168.33.66`) porque es lo
+    # natural: se acepta una IP sola (equivale a /32) o una red.
+    q.add_argument("origen", nargs="?", default=None,
+                   help="de donde entra: 192.168.33.66 o 192.168.0.0/24")
     # El default NO es una red: es 127.0.0.1, o sea "solo desde este host".
     # Con 10.0.0.0/8 cualquier red privada que llegue al puerto entra, y el
     # que llama al comando no tiene por que saber que la base quedo abierta
     # a medio LAN. Quien quiera la red interna la pide explicita.
-    q.add_argument("--cidr", default="127.0.0.1",
-                   help="de donde se permite entrar (default 127.0.0.1: "
-                        "solo este host. Para una red, --cidr 10.20.0.0/16)")
+    q.add_argument("--cidr", default=None,
+                   help="igual que el origen posicional (formato viejo)")
     q.add_argument("--rol", default="readonly",
                    choices=["readonly", "write", "migrate"], help="readonly default")
     q.add_argument("--schema", default="public")
