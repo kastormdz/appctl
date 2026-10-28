@@ -3318,24 +3318,60 @@ def cmd_doctor(args) -> int:
 
 # ------------------------------------------------------------------ main ----
 
+def _versiones_ofertadas() -> dict[str, str]:
+    """Que version ofrece hoy cada componente, para el `-h` sin parametros.
+
+    Las bases salian sin version ("psql PostgreSQL", "mysql MariaDB") y no se
+    sabia que se estaba ofreciendo. El tag por defecto dice la version mayor;
+    para PHP, que se construye con un tag flotante (8.5-fpm-alpine), la version
+    PATCH real (8.5.12) solo la sabe la imagen ya construida: se lee de ahi y
+    si no hay ninguna se muestra el tag.
+    """
+    import re as _re
+    v = {
+        "php": DEFAULT_TAGS.get("php", ""),
+        "psql": DEFAULT_TAGS.get("psql", ""),
+        "mysql": DEFAULT_TAGS.get("mysql", ""),
+        "nextjs": DEFAULT_TAGS.get("nextjs", ""),
+        "tomcat": DEFAULT_TAGS.get("tomcat", ""),
+        "garage": DEFAULT_TAGS.get("garage", ""),
+    }
+    r = sh("docker images --format '{{.Repository}}:{{.Tag}}'", timeout=5)
+    vs = sorted({m.group(1) for m in
+                 _re.finditer(r"appctl/php-\w+:(\d+\.\d+\.\d+)-fpm-alpine",
+                              r.stdout or "")})
+    if vs:
+        v["php"] = vs[-1] + "-fpm-alpine"
+    return v
+
+
+def _v_mayor(tag: str) -> str:
+    """'18-alpine' -> '18', '11.8' -> '11.8', '22-alpine' -> '22'."""
+    return (tag or "?").split("-")[0]
+
+
 def main() -> int:
+    _vv = _versiones_ofertadas()
+    _v = {'php': _vv['php'].replace('-fpm-alpine', ''),
+          'node': _v_mayor(_vv['nextjs']),
+          'tomcat': _v_mayor(_vv['tomcat']), 'psql': _v_mayor(_vv['psql']),
+          'mysql': _v_mayor(_vv['mysql']), 'garage': _vv['garage']}
     ap = argparse.ArgumentParser(
         prog="appctl", description="provisionador de stacks por cliente",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""\
+        epilog=textwrap.dedent(f"""\
             componentes:
-              php      PHP-FPM + nginx + sshd (5 servicios juntos)
-              nextjs   Node 22 + Next.js
-              express  Node 22 + Express + React (nginx sirve el build
+              php      PHP-FPM {_v['php']} + nginx + sshd (5 servicios juntos)
+              nextjs   Node {_v['node']} + Next.js
+              express  Node {_v['node']} + Express + React (nginx sirve el build
                        de React y proxya /api al backend)
-              tomcat   Tomcat 11 + nginx (4 servicios: nginx aparte)
+              tomcat   Tomcat {_v['tomcat']} + nginx (4 servicios: nginx aparte)
               python   API FastAPI + uvicorn al lado de Next (complemento)
-              psql     PostgreSQL
-              mysql    MariaDB / MySQL
+              psql     PostgreSQL {_v['psql']}
+              mysql    MariaDB {_v['mysql']}
               sftp     SFTP con chroot
               cron     crontab con supervisor
-              s3       Garage: un S3 por proyecto (cualquier stack)
-
+              s3       Garage {_v['garage']}: un S3 por proyecto (cualquier stack)
             ejemplos:
               appctl acme php psql sftp
               appctl acme php psql sftp --app-port 3001

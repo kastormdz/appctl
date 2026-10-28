@@ -329,6 +329,10 @@ makes more sense.
 | `python` | FastAPI + uvicorn API next to Next, **internal** (the BFF consumes it; `PY_API_PUBLICA=1` publishes it) (modifier: `nextjs` only) |
 | `tomcat` | Tomcat 11 + JDK 25, the external proxy talks straight to it |
 | `psql` / `mysql` | PostgreSQL 18 / MariaDB 11.8, private network |
+
+**Exact versions:** plain `appctl -h` prints the version of every
+component on offer. PHP's is read from the built image
+(`appctl/php-pg:8.5.12-...`), so it reflects the real patch, not a fixed string.
 | `sftp` | sshd with chroot, dedicated port, volume shared with the app |
 | `cron` | the client's crontab, run inside the app container |
 | `s3` | Garage: an S3-compatible store **per project**, for any stack |
