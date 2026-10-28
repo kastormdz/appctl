@@ -177,6 +177,18 @@ def stack_name(components: set[str]) -> str:
     """
     runtime = next((r for r in ("php", "nextjs", "express", "tomcat")
                     if r in components), None)
+    if runtime is None:
+        # Sin runtime no hay donde correr la app: la base sola no es un stack.
+        # Antes esto explotaba con un TypeError ('sequence item 0: expected
+        # str instance, NoneType found') y no decia nada util.
+        solo = ", ".join(sorted(components)) or "nada"
+        die("un proyecto necesita un runtime de aplicacion: php, nextjs, "
+            "express o tomcat.\n"
+            "  pediste: %s\n"
+            "  psql y mysql solos todavia no son un stack: la base necesita "
+            "una app al lado.\n"
+            "  si lo que queres es SOLO una base, decilo y lo agregamos "
+            "(stack nuevo, sin app)." % solo)
     # `python` va pegado al runtime (nextjs-python-postgres-sftp): el nombre
     # tiene que decir que imagen se construye, y la de este stack trae node
     # Y python. No se duplica cada directorio de stack: 5 stacks cubren
