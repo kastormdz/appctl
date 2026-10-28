@@ -3772,6 +3772,18 @@ def main() -> int:
         if len(a) >= 2 and a[1] in VERBS:
             # appctl <proj> <verb> ...  ->  <verb> <proj> ...
             proj, verb, rest = a[0], a[1], a[2:]
+            # Si el proyecto no existe, el verbo moria con "no puedo leer
+            # /data/proyectos/<x>/.env" (o un chown de root): no dice que el
+            # proyecto no esta. Y en el caso de `psql`, el usuario casi seguro
+            # queria CREAR algo con una base: se le dice que falta el runtime.
+            if not (Path(PROJECTS_DIR) / proj).is_dir():
+                pista = ("\n  ojo: `%s %s` se lee como el comando %r. una base\n"
+                         "  sola no es un stack: hace falta un runtime (php, nextjs,\n"
+                         "  express o tomcat) al lado de psql/mysql." % (proj, verb, verb)
+                         if verb == "psql" else "")
+                die(f"no existe el proyecto {proj!r}.\n"
+                    f"  para crearlo:  appctl {proj} php psql sftp\n"
+                    f"  para ver los que hay:  appctl list{pista}")
             sys.argv = [sys.argv[0], verb, proj, *rest]
         elif len(a) >= 2 and a[1] in SIN_PROYECTO:
             # `appctl acme doctor` cae al default (create) y el error decia

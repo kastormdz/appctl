@@ -57,6 +57,22 @@ for comps, esperado in ((["php", "psql"], "php-postgres"),
     else:
         print(f"  ok   - {comps} -> {esperado}")
 
+# y por la puerta real: `appctl <proyecto-que-no-existe> psql`
+r = subprocess.run([sys.executable, str(RAIZ / "bin" / "appctl"),
+                    "un-proyecto-que-no-existe-xyz", "psql"],
+                   capture_output=True, text=True,
+                   env=dict(__import__("os").environ, PYTHONPATH=str(RAIZ / "lib")),
+                   timeout=120)
+out = r.stdout + r.stderr
+if "Traceback" in out:
+    fallos.append("appctl <proj> psql: traceback")
+    print("  FAIL - appctl <proj> psql: traceback")
+elif "no existe el proyecto" in out and "no es un stack" in out:
+    print("  ok   - appctl <proj> psql: dice que el proyecto no existe y que falta el runtime")
+else:
+    fallos.append("appctl <proj> psql: mensaje confuso")
+    print("  FAIL - appctl <proj> psql: " + out.strip().splitlines()[-1][:90])
+
 print()
 print(f"test_db_only_error: {'OK' if not fallos else str(len(fallos)) + ' FALLAS'}")
 sys.exit(1 if fallos else 0)
