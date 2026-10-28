@@ -3355,7 +3355,72 @@ def _versiones_ofertadas() -> dict[str, str]:
                                                r.stdout or "")}
     if vs:
         v["php"] = sorted(vs)[-1] + "-fpm-alpine"
+
+    # Las bases: el tag es flotante (18-alpine -> 18.6 hoy). Se resuelve la
+    # version REAL una vez y se cachea 12h: asi el -h la muestra exacta sin
+    # pagar docker en cada corrida.
+    import json as _json
+    import time as _time
+    cache = _cache_versiones()
+    datos = {}
+    try:
+        datos = _json.loads(cache.read_text(encoding="utf-8"))
+        if (_time.time() - float(datos.get("ts", 0))) > 12 * 3600:
+            datos = {}
+    except Exception:
+        datos = {}
+    for k in ("psql", "mysql"):
+        if not datos.get(k):
+            real = _version_db_real(k)
+            if real:
+                datos[k] = real
+        # si no se pudo resolver, la mayor del tag (18, 11.8): nunca el tag crudo
+        v[k] = datos.get(k) or _v_mayor(DEFAULT_TAGS.get(k, ""))
+    if datos.get("psql") or datos.get("mysql"):
+        try:
+            datos["ts"] = _time.time()
+            cache.write_text(_json.dumps(datos), encoding="utf-8")
+        except Exception:
+            pass
     return v
+
+
+def _cache_versiones() -> Path:
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    d = Path(base) / "appctl"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d / "versiones.json"
+
+
+def _version_db_real(kind: str) -> str | None:
+    """La version patch del motor (18.6, 11.8.9) mirando una imagen/cont.
+
+    Primero un contenedor VIVO de esa imagen (docker exec, ~40 ms), despues la
+    imagen local con --pull=never (nunca baja nada por un -h). Si no hay, None.
+    """
+    import re as _re
+    if kind == "psql":
+        img, argv, pat = ("postgres:18-alpine", ["postgres", "--version"],
+                          r"PostgreSQL\) (\d+\.\d+(?:\.\d+)?)")
+    else:
+        img, argv, pat = ("mariadb:11.8", ["mariadb", "--version"],
+                          r"mariadb from (\d+\.\d+\.\d+)")
+    linea = ""
+    r = sh("docker ps --format '{{.Image}}|{{.Names}}'", timeout=5)
+    for l in (r.stdout or "").splitlines():
+        if l.startswith(img + "|"):
+            c = l.split("|", 1)[1].strip()
+            r2 = sh("docker exec %s %s" % (sh_quote(c), " ".join(argv)), timeout=10)
+            linea = (r2.stdout or "") + (r2.stderr or "")
+            break
+    # Sin contenedor vivo NO se levanta uno para preguntar la version: medido,
+    # costaba ~5 s en una maquina sin la imagen y el -h no puede pagar eso. En
+    # ese caso se muestra la version mayor del tag.
+    m = _re.search(pat, linea)
+    return m.group(1) if m else None
 
 
 def _v_mayor(tag: str) -> str:
@@ -3367,8 +3432,8 @@ def main() -> int:
     _vv = _versiones_ofertadas()
     _v = {'php': _vv['php'].replace('-fpm-alpine', ''),
           'node': _v_mayor(_vv['nextjs']),
-          'tomcat': _v_mayor(_vv['tomcat']), 'psql': _v_mayor(_vv['psql']),
-          'mysql': _v_mayor(_vv['mysql']), 'garage': _vv['garage']}
+          'tomcat': _v_mayor(_vv['tomcat']), 'psql': _vv['psql'] or '?',
+          'mysql': _vv['mysql'] or '?', 'garage': _vv['garage']}
     ap = argparse.ArgumentParser(
         prog="appctl", description="provisionador de stacks por cliente",
         formatter_class=argparse.RawDescriptionHelpFormatter,
