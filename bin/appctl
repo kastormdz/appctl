@@ -1747,6 +1747,14 @@ def _stack_for_runtime(runtime: str, db_kind: str) -> str | None:
     return cand if (STACKS_DIR / cand).is_dir() else None
 
 
+def _app_image_of(stack: str, tags: dict) -> str:
+    """Imagen de app del stack; '' en un solo-base (no hay app que correr)."""
+    if is_db_only(stack):
+        return ""
+    return image_tag(stack, tags.get(runtime_of(stack),
+                                     DEFAULT_TAGS[runtime_of(stack)]))
+
+
 def cmd_upgrade(args) -> int:
     """Re-renderiza el compose con la version actual de los stacks.
 
@@ -1881,9 +1889,10 @@ def cmd_upgrade(args) -> int:
         # esta al dia": la imagen pudo cambiar (hash distinto) sin que el
         # compose cambie, y el cliente quedaria con la version vieja sin
         # enterarse. Por eso se verifica igual.
-        img = image_tag(stack, tags.get(runtime_of(stack),
-                                       DEFAULT_TAGS[runtime_of(stack)]))
-        if _image_exists(img):
+        img = _app_image_of(stack, tags)
+        if not img:
+            print("el compose ya estaba al dia (proyecto solo-base: sin app)")
+        if not img or _image_exists(img):
             print(f"el compose ya estaba al dia y la imagen esta "
                   f"({img.split(':')[-1]})")
             if _anotado and args.yes:
@@ -1979,9 +1988,10 @@ def cmd_upgrade(args) -> int:
         # esta al dia": la imagen pudo cambiar (hash distinto) sin que el
         # compose cambie, y el cliente quedaria con la version vieja sin
         # enterarse. Por eso se verifica igual.
-        img = image_tag(stack, tags.get(runtime_of(stack),
-                                       DEFAULT_TAGS[runtime_of(stack)]))
-        if _image_exists(img):
+        img = _app_image_of(stack, tags)
+        if not img:
+            print("el compose ya estaba al dia (proyecto solo-base: sin app)")
+        if not img or _image_exists(img):
             print(f"el compose ya estaba al dia y la imagen esta "
                   f"({img.split(':')[-1]})")
             if _anotado and args.yes:

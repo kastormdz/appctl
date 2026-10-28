@@ -134,6 +134,16 @@ cli_txt = (RAIZ / "bin" / "appctl").read_text(encoding="utf-8")
 check("_puerto_libre(desde + 1)" in cli_txt,
       "el puerto automatico arranca en el siguiente del nativo (no en 5432/3306)")
 
+# ---- 7. upgrade no puede pedir la imagen del runtime (KeyError 'postgres')
+print("\n=== upgrade")
+txt = (RAIZ / "bin" / "appctl").read_text(encoding="utf-8")
+i_up = txt.index("def cmd_upgrade")
+i_next = txt.index("\ndef ", i_up + 10)
+cuerpo = txt[i_up:i_next]
+check("DEFAULT_TAGS[runtime_of(" not in cuerpo,
+      "cmd_upgrade no pide la imagen del runtime (crash en solo-base)")
+check("_app_image_of" in cuerpo, "cmd_upgrade usa _app_image_of (tolera sin app)")
+
 print()
 print(f"test_db_only_stack: {'OK' if not fallos else str(len(fallos)) + ' FALLAS'}")
 sys.exit(1 if fallos else 0)
