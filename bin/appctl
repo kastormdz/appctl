@@ -178,17 +178,27 @@ def stack_name(components: set[str]) -> str:
     runtime = next((r for r in ("php", "nextjs", "express", "tomcat")
                     if r in components), None)
     if runtime is None:
-        # Sin runtime no hay donde correr la app: la base sola no es un stack.
-        # Antes esto explotaba con un TypeError ('sequence item 0: expected
-        # str instance, NoneType found') y no decia nada util.
+        # Sin runtime hay dos caminos: proyecto SOLO-BASE (la base es el
+        # proyecto entero) o un error. Antes esto explotaba con un TypeError
+        # ('sequence item 0: expected str instance, NoneType found').
+        if "psql" in components and "mysql" in components:
+            die("elegi un motor: psql o mysql, no los dos")
+        if "psql" in components or "mysql" in components:
+            motor = "psql" if "psql" in components else "mysql"
+            sobran = sorted(c for c in components
+                            if c in ("sftp", "cron", "s3", "python"))
+            if sobran:
+                die("una base sola no tiene %s: no hay app que lo use.\n"
+                    "  base sola:   appctl create <proyecto> %s\n"
+                    "  con app:     appctl create <proyecto> php %s sftp"
+                    % (", ".join(sobran), motor, motor))
+            return "postgres-only" if motor == "psql" else "mysql-only"
         solo = ", ".join(sorted(components)) or "nada"
-        die("un proyecto necesita un runtime de aplicacion: php, nextjs, "
-            "express o tomcat.\n"
+        die("un proyecto necesita un runtime de aplicacion (php, nextjs, "
+            "express o tomcat) o una base sola.\n"
             "  pediste: %s\n"
-            "  psql y mysql solos todavia no son un stack: la base necesita "
-            "una app al lado.\n"
-            "  si lo que queres es SOLO una base, decilo y lo agregamos "
-            "(stack nuevo, sin app)." % solo)
+            "  base sola:  appctl <proyecto> psql   |   appctl <proyecto> mysql"
+            % solo)
     # `python` va pegado al runtime (nextjs-python-postgres-sftp): el nombre
     # tiene que decir que imagen se construye, y la de este stack trae node
     # Y python. No se duplica cada directorio de stack: 5 stacks cubren
@@ -203,13 +213,26 @@ def stack_name(components: set[str]) -> str:
     return "-".join(parts)
 
 
+def is_db_only(stack: str) -> bool:
+    """Un stack solo-base (postgres-only / mysql-only): no hay app."""
+    return (stack or "").endswith("-only")
+
+
 def validate_components(components: set[str]) -> None:
     unknown = components - ALL_COMPONENTS
     if unknown:
         die(f"componentes desconocidos: {', '.join(sorted(unknown))}\n"
             f"  validos: {', '.join(sorted(ALL_COMPONENTS))}")
     if not (components & RUNTIMES):
-        die(f"falta el runtime: elige uno de {', '.join(sorted(RUNTIMES))}")
+        if components & DATABASES and not (components & {"sftp", "cron", "s3", "python"}):
+            # base sola (proyecto DB-only) y nada mas: es valido.
+            return
+        # db + algo que necesita app (python, cron, sftp): NO se acepta aca;
+        # sigue de largo para que hable el chequeo especifico de abajo
+        # ("python es el complemento de nextjs", "cron necesita sftp") o, al
+        # final, stack_name ("una base sola no tiene sftp").
+        die(f"falta el runtime: elige uno de {', '.join(sorted(RUNTIMES))}\n"
+            f"  o una base sola:  appctl create <proyecto> psql|mysql")
     if not (components & SERVICES):
         die("falta al menos un servicio: psql, mysql o sftp")
     if len(components & DATABASES) > 1:
@@ -321,7 +344,11 @@ def cmd_create(args) -> int:
     # ---- puertos, bajo lock ------------------------------------------------
     reg = portsmod.Registry(str(APPCTL_HOME / "registry.json"))
     with reg.locked() as data:
-        if args.app_port:
+        if is_db_only(stack):
+            # no hay app: no se reserva puerto de app (state.json lo guarda
+            # como null y el registry no lo anota).
+            app_port = None
+        elif args.app_port:
             app_port = args.app_port
         else:
             app_port = portsmod.find_free(
@@ -331,7 +358,7 @@ def cmd_create(args) -> int:
             sftp_port = args.sftp_port or portsmod.find_free(
                 *SFTP_PORT_RANGE, data["ports"], "sftp")
         try:
-            reg.check_free(data, project, app_port, sftp_port or 0)
+            reg.check_free(data, project, app_port or 0, sftp_port or 0)
         except portsmod.PortError as e:
             die(str(e))
 
@@ -397,12 +424,15 @@ def cmd_create(args) -> int:
 
         # ---- reservar en el registry -------------------------------------
         if not args.dry_run:
-            reg.reserve(data, project, app_port, sftp_port or 0)
+            reg.reserve(data, project, app_port or 0, sftp_port or 0)
 
     if args.dry_run:
         print(f"\n[dry-run] {project}: se crearia en {pdir}")
         print(f"  stack: {stack}")
-        print(f"  app:   {args.host}:{app_port}")
+        if app_port:
+            print(f"  app:   {args.host}:{app_port}")
+        else:
+            print("  app:   (no hay: proyecto solo-base)")
         if sftp_port:
             print(f"  sftp:  sftp://{names['SFTP_USER']}@{args.host}:{sftp_port}")
         print("  no se escribio nada: ni el directorio, ni el .env, "
@@ -416,8 +446,9 @@ def cmd_create(args) -> int:
     # dice que corras `appctl build`, con el tag exacto. Compilar acá
     # seria lo que hace cada deploy lento.
     # el tag sale del STACK (que ya sabe el motor), no del runtime suelto
-    img = image_tag(stack, tags.get(runtime_of(stack), DEFAULT_TAGS[runtime_of(stack)]))
-    if not _image_exists(img):
+    img = "" if is_db_only(stack) else image_tag(
+        stack, tags.get(runtime_of(stack), DEFAULT_TAGS[runtime_of(stack)]))
+    if img and not _image_exists(img):
         die(f"falta la imagen {img}\n"
             f"  construila una vez:  appctl build\n"
             f"  (no se compila en cada create: es el mismo build para todos "
@@ -427,7 +458,7 @@ def cmd_create(args) -> int:
     # distinto (':8.5' vs ':8.5-fpm-alpine') hace que el up falle con
     # 'No such image' despues de crear las redes y los directorios.
     compose_txt = (pdir / "compose.yaml").read_text()
-    if img not in compose_txt:
+    if img and img not in compose_txt:
         die(f"el compose pide una imagen distinta de la que existe\n"
             f"  existe:  {img}\n"
             f"  compose: busca otra cosa (revisar el template del stack)")
@@ -761,8 +792,12 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
             f"    sudo chown -R $(id -un):$(id -gn) {pdir}")
     # build/ es donde Next buildea (node_modules, .next). El codigo del
     # cliente vive en sftp/home/upload; /app se arma solo en el arranque.
-    for sub in ("db/data", "db/init", "sftp/home/upload", "nginx",
-                "cron", "logs", "build"):
+    # Un proyecto solo-base no tiene SFTP, nginx, cron ni build: crear esos
+    # directorios vacios hacia pensar que habia una app. Solo db/.
+    _subs = (["db/data", "db/init"] if is_db_only(stack) else
+             ["db/data", "db/init", "sftp/home/upload", "nginx",
+              "cron", "logs", "build"])
+    for sub in _subs:
         (pdir / sub).mkdir(parents=True, exist_ok=True)
     if want_s3:
         # Los datos del S3 viven en el proyecto, como los de la DB: asi
@@ -834,8 +869,11 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
     "__S3__": _render_s3(want_s3, project, tags.get("garage", "v2.4.1"),
                          s3_publish, s3_publish_bind),
     "__S3_APP_ENV__": _render_s3_app_env(want_s3),
-    "__APP_IMAGE__": image_tag(stack, tags.get(runtime_of(stack),
-                                                 DEFAULT_TAGS[runtime_of(stack)])),
+    # un stack solo-base no tiene imagen de app: el template no pide
+        # __APP_IMAGE__ y runtime_of() devolveria None (KeyError).
+    "__APP_IMAGE__": ("" if is_db_only(stack) else
+                          image_tag(stack, tags.get(runtime_of(stack),
+                                                    DEFAULT_TAGS[runtime_of(stack)]))),
 
     # "__CRON__" se reemplaza por el bloque de crontab (o por nada). Es una
     # bandera, no un stack: `cron` no cambia la imagen ni la DB, solo hace
@@ -924,8 +962,9 @@ def render_project(pdir: Path, stack_dir: Path, stack: str, project: str,
     (pdir / ".env").write_text("\n".join(env_lines) + "\n")
     (pdir / ".env").chmod(0o600)
 
-    # nginx vhost
-    (pdir / "nginx" / "site.conf").write_text(
+    # nginx vhost (solo si hay app: un proyecto solo-base no tiene nginx)
+    if not is_db_only(stack):
+      (pdir / "nginx" / "site.conf").write_text(
         (stack_dir / "nginx" / "site.conf").read_text()
         if (stack_dir / "nginx" / "site.conf").exists()
         else "# server block: lo genera el entrypoint si no existe\n"
@@ -1378,6 +1417,24 @@ def _wait_db_ready(pdir: Path | str, timeout: int = 180) -> bool:
     return False
 
 
+def _wait_db_only_ready(pdir: Path | str, timeout: int = 180) -> bool:
+    """Espera el contenedor db de un proyecto solo-base (no hay app)."""
+    import time
+    proj = Path(pdir).name
+    cname = f"{proj}_db"
+    fin = time.time() + timeout
+    while time.time() < fin:
+        r = sh("docker inspect -f '{{.State.Health.Status}}' %s"
+               % sh_quote(cname), timeout=30)
+        estado = (r.stdout or "").strip()
+        if estado == "healthy":
+            return True
+        if estado in ("exited", "dead"):
+            return False
+        time.sleep(2)
+    return False
+
+
 def _wait_app_ready(pdir: Path | str, timeout: int = 1200) -> bool:
     """Espera a que el contenedor de la app quede healthy.
 
@@ -1811,7 +1868,7 @@ def cmd_upgrade(args) -> int:
     stage = Path(tempfile.mkdtemp(prefix="appctl-upgrade-"))
     atexit.register(shutil.rmtree, stage, ignore_errors=True)
     render_project(stage, stack_dir, stack, project, components, tags,
-                   names, pw, int(st["app_port"]), st.get("sftp_port"),
+                   names, pw, int(st.get("app_port") or 0), st.get("sftp_port"),
                    host=st["host"], pg_major=pg_major, api_key=api_key,
                    want_cron="cron" in components,
                    db_publish=st.get("db_published_port"),
@@ -1843,7 +1900,7 @@ def cmd_upgrade(args) -> int:
                 r = sh("docker compose up -d", cwd=build_dir(project), timeout=300)
                 if r.returncode == 0:
                     print("  aplicado (docker compose up -d)")
-                    if not _wait_app_ready(pdir):
+                    if not (_wait_db_only_ready(pdir) if is_db_only(stack) else _wait_app_ready(pdir)):
                         print("  la app no quedo healthy: mirar: appctl %s logs"
                               % project)
                         return 1
@@ -1941,7 +1998,7 @@ def cmd_upgrade(args) -> int:
                 r = sh("docker compose up -d", cwd=build_dir(project), timeout=300)
                 if r.returncode == 0:
                     print("  aplicado (docker compose up -d)")
-                    if not _wait_app_ready(pdir):
+                    if not (_wait_db_only_ready(pdir) if is_db_only(stack) else _wait_app_ready(pdir)):
                         print("  la app no quedo healthy: mirar: appctl %s logs"
                               % project)
                         return 1
@@ -1969,7 +2026,7 @@ def cmd_upgrade(args) -> int:
     r = sh("docker compose up -d", cwd=build_dir(project), timeout=600)
     if r.returncode == 0:
         print("  aplicado (docker compose up -d)")
-        if not _wait_app_ready(pdir):
+        if not (_wait_db_only_ready(pdir) if is_db_only(stack) else _wait_app_ready(pdir)):
             # Un upgrade que deja la app caida NO se queda asi: se restaura el
             # compose anterior y se vuelve a levantar. Medido: un cambio que
             # daba 500 en produccion quedo aplicado y "solo avisaba".
@@ -2001,7 +2058,7 @@ def cmd_upgrade(args) -> int:
     # entrypoint vuelve a instalar y buildear. Sin esta espera, los checks
     # corren contra un contenedor a medio arrancar y el upgrade se revierte
     # solo, con el compose nuevo ya correcto.
-    if not _wait_app_ready(pdir):
+    if not (_wait_db_only_ready(pdir) if is_db_only(stack) else _wait_app_ready(pdir)):
         print("  la app no quedo healthy; los checks van a fallar y se "
               "revierte. Mirar: appctl %s logs" % project)
 
@@ -2017,7 +2074,7 @@ def cmd_upgrade(args) -> int:
     cfg = {
         "project": project,
         "stack": stack,
-        "app_port": int(st["app_port"]),
+        "app_port": (int(st["app_port"]) if st.get("app_port") else None),
         "sftp_port": st.get("sftp_port"),
         "db_kind": "mysql" if "mysql" in stack else "postgres",
         "db_port": 3306 if ("mysql" in stack) else 5432,
@@ -2147,7 +2204,7 @@ def cmd_creds(args) -> int:
     env = load_env(args.proyecto)
     st = load_state(args.proyecto)
     print(render_create(st["project"], st["stack"], _host_guardado(args.proyecto, st),
-                        st["app_port"], st["sftp_port"],
+                        st.get("app_port"), st["sftp_port"],
                         {k: env[k] for k in
                          ("DB_NAME", "DB_USER", "DB_MIGRATION_USER",
                           "DB_READONLY_USER", "SFTP_USER")},
@@ -2645,9 +2702,13 @@ def cmd_db_expose(args) -> int:
     if port is None:
         # Sin puerto: el primero libre desde el puerto nativo del motor.
         desde = 3306 if "mysql" in stack else 5432
-        port = _puerto_libre(desde)
-        print(f"  puerto automatico: {port} (el {desde} y los siguientes "
-              f"hasta {port} estaban usados)")
+        # El automatico NO arranca en el puerto nativo: 5432/3306 se dejan
+        # libres para un motor local o para pedirlos a mano. Si se pide
+        # explicito (`db expose 5432`) se respeta.
+        port = _puerto_libre(desde + 1)
+        print(f"  puerto automatico: {port}  "
+              f"(el primero libre desde {desde + 1}; el {desde} nativo no se "
+              f"toma solo)")
     if not (1024 <= port <= 65535):
         die(f"puerto {port} fuera de rango (1024-65535)")
     bind = _validar_bind(getattr(args, "bind", "0.0.0.0"))
@@ -3442,7 +3503,11 @@ def _v_mayor(tag: str) -> str:
 
 def main() -> int:
     _vv = _versiones_ofertadas()
-    _v = {'php': _vv['php'].replace('-fpm-alpine', ''),
+    _v = {'psql_ep': ('psql     PostgreSQL %s sin app:  appctl create <p> psql'
+                      % _vv['psql']),
+          'mysql_ep': ('mysql    MariaDB %s sin app:  appctl create <p> mysql'
+                       % _vv['mysql']),
+          'php': _vv['php'].replace('-fpm-alpine', ''),
           'node': _v_mayor(_vv['nextjs']),
           'tomcat': _v_mayor(_vv['tomcat']), 'psql': _vv['psql'] or '?',
           'mysql': _vv['mysql'] or '?', 'garage': _vv['garage']}
@@ -3462,6 +3527,10 @@ def main() -> int:
               sftp     SFTP con chroot
               cron     crontab con supervisor
               s3       Garage {_v['garage']}: un S3 por proyecto (cualquier stack)
+
+            base sola (sin app):
+              {_v['psql_ep']}
+              {_v['mysql_ep']}
             ejemplos:
               appctl acme php psql sftp
               appctl acme php psql sftp --app-port 3001
@@ -3777,9 +3846,10 @@ def main() -> int:
             # proyecto no esta. Y en el caso de `psql`, el usuario casi seguro
             # queria CREAR algo con una base: se le dice que falta el runtime.
             if verb == "psql" and not (Path(PROJECTS_DIR) / proj).is_dir():
-                pista = ("\n  ojo: `%s %s` se lee como el comando %r. una base\n"
-                         "  sola no es un stack: hace falta un runtime (php, nextjs,\n"
-                         "  express o tomcat) al lado de psql/mysql." % (proj, verb, verb))
+                pista = ("\n  ojo: `%s %s` se lee como el comando %r. para crear un\n"
+                         "  proyecto con SOLO una base:\n"
+                         "    appctl create %s psql     (o: appctl create %s mysql)"
+                         % (proj, verb, verb, proj, proj))
                 die(f"no existe el proyecto {proj!r}.\n"
                     f"  para crearlo:  appctl {proj} php psql sftp\n"
                     f"  para ver los que hay:  appctl list{pista}")

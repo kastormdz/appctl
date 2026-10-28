@@ -1,0 +1,73 @@
+# Generado por appctl desde stacks/mysql-only/compose.tmpl.yaml
+# NO EDITAR A MANO: los cambios se pierden en el proximo
+# `appctl <proyecto> upgrade`, que lo re-renderiza desde este template.
+#
+# STACK SOLO-BASE: un unico servicio (MariaDB). No hay app, no hay nginx,
+# no hay SFTP: este proyecto ES la base. Se usa cuando la aplicacion del
+# cliente corre en otro lado y solo necesita un MariaDB administrado.
+#
+# Datos persistentes: TODO en bind mounts dentro de este directorio (nada de
+# volumes nombrados), para que `destroy --keep-data` sea un rm -rf de una
+# carpeta y el backup sea un tar de una carpeta.
+name: appctl-__PROYECTO__
+
+services:
+
+  db:
+    image: mariadb:__MYSQL_VERSION__
+    # esta si viene de docker hub: bajarla si no esta local
+    pull_policy: missing
+    container_name: __PROYECTO___db
+    labels:
+      appctl.proyecto: __PROYECTO__
+      appctl.rol: db
+      appctl.gestor: appctl
+    hostname: __PROYECTO___db
+    # La base arranca CERRADA: la red data es internal:true y no hay ports:.
+    # `appctl <p> db expose` (sin puerto) toma el siguiente libre y lo anota
+    # en state.json, asi sobrevive al proximo upgrade.
+__DB_PUBLISH__
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      # root: solo para el init/10-users.sh y el check de roles.
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_RANDOM_ROOT_PASSWORD: "no"
+      MARIADB_MYSQL_LOCALHOST_USER: ""
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_MIGRATION_USER: ${DB_MIGRATION_USER}
+      DB_MIGRATION_PASSWORD: ${DB_MIGRATION_PASSWORD}
+      DB_READONLY_USER: ${DB_READONLY_USER}
+      DB_READONLY_PASSWORD: ${DB_READONLY_PASSWORD}
+      DB_NAME: ${DB_NAME}
+
+    volumes:
+      - ./db/data:/var/lib/mysql
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - data
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPUS:-0.75}"
+          memory: ${DB_MEMORY:-512M}
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+networks:
+  # Declarada pero NO usada al crear: `db expose` la agrega al servicio db
+  # (docker no publica un puerto de una red internal:true). Sin la
+  # declaracion, el compose quedaria invalido al exponer.
+  egress:
+    driver: bridge
+  # SIN GATEWAY: mientras no se exponga, la base no la alcanza nadie.
+  data:
+    driver: bridge
+    internal: true

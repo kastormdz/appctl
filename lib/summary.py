@@ -120,12 +120,13 @@ def render_create(project: str, stack: str, host: str, app_port: int,
     L.append(f"{BOLD}{project}{RESET}  {DIM}({stack}){RESET}")
     L.append(f"{bar}")
 
-    L.append(f"{BOLD}Acceso a la aplicacion{RESET}")
-    L.append(f"  URL        http://{host}:{app_port}")
+    if app_port:
+      L.append(f"{BOLD}Acceso a la aplicacion{RESET}")
+      L.append(f"  URL        http://{host}:{app_port}")
     # el codigo vive en sftp/home/upload: es el MISMO directorio que ve el
     # cliente por SFTP y que sirve nginx. Decir "app/" hace pensar que hay
     # dos lugares, y no los hay.
-    L.append(f"  Codigo     {pdir}/sftp/home/upload   (sube por SFTP)")
+      L.append(f"  Codigo     {pdir}/sftp/home/upload   (sube por SFTP)")
     L.append("")
 
     # nextjs-python: el stack corre DOS runtimes. El developer tiene que
@@ -191,8 +192,15 @@ def render_create(project: str, stack: str, host: str, app_port: int,
     if "mysql" in stack:
         db_driver = "mysql"
 
-    L.append(f"{BOLD}Base de datos{RESET}  {DIM}(solo accesible desde la app){RESET}")
-    L.append(f"  Servidor   {host}:{db_port}  {DIM}(NO abrir desde afuera){RESET}")
+    _solo_base = (stack or "").endswith("-only")
+    L.append(f"{BOLD}Base de datos{RESET}  "
+             + (f"{DIM}(el proyecto entero: se abre con db expose){RESET}"
+                if _solo_base else
+                f"{DIM}(solo accesible desde la app){RESET}"))
+    if _solo_base:
+        L.append(f"  Servidor   {host}  {DIM}(cerrada hasta que la expongas){RESET}")
+    else:
+        L.append(f"  Servidor   {host}:{db_port}  {DIM}(NO abrir desde afuera){RESET}")
     L.append(f"  Base       {names['DB_NAME']}")
     L.append("")
     L.append(f"  {BOLD}Usuario de la aplicacion{RESET}")
@@ -238,6 +246,23 @@ def render_create(project: str, stack: str, host: str, app_port: int,
             L.append(f"  {DIM}Entra quien alcance esa direccion. Se cierra con:")
             L.append(f"    appctl {project} db unexpose{RESET}")
         L.append("")
+
+    if _solo_base:
+        L.append(f"{BOLD}Como se conecta el cliente{RESET}")
+        if db_publish:
+            _pb, _, _pp = db_publish.rpartition(":")
+            L.append(f"  publicada en {addr_publicada(_pb, _pp, host)}"
+                     f"{alcance_bind(_pb)}")
+        else:
+            L.append(f"  {DIM}La base esta CERRADA: red interna y sin puerto en el")
+            L.append(f"  host. Se abre en el SIGUIENTE puerto libre:{RESET}")
+            L.append(f"    appctl {project} db expose")
+        L.append(f"  {DIM}Acotar quien entra:{RESET}")
+        L.append(f"    appctl {project} db grant <usuario> --cidr <red>")
+        L.append(f"  {DIM}Cerrarla:{RESET}")
+        L.append(f"    appctl {project} db unexpose")
+        L.append("")
+        return "\n".join(L)
 
     # El ejemplo tiene que ser del runtime del proyecto: el stack de PHP usa
     # Laravel, el de Node no (DB_CONNECTION es una clave de Laravel y en un
@@ -405,7 +430,10 @@ def render_info(st: dict, env: dict, ps_out: str, limits=None,
     L = ["", f"  {BOLD}{st['project']}{RESET}  {DIM}creado {st.get('created','?')}{RESET}", ""]
     L.append(f"  Stack      {st['stack']}")
     L.append(f"  Host       {st['host']}")
-    L.append(f"  App        http://{st['host']}:{st['app_port']}")
+    if st.get("app_port"):
+        L.append(f"  App        http://{st['host']}:{st['app_port']}")
+    else:
+        L.append(f"  App        {DIM}(no hay: proyecto solo-base){RESET}")
     if st.get("sftp_port"):
         L.append(f"  SFTP       {st['host']}:{st['sftp_port']}  user {env.get('SFTP_USER')}")
     _dbn = (st.get("db") or {}).get("name", "-")

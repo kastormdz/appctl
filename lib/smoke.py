@@ -1247,7 +1247,11 @@ def all_checks(project_dir: str, cfg: dict, host: str,
 
     # el garage tarda lo suyo en arrancar (es un proceso rust con sqlite
     # arriba); se espera como a la db.
-    _svcs = ["db", "app"] + (["garage"] if "s3" in (cfg.get("components") or []) else [])
+    # un proyecto solo-base no tiene contenedor de app: esperar "app
+    # healthy" ahi es esperar 20 minutos algo que no existe.
+    _db_only = (cfg.get("stack") or "").endswith("-only")
+    _svcs = (["db"] + ([] if _db_only else ["app"])
+             + (["garage"] if "s3" in (cfg.get("components") or []) else []))
     checks += wait_healthy(project_dir, _svcs)
     # el healthcheck del stub no toca la DB, asi que "app healthy" puede
     # pasar antes de que postgres termine el initdb. esperar la DB real.
@@ -1268,6 +1272,10 @@ def all_checks(project_dir: str, cfg: dict, host: str,
         checks.append(db_not_reachable_from_host(
             project_dir, db_port, cfg.get("db_image", "postgres:18-alpine")))
     checks.append(db_not_reachable_from_other_container(project_dir, cfg))
+    if _db_only:
+        # solo-base: no hay app, ni SFTP, ni S3. Los checks de la base ya
+        # corrieron (arriba); el resto no aplica.
+        return checks
     checks.append(app_serves(project_dir, cfg["app_port"], project, cfg,
                              expect_stub=expect_stub))
     # El stack express tiene DOS cosas detras del mismo nginx: el build de

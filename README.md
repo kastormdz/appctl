@@ -156,7 +156,8 @@ Cada stack es un directorio bajo `stacks/`, con su `compose.tmpl.yaml` y una
 imagen propia (Dockerfile, entrypoint, nginx) donde hace falta. Agregar uno
 nuevo es copiar un directorio y ajustar los placeholders.
 
-Hay **6**, y cada uno levanta **dos contenedores**: `app` y `db`.
+Hay **8**: seis levantan **dos contenedores** (`app` y `db`) y dos son
+sólo-base (**un** contenedor: `db`).
 
 | Stack | App | Base | Notas |
 |---|---|---|---|
@@ -166,6 +167,8 @@ Hay **6**, y cada uno levanta **dos contenedores**: `app` y `db`.
 | `nextjs-python-postgres-sftp` | Node 22 + Next.js + API Python (FastAPI) | PostgreSQL 18 | dos runtimes en un contenedor: `/api` lo sirve Next (la capa BFF) y la API Python queda interna |
 | `express-postgres-sftp` | Node 22 + Express + React | PostgreSQL 18 | nginx sirve el build de React y proxya `/api` a Express |
 | `tomcat-postgres-sftp` | Tomcat 11 + JDK 25 | PostgreSQL 18 | el proxy externo habla directo con Tomcat |
+| `postgres-only` | — (no hay app) | PostgreSQL 18 | el proyecto ES la base; se abre con `db expose` |
+| `mysql-only` | — (no hay app) | MariaDB 11.8 | el proyecto ES la base; se abre con `db expose` |
 
 SFTP no es un contenedor aparte: es un `sshd` dentro del contenedor de la app,
 con el directorio del cliente montado en los dos lados. Menos contenedores que
@@ -942,7 +945,7 @@ appctl/
 │   ├── dbtool.py              # dump / restore / expose / grant
 │   ├── smoke.py               # las comprobaciones (11 en nextjs-python)
 │   └── summary.py             # el resumen para el developer
-├── stacks/                    # 6 stacks, uno por directorio
+├── stacks/                    # 8 stacks, uno por directorio
 └── tests/
     ├── test_init_sql.py       # ejecuta los init y valida el SQL que producen
     ├── test_root_pw.py        # parsea la línea del log de mariadb

@@ -156,7 +156,8 @@ Each stack is a directory under `stacks/`, with its `compose.tmpl.yaml` and its
 own image (Dockerfile, entrypoint, nginx) where needed. Adding one means copying
 a directory and adjusting the placeholders.
 
-There are **6**, and each brings up **two containers**: `app` and `db`.
+There are **8**: six bring up **two containers** (`app` and `db`) and two are
+database-only (**one** container: `db`).
 
 | Stack | App | Database | Notes |
 |---|---|---|---|
@@ -165,6 +166,8 @@ There are **6**, and each brings up **two containers**: `app` and `db`.
 | `nextjs-postgres-sftp` | Node 22 + Next.js | PostgreSQL 18 | multi-stage build, `.next` |
 | `nextjs-python-postgres-sftp` | Node 22 + Next.js + Python API (FastAPI) | PostgreSQL 18 | two runtimes in one container: Next serves `/api` (the BFF layer) and the Python API stays internal |
 | `express-postgres-sftp` | Node 22 + Express + React | PostgreSQL 18 | nginx serves the React build and proxies `/api` to Express |
+| `postgres-only` | — (no app) | PostgreSQL 18 | the project IS the database; open it with `db expose` |
+| `mysql-only` | — (no app) | MariaDB 11.8 | the project IS the database; open it with `db expose` |
 | `tomcat-postgres-sftp` | Tomcat 11 + JDK 25 | PostgreSQL 18 | the external proxy talks straight to Tomcat |
 
 SFTP is not a separate container: it's an `sshd` inside the app container, with
@@ -175,6 +178,18 @@ Missing are the `mysql` variants for Next.js and Tomcat, plus a stack with `cron
 for queue workers. The CLI already accepts those names; what doesn't exist yet is
 the directory. They aren't built by design: each one gets added when someone
 actually asks for it, so the repo doesn't carry stacks nobody has tested.
+
+### Database-only project
+
+`appctl create midb psql` creates a project with **one** thing: the database.
+No app, no nginx, no SFTP. It starts **closed** (internal network, no host
+port) and you open it when needed:
+
+```
+appctl midb db expose              # takes the NEXT free port (5432, 5433, ...)
+appctl midb db grant midb --cidr 10.20.0.0/16
+appctl midb db unexpose
+```
 
 ### Next.js + Python API
 
@@ -952,7 +967,7 @@ appctl/
 │   ├── dbtool.py              # dump / restore / expose / grant
 │   ├── smoke.py               # the checks (11 on nextjs-python)
 │   └── summary.py             # the summary for the developer
-├── stacks/                    # 6 stacks, one per directory
+├── stacks/                    # 8 stacks, one per directory
 └── tests/
     ├── test_init_sql.py       # runs the inits and validates the SQL they produce
     ├── test_root_pw.py        # parses the password line out of the mariadb log

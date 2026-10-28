@@ -172,7 +172,9 @@ class Registry:
             "app_port": app_port,
             "sftp_port": sftp_port,
         }
-        data["ports"][str(app_port)] = project
+        if app_port:
+            # un proyecto solo-base no reserva puerto de app: no hay app.
+            data["ports"][str(app_port)] = project
         if sftp_port:
             data["ports"][str(sftp_port)] = project
 

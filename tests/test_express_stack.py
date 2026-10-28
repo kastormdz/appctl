@@ -214,7 +214,7 @@ def main() -> int:
     for n in ("README.md", "README.en.md"):
         t = leer(n)
         check(NOMBRE in t, f"{n} nombra el stack")
-        check("Hay **6**" in t or "There are **6**" in t, f"{n} dice 6 stacks")
+        check("Hay **8**" in t or "There are **8**" in t, f"{n} dice 8 stacks")
 
     print()
     if FALLOS:

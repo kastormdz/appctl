@@ -77,12 +77,18 @@ def main():
     cli = leer("bin/appctl")
     epilogo = cli[cli.index("componentes:"):cli.index("ejemplos:")]
     choices = re.findall(r"choices=\[([^\]]+)\]", cli)
+    # el prefijo del stack no siempre es el nombre del componente: los stacks
+    # postgres-* usan el componente `psql` (y postgres-only tambien).
+    _comp_de_stack = {"postgres": "psql", "mysql": "mysql"}
     for d in sorted(p.name for p in (RAIZ / "stacks").iterdir() if p.is_dir()):
-        rt = d.split("-")[0]
+        rt = _comp_de_stack.get(d.split("-")[0], d.split("-")[0])
         check("-h lista el componente {0}".format(rt),
               re.search(r"^\s+" + rt + r"\s", epilogo, re.M) is not None)
-        check("un choices acepta {0}".format(rt),
-              any('"{0}"'.format(rt) in c for c in choices))
+        # `componentes` es libre (nargs="+"), no tiene choices=: lo que importa
+        # es que el CLI lo CONOZCA (ALL_COMPONENTS) para poder validarlo.
+        check("el CLI conoce {0}".format(rt),
+              rt in _cli().ALL_COMPONENTS
+              or any('"{0}"'.format(rt) in c for c in choices))
 
     # Los COMPONENTES, no solo los runtimes que tienen directorio en stacks/:
     # `sftp`, `cron` y `s3` son banderas y el bucle de arriba no los ve. Un
