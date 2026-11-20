@@ -399,7 +399,8 @@ def render_list(proj_dir: str) -> str:
         sftp = str(st.get("sftp_port") or "-")
         db = (st.get("db") or {}).get("name") or "-"
         L.append(f"  {st['project']:<20} {st['stack']:<26} "
-                 f"{st.get('app_port','-'):<7} {sftp:<7} {db:<10}")
+                 f"{(str(st.get('app_port')) if st.get('app_port') else '-'):<7} "
+                 f"{sftp:<7} {db:<10}")
     L.append("")
     return "\n".join(L)
 

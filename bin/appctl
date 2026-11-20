@@ -2452,9 +2452,11 @@ def cmd_rotate(args) -> int:
         env[key] = new
         _write_env(pdir, env)
         print("[2/2] reiniciando la app para que tome la nueva...")
-        sh("docker compose up -d --force-recreate app", cwd=pdir, timeout=600)
+        # en un solo-base no hay contenedor app: se recrea la db.
+        _svc = "db" if is_db_only(stack) else "app"
+        sh(f"docker compose up -d --force-recreate {_svc}", cwd=pdir, timeout=600)
         print(render_rotate(project, f"DB ({user})", [(user, new)],
-                            st["host"], st["app_port"]))
+                            st["host"], st.get("app_port") or 0))
         return 0
 
     die(f"que rotar: sftp | db | mig | ro  (no {what!r})")

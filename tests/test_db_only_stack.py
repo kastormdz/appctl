@@ -144,6 +144,25 @@ check("DEFAULT_TAGS[runtime_of(" not in cuerpo,
       "cmd_upgrade no pide la imagen del runtime (crash en solo-base)")
 check("_app_image_of" in cuerpo, "cmd_upgrade usa _app_image_of (tolera sin app)")
 
+# ---- 8. `appctl list` con un solo-base (app_port null)
+print("\n=== appctl list")
+import json as _json
+import tempfile
+with tempfile.TemporaryDirectory() as _td:
+    d = pathlib.Path(_td) / "ddp-test"
+    d.mkdir()
+    (d / "state.json").write_text(_json.dumps({
+        "project": "ddp-test", "stack": "postgres-only", "host": "h",
+        "app_port": None, "sftp_port": None,
+        "db": {"kind": "postgres", "name": "ddp-test_db"},
+        "components": ["psql"], "created": "2026-10-28"}))
+    try:
+        out = summary.render_list(_td)
+        check("ddp-test" in out, "lista un proyecto solo-base sin romperse")
+        check("-" in out, "muestra '-' donde no hay puerto de app")
+    except Exception as e:  # noqa: BLE001
+        check(False, "render_list con app_port null", f"{type(e).__name__}: {e}")
+
 print()
 print(f"test_db_only_stack: {'OK' if not fallos else str(len(fallos)) + ' FALLAS'}")
 sys.exit(1 if fallos else 0)
